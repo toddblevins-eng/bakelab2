@@ -1,0 +1,13 @@
+/* index.css — minimal globals. BakeLab carries its own component styles. */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: #f4eeda; /* matches --paper so there's no flash before the app paints */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* respect iPhone safe areas when installed to the home screen */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+#root { min-height: 100vh; }
+/* prevent the pull-to-refresh / rubber-band from feeling like a broken app once installed */
+html { overscroll-behavior-y: contain; }
