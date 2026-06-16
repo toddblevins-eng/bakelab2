@@ -342,18 +342,15 @@ export default function App() {
   const [doneBatches, setDoneBatches] = useState([]);
   const [nowMin, setNowMin] = useState(() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); });
   useEffect(() => { const id = setInterval(() => { const d = new Date(); setNowMin(d.getHours() * 60 + d.getMinutes()); }, 20000); return () => clearInterval(id); }, []);
+  const tabsRef = useRef(null);
+  // keep the active tab pill centered in the scrolling nav
   useEffect(() => {
-    let t;
-    const onScroll = () => {
-      clearTimeout(t);
-      if (window.scrollY <= 130) { setNavShow(false); return; }
-      setNavShow(false);                       // hide while actively scrolling
-      t = setTimeout(() => setNavShow(true), 420); // reveal when scrolling stops
-    };
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => { window.removeEventListener("scroll", onScroll); clearTimeout(t); };
-  }, []);
-  const goTab = (k) => { setTab(k); setNavShow(false); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
+    const c = tabsRef.current; if (!c) return;
+    const el = c.querySelector(".bl-tab.on"); if (!el) return;
+    const target = el.offsetLeft - (c.clientWidth - el.clientWidth) / 2;
+    c.scrollTo({ left: Math.max(0, target), behavior: "smooth" });
+  }, [tab]);
+  const goTab = (k) => { setTab(k); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState("home");
   const [days, setDays] = useState([]);
@@ -789,7 +786,7 @@ export default function App() {
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
         * { box-sizing:border-box; }
-        .bl-root{--chrome:#1a0f07;--chrome2:#2f1c0f;--chrome3:#3d2010;--chrome-t:#f5efe3;--chrome-m:#b09070;--paper:#f4eeda;--paper2:#e8d9be;--cream:#fffdf8;--ink:#241508;--ink2:#7a5a3a;--line:#d4c4a8;--crust:#b5651d;--crust2:#8a4a14;--active:#c4521f;--passive:#dfc99a;--passive-line:#c9ad79;--sand:#a08060;--alert:#b32d24;--alert-bg:#f6d9d4;font-family:'DM Sans',system-ui,sans-serif;color:var(--ink);background:var(--paper);padding:0 22px 40px;min-height:100vh;overflow-x:hidden;}
+        .bl-root{--chrome:#1a0f07;--chrome2:#2f1c0f;--chrome3:#3d2010;--chrome-t:#f5efe3;--chrome-m:#b09070;--paper:#f4eeda;--paper2:#e8d9be;--cream:#fffdf8;--ink:#241508;--ink2:#7a5a3a;--line:#d4c4a8;--crust:#b5651d;--crust2:#8a4a14;--active:#c4521f;--passive:#dfc99a;--passive-line:#c9ad79;--sand:#a08060;--alert:#b32d24;--alert-bg:#f6d9d4;font-family:'DM Sans',system-ui,sans-serif;color:var(--ink);background:var(--paper);padding:0 22px 40px;min-height:100vh;overflow-x:clip;}
         .bl-head{background:var(--chrome);margin:0 -22px;padding:14px 22px 0;border-bottom:none;display:flex;flex-direction:column;gap:0;}
         .bl-brandstrip{display:flex;align-items:center;gap:11px;padding-bottom:12px;border-bottom:1px solid rgba(245,239,227,.08);margin-bottom:12px;}
         .bl-hap-logo-sm{height:20px;width:auto;color:var(--chrome-t);display:block;}
@@ -996,8 +993,8 @@ export default function App() {
         .bl-ing-row .ir-price{font-family:'JetBrains Mono';font-size:12px;color:var(--crust2);}
         .bl-ing-add{display:flex;gap:8px;margin-top:6px;}
         .bl-ing-input{flex:1;font-family:'DM Sans';font-size:14px;padding:8px 10px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);}
-        .bl-ingwrap{position:relative;display:flex;align-items:center;}
-        .bl-ingwrap .ing-name{flex:1;padding-right:30px;}
+        .bl-ingwrap{position:relative;display:flex;align-items:center;flex:1;min-width:0;}
+        .bl-ingwrap .ing-name{flex:1;min-width:0;width:100%;padding-right:30px;}
         .bl-ingdrop-btn{position:absolute;right:4px;width:24px;height:100%;border:none;background:transparent;color:var(--ink2);cursor:pointer;font-size:11px;display:flex;align-items:center;justify-content:center;}
         .bl-ingdrop{position:absolute;top:100%;left:0;right:0;z-index:200;background:#fff;border:1.5px solid var(--crust);border-radius:8px;box-shadow:0 6px 18px rgba(42,29,18,.14);max-height:160px;overflow-y:auto;margin-top:3px;}
         .bl-ingdrop-item{padding:9px 12px;font-family:'DM Sans';font-size:13px;color:var(--ink);cursor:pointer;}
@@ -1074,14 +1071,15 @@ export default function App() {
         .bl-item{display:grid;grid-template-columns:62px 1fr auto;gap:12px;align-items:center;padding:8px 12px;border-radius:7px;background:var(--paper);border:1px solid var(--line);}
         .bl-item.hit{border-color:var(--alert);background:var(--alert-bg);} .bl-item .tm{font-family:'JetBrains Mono';font-weight:600;font-size:14px;} .bl-item .lb{font-size:13px;} .bl-item .lb b{font-family:'JetBrains Mono';font-weight:600;color:var(--crust2);font-size:11px;} .bl-item .dn{font-family:'JetBrains Mono';font-size:11px;color:var(--ink2);} .bl-item .flag{font-size:10px;font-weight:700;color:var(--alert);}
         .bl-note{font-size:11px;color:var(--ink2);margin-top:10px;line-height:1.5;}
-        .bl-tabs{background:var(--chrome);display:flex;gap:0;margin:0 -22px 24px;border-bottom:none;overflow-x:auto;-webkit-overflow-scrolling:touch;padding:0 12px;}
-        .bl-tab{font-family:'DM Sans';font-weight:600;font-size:13px;letter-spacing:.2px;cursor:pointer;border:none;background:transparent;color:var(--chrome-m);padding:11px 14px 13px;border-bottom:2px solid transparent;margin-bottom:0;display:flex;align-items:center;gap:7px;flex:none;white-space:nowrap;}
-        .bl-tab:hover{color:var(--chrome-t);}
-        .bl-tab.on{color:var(--crust);border-bottom-color:var(--crust);}
-        .bl-tab .num{font-family:'JetBrains Mono';font-size:10px;background:rgba(245,239,227,.1);color:var(--chrome-m);border-radius:9px;padding:1px 6px;font-weight:600;}
-        .bl-tab.on .num{background:var(--crust);color:var(--chrome-t);}
-        .bl-tab .tshort{display:none;}
-        .bl-mininav{position:fixed;top:0;left:0;right:0;z-index:80;display:flex;gap:3px;justify-content:center;background:rgba(26,15,7,.95);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid rgba(245,239,227,.1);padding:7px 8px;transform:translateY(-115%);transition:transform .26s ease;box-shadow:0 3px 16px rgba(0,0,0,.3);}
+        .bl-tabs{position:sticky;top:0;z-index:90;background:var(--chrome);display:flex;gap:8px;margin:0 -22px 22px;padding:11px 18px;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;scroll-snap-type:x proximity;scrollbar-width:none;box-shadow:0 6px 18px -10px rgba(0,0,0,.5);}
+        .bl-tabs::-webkit-scrollbar{display:none;}
+        .bl-tab{font-family:'DM Sans';font-weight:600;font-size:15px;letter-spacing:.2px;cursor:pointer;border:none;background:rgba(245,239,227,.08);color:var(--chrome-m);padding:11px 20px;border-radius:999px;display:flex;align-items:center;gap:7px;flex:0 0 auto;white-space:nowrap;scroll-snap-align:center;transition:background .15s,color .15s;}
+        .bl-tab:hover{color:var(--chrome-t);background:rgba(245,239,227,.15);}
+        .bl-tab.on{background:var(--crust);color:#fff;}
+        .bl-tab .num{display:none;}
+        .bl-tab .tlabel{display:none;}
+        .bl-tab .tshort{display:inline;}
+        .bl-mininav{display:none;}
         .bl-home{max-width:1100px;margin:0 auto;padding-top:28px;}
         .bl-home-hd{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:24px;padding-bottom:18px;border-bottom:1.5px solid var(--line);}
         .bl-newday{font-family:'DM Sans';font-size:14px;font-weight:600;color:var(--chrome-t);background:var(--chrome2);border:none;border-radius:9px;padding:11px 18px;cursor:pointer;white-space:nowrap;}
@@ -1355,14 +1353,30 @@ export default function App() {
         @media (max-width:600px){
           .bl-root{padding:0 12px 34px;}
           .bl-head{margin:0 -12px;padding:12px 12px 0;}
-          .bl-tabs{margin:0 -12px 20px;padding:0 6px;}
+          .bl-tabs{margin:0 -12px 20px;padding:11px 14px;}
           .bl-title{font-size:20px;} .bl-title small{font-size:9px;letter-spacing:1.8px;} .bl-hap-logo{height:21px;} .bl-prodname{font-size:17px;}
           .bl-panel{padding:13px;}
           /* 16px inputs stop iOS zoom-on-tap; taller targets for fingers */
           .bl-root input, .bl-root select{font-size:16px;min-height:40px;}
           .ing-pct.main{min-height:40px;}
-          .bl-tab .num{display:none;} .bl-tab .tlabel{display:none;} .bl-tab .tshort{display:inline;}
-          .bl-tab{padding:13px 14px;font-size:13px;flex:1;justify-content:center;}
+          .bl-tab{padding:12px 20px;font-size:15px;}
+          /* home header: stack so the toggle + new-day button never clip */
+          .bl-home-hd{flex-direction:column;align-items:stretch;gap:14px;}
+          .bl-home-tabs{display:flex;width:100%;}
+          .bl-home-tabs button{flex:1;text-align:center;padding:12px 8px;font-size:15px;}
+          .bl-newday{width:100%;padding:13px 18px;font-size:15px;}
+          /* food safety: narrower columns so two readings show before scroll */
+          .fsm-head,.fsm-row{grid-template-columns:minmax(104px,1fr) repeat(3,minmax(96px,1fr));min-width:440px;}
+          /* lift the smallest labels off the floor for scannability */
+          .bl-subhead{font-size:11.5px;}
+          .bl-note{font-size:13px;}
+          .lr-spec,.dc-bake,.dc-date{font-size:12px;}
+          .ing-pct.main b{font-size:8.5px;}
+          .fsm-sub{font-size:10px;}
+          .fsm-ts{font-size:12px;}
+          .bl-field2 label{font-size:11.5px;}
+          .bl-fixed .cell label{font-size:11px;}
+          .bl-lev-exp label,.bl-lev-grid label{font-size:11px;}
           .bl-rec-top{grid-template-columns:1fr 1fr;}
           .bl-rec-top > div:first-child{grid-column:1 / -1;}
           .ing-x{width:38px;height:40px;font-size:17px;}
@@ -1642,12 +1656,6 @@ export default function App() {
       )}
 
       {view === "editor" && (<>
-      <div className={"bl-mininav" + (navShow ? " show" : "")}>
-        {[["plan", "Plan"], ["prep", "Prep"], ["levain", "Levain"], ["build", "Mix"], ["fold", "Shape"], ["bake", "Bake"], ["safety", "Safety"]].map(([k, l]) => (
-          <button key={k} className={tab === k ? "on" : ""} onClick={() => goTab(k)}>{l}</button>
-        ))}
-      </div>
-
       <div className="bl-head">
         <div className="bl-brandstrip"><HapLogo className="bl-hap-logo-sm" /><span className="bl-prodname-sm">BakeLab</span></div>
         <div className="bl-dayhd">
@@ -1663,14 +1671,14 @@ export default function App() {
         </div>
       </div>
 
-      <div className="bl-tabs">
-        <button className={"bl-tab" + (tab === "plan" ? " on" : "")} onClick={() => setTab("plan")}><span className="num">1</span><span className="tlabel">Plan</span><span className="tshort">Plan</span></button>
-        <button className={"bl-tab" + (tab === "prep" ? " on" : "")} onClick={() => setTab("prep")}><span className="num">2</span><span className="tlabel">Prep &amp; Shop</span><span className="tshort">Prep</span></button>
-        <button className={"bl-tab" + (tab === "levain" ? " on" : "")} onClick={() => setTab("levain")}><span className="num">3</span><span className="tlabel">Levain</span><span className="tshort">Levain</span></button>
-        <button className={"bl-tab" + (tab === "build" ? " on" : "")} onClick={() => setTab("build")}><span className="num">4</span><span className="tlabel">Mix</span><span className="tshort">Mix</span></button>
-        <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => setTab("fold")}><span className="num">5</span><span className="tlabel">Fold &amp; Shape</span><span className="tshort">Shape</span></button>
-        <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => setTab("bake")}><span className="num">6</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
-        <button className={"bl-tab" + (tab === "safety" ? " on" : "")} onClick={() => setTab("safety")}><span className="num">7</span><span className="tlabel">Food Safety</span><span className="tshort">Safety</span></button>
+      <div className="bl-tabs" ref={tabsRef}>
+        <button className={"bl-tab" + (tab === "plan" ? " on" : "")} onClick={() => goTab("plan")}><span className="num">1</span><span className="tlabel">Plan</span><span className="tshort">Plan</span></button>
+        <button className={"bl-tab" + (tab === "prep" ? " on" : "")} onClick={() => goTab("prep")}><span className="num">2</span><span className="tlabel">Prep &amp; Shop</span><span className="tshort">Prep</span></button>
+        <button className={"bl-tab" + (tab === "levain" ? " on" : "")} onClick={() => goTab("levain")}><span className="num">3</span><span className="tlabel">Levain</span><span className="tshort">Levain</span></button>
+        <button className={"bl-tab" + (tab === "build" ? " on" : "")} onClick={() => goTab("build")}><span className="num">4</span><span className="tlabel">Mix</span><span className="tshort">Mix</span></button>
+        <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => goTab("fold")}><span className="num">5</span><span className="tlabel">Fold &amp; Shape</span><span className="tshort">Shape</span></button>
+        <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => goTab("bake")}><span className="num">6</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
+        <button className={"bl-tab" + (tab === "safety" ? " on" : "")} onClick={() => goTab("safety")}><span className="num">7</span><span className="tlabel">Food Safety</span><span className="tshort">Safety</span></button>
       </div>
 
       {/* ---------- TAB 1: PLANNING ---------- */}
