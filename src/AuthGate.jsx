@@ -24,7 +24,7 @@ const sub = { fontSize: 13, color: "#b09070", margin: "0 0 22px", lineHeight: 1.
 const input = { width: "100%", padding: "12px 14px", fontSize: 16, borderRadius: 10, border: "1.5px solid rgba(245,239,227,0.18)", background: "#1a0f07", color: "#f5efe3", marginBottom: 12, boxSizing: "border-box" };
 const button = { width: "100%", padding: "12px 14px", fontSize: 15, fontWeight: 600, borderRadius: 10, border: "none", background: "#b5651d", color: "#fffdf8", cursor: "pointer" };
 const note = { fontSize: 12, color: "#b09070", marginTop: 16, lineHeight: 1.5 };
-const signout = { position: "fixed", bottom: 10, left: 10, zIndex: 9999, fontSize: 11, fontFamily: "'DM Sans', sans-serif", color: "#a08060", background: "rgba(26,15,7,0.6)", border: "1px solid rgba(245,239,227,0.12)", borderRadius: 7, padding: "5px 9px", cursor: "pointer", backdropFilter: "blur(6px)" };
+const signout = { position: "fixed", bottom: "calc(env(safe-area-inset-bottom, 0px) + 12px)", left: 12, zIndex: 9999, width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, fontFamily: "'DM Sans', sans-serif", color: "#b09070", background: "rgba(26,15,7,0.5)", border: "1px solid rgba(245,239,227,0.14)", borderRadius: 999, padding: 0, cursor: "pointer", backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)", opacity: 0.7 };
 
 export default function AuthGate() {
   const [session, setSession] = useState(null);
@@ -78,7 +78,7 @@ export default function AuthGate() {
   if (session && storageReady) {
     return (<>
       <App />
-      <button style={signout} onClick={signOut} title="Sign out">⎋ {session.user.email}</button>
+      <button style={signout} onClick={signOut} title={"Sign out — " + session.user.email} aria-label="Sign out">⎋</button>
     </>);
   }
 
