@@ -1,15 +1,13 @@
-// main.jsx — app entry point
-// The storage shim is imported FIRST (before the component) so window.storage
-// exists by the time BakeLab's boot effect runs.
-import "./storage-shim.js";
-
+// main.jsx — app entry point (Tier 2: cloud sync)
+// AuthGate handles sign-in, installs the Supabase-backed window.storage,
+// and only then mounts the BakeLab app.
 import React from "react";
 import { createRoot } from "react-dom/client";
-import App from "./BakeLab.jsx";
+import AuthGate from "./AuthGate.jsx";
 import "./index.css";
 
 createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <App />
+    <AuthGate />
   </React.StrictMode>
 );
