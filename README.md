@@ -1,109 +1,145 @@
-# BakeLab · House au Pain
+# BakeLab — Operations Guide
 
-Production planning studio for House au Pain — recipes, levain calibration (Thelma),
-bake-day scheduling, Gantt timelines, and food-safety logs. Installable to your phone
-as an app, works offline.
+Everything you need to find, run, and change the BakeLab app. If you've forgotten
+where anything lives, start here.
 
-This is the **Tier 1** packaging of the BakeLab artifact: the app component runs
-unchanged; a small storage shim swaps the sandbox's `window.storage` for the browser's
-`localStorage`, and a service worker makes it installable and offline-capable.
+BakeLab is the House au Pain production app (recipes, levain/Thelma calibration,
+bake-day scheduling, Gantt timelines, food-safety logs). It's a web app installed
+to your phone and Mac, backed by a cloud database so both devices share the same data.
 
----
-
-## Run it locally
-
-Requires **Node.js 18+** (check with `node -v`).
-
-```bash
-npm install      # one time
-npm run dev      # starts the dev server, usually http://localhost:5173
-```
-
-Open the URL it prints. On the same Wi-Fi you can also open it on your phone using the
-"Network" address Vite shows (e.g. http://192.168.1.x:5173).
-
-To make a production build and preview it exactly as it'll ship:
-
-```bash
-npm run build    # outputs to dist/
-npm run preview  # serves the built app
-```
+**Stack:** Vite + React (the app) · vite-plugin-pwa (makes it installable/offline) ·
+Supabase (database + sign-in) · hosted on Vercel · code on GitHub.
 
 ---
 
-## Deploy (free) — Vercel
+## Your three control panels
 
-1. Put this folder in a Git repo (GitHub/GitLab/Bitbucket).
-2. Go to **vercel.com**, "Add New → Project", import the repo.
-3. Vercel auto-detects Vite. Confirm:
-   - **Build command:** `npm run build`
-   - **Output directory:** `dist`
-4. Deploy. You'll get a URL like `bakelab.vercel.app`.
+These are the only places you ever need to go. Bookmark all three.
 
-Netlify works identically (build `npm run build`, publish `dist`).
+### 1. GitHub — the code
+**https://github.com/toddblevins-eng/bakelab2**
+Holds every file of the app. This is where you upload a new version of the app when
+you want to change it. The app component itself is the file **`src/BakeLab.jsx`**.
 
-Every push to the repo redeploys automatically.
+### 2. Vercel — hosting & deploys
+**https://vercel.com/todd-blevins-projects1/bakelab2**
+Takes the code from GitHub and publishes it to the internet. Every time GitHub
+changes, Vercel automatically rebuilds and re-publishes within about a minute.
+Plan: Hobby (free). This is also where the two secret connection settings live
+(see "Settings reference").
+
+### 3. Supabase — database & sign-in
+**https://supabase.com/dashboard/project/jgdvjzhhdfrzljipaio**
+The cloud database that stores all your bake days, recipes, Thelma's profile, and
+logs, and handles the email sign-in. Project name: **BakeLab_Cloud**. Plan: Free.
+
+Handy deep links inside Supabase:
+- See your actual data: **https://supabase.com/dashboard/project/jgdvjzhhdfrzljipaio/editor** (open the `kv` table)
+- Sign-in URL settings: **https://supabase.com/dashboard/project/jgdvjzhhdfrzljipaio/auth/url-configuration**
+- API keys: **https://supabase.com/dashboard/project/jgdvjzhhdfrzljipaio/settings/api-keys**
 
 ---
 
-## Install to your iPhone home screen
+## The live app
 
-1. Open the deployed URL in **Safari**.
-2. Tap the **Share** icon → **Add to Home Screen**.
-3. It launches full-screen with the BakeLab icon, no browser chrome, and opens offline.
+**https://bakelab2.vercel.app**
 
-(Android: open in Chrome → menu → **Install app**.)
+Installed as an app on:
+- iPhone (Safari → Share → Add to Home Screen)
+- Mac (Chrome → Install)
+
+You sign in once per device with your email (todd.blevins@gmail.com) and stay
+signed in.
+
+---
+
+## How to change the app (the loop you'll use most)
+
+When you want new features or fixes:
+
+1. Claude gives you an updated **`src/BakeLab.jsx`** file.
+2. Go to the GitHub repo → open the `src` folder → open `BakeLab.jsx` →
+   use **Add file → Upload files** (or the edit pencil) to replace it → **Commit**.
+3. Vercel notices the change and redeploys automatically (~1 minute).
+4. Refresh to see it: on Mac hold **Shift** and click reload; on iPhone the app
+   updates on its next launch or two. (If it's stubborn, see "Gotchas".)
+
+That's the whole loop. You almost never touch Vercel or Supabase once they're set up.
+
+---
+
+## Settings reference
+
+| Thing | Value / where it lives |
+|---|---|
+| GitHub repo | `toddblevins-eng/bakelab2` |
+| Vercel project | `bakelab2` (team: todd-blevins-projects1) |
+| Live URL | `https://bakelab2.vercel.app` |
+| Supabase project ref | `jgdvjzhhdfrzljipaio` |
+| Supabase URL | `https://jgdvjzhhdfrzljipaio.supabase.co` |
+| Region | us-east-1 (East US, N. Virginia) |
+| App component file | `src/BakeLab.jsx` |
+| Sign-in method | Email magic link |
+| Auth Site URL (Supabase) | `https://bakelab2.vercel.app` |
+| Auth Redirect URL (Supabase) | `https://bakelab2.vercel.app/**` |
+
+**Connection settings (in Vercel → project → Settings → Environments):**
+- `VITE_SUPABASE_URL` = the Supabase URL above
+- `VITE_SUPABASE_ANON_KEY` = the Supabase **publishable** key (`sb_publishable_…`)
+
+> If you ever change an environment variable in Vercel, you must **redeploy** for it
+> to take effect (Vercel → Deployments → ⋯ on the latest → Redeploy).
+
+---
+
+## Secrets — what's safe and what's not
+
+- **Safe to be public** (these are already inside the shipped app): the Supabase
+  URL, the project ref, and the **publishable** key (`sb_publishable_…`). No harm if
+  anyone sees them — the database's security rules protect your data.
+- **NEVER share or post anywhere**: the Supabase **secret** key (`sb_secret_…`) and
+  your **database password**. You don't need either for normal use. If one ever
+  leaks, rotate it in Supabase.
+
+This is why this guide pastes no key values — the real ones live only in Vercel
+(the publishable key) and Supabase (everything else).
+
+---
+
+## Gotchas we hit (so future-you doesn't relive them)
+
+- **App still shows the old version after a deploy.** It's the installed app caching
+  itself. Fixes: on Mac, hard-refresh (Shift + reload), or Chrome DevTools →
+  Application → Service Workers → Unregister, then reload. On iPhone, delete the
+  home-screen app and re-add it. An **Incognito window always shows the true latest
+  version** — use it to tell whether a problem is caching or code.
+- **"email rate limit exceeded" on sign-in.** Too many link requests too fast.
+  Wait 30–60 minutes, then request **one** link. Don't spam the button.
+- **Sign in on your phone first.** The first device you sign into becomes the master
+  copy that seeds the cloud. Your phone holds your real kitchen data, so always sign
+  in there first; other devices then pull from the cloud.
+- **Magic-link email points at localhost.** That means the Supabase **Site URL** got
+  reset to localhost — set it back to `https://bakelab2.vercel.app`.
+- **Redirect URL must be one clean entry.** `https://bakelab2.vercel.app/**` — watch
+  for accidentally pasting the address twice into one field.
 
 ---
 
 ## Your data
 
-- All bake days, recipes, Thelma's profile, and logs are stored in your browser's
-  `localStorage` on the device you use, under keys prefixed `bakelab:`.
-- **This means data lives on one device and one browser.** It is not yet synced.
-- Safari can evict localStorage if the app is unused for a long time. For a tool you
-  rely on, **Tier 2 (cloud sync)** is the recommended next step — it makes the data
-  durable and shared across your laptop and phone.
+It lives in the cloud now, in a Supabase table called **`kv`**. To look at it:
+Supabase → Table Editor → `kv`. You'll see a couple of rows (one for your recipes
+and settings, one for your bake days) — each holds a blob of saved data.
 
-### Backing up / moving data (manual, until Tier 2)
-
-In the browser console on the running app:
-
-```js
-// export everything
-copy(JSON.stringify(Object.fromEntries(
-  Object.keys(localStorage).filter(k => k.startsWith('bakelab:')).map(k => [k, localStorage[k]])
-)));
-// (now paste the clipboard somewhere safe)
-
-// import on another device — paste your saved JSON in place of {...}
-const data = {/* ...paste... */};
-Object.entries(data).forEach(([k,v]) => localStorage.setItem(k,v));
-location.reload();
-```
+**Backups:** the free plan has no automatic backups. Your data is safely in the
+cloud and synced across devices, but if you wanted belt-and-suspenders protection
+you could periodically export the `kv` table from the Table Editor, or upgrade the
+Supabase plan later for automatic backups. Low priority for now.
 
 ---
 
-## Project structure
+## When you need help
 
-```
-index.html            # page shell + font + PWA tags
-vite.config.js        # Vite + PWA (service worker, manifest) config
-public/               # icons (generated from the HaP diamond mark)
-src/
-  main.jsx            # entry — loads the storage shim, then mounts the app
-  storage-shim.js     # window.storage  ->  localStorage  (lets the app run unchanged)
-  BakeLab.jsx         # the full app component (unchanged from the artifact)
-  index.css           # minimal globals; the app carries its own styles
-```
-
-## Notifications (Thelma feeding reminders)
-
-Not wired up yet. Installed PWAs on iOS can do web-push, but it's finicky; a recurring
-calendar event is a zero-effort stopgap. Reliable native reminders are a **Tier 3**
-(Capacitor wrapper) consideration.
-
-## Updating the app
-
-When you change `src/BakeLab.jsx` (or anything else), rebuild/redeploy. The service
-worker is set to `autoUpdate`, so visitors get the new version on next load.
+Come back to Claude with the specifics — what you were doing, what you clicked, and
+a screenshot of any error. That's how we got through setup, and it's the fastest way
+through anything new.
