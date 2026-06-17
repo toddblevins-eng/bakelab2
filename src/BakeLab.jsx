@@ -83,15 +83,10 @@ function HapLogo({ className }) {
 }
 function IngAddRow({ onAdd }) {
   const [v, setV] = useState("");
-  const [kind, setKind] = useState("flour");
-  const add = () => { const n = v.trim(); if (n) { onAdd(n, kind); setV(""); } };
+  const add = () => { const n = v.trim(); if (n) { onAdd(n); setV(""); } };
   return (
     <div className="bl-ing-add">
-      <div className="bl-ing-kindtoggle">
-        <button className={kind === "flour" ? "on" : ""} onClick={() => setKind("flour")}>Flour</button>
-        <button className={kind === "inclusion" ? "on" : ""} onClick={() => setKind("inclusion")}>Inclusion</button>
-      </div>
-      <input className="bl-ing-input" value={v} placeholder={"Add " + (kind === "inclusion" ? "inclusion" : "flour") + "…"} onChange={(e) => setV(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
+      <input className="bl-ing-input" value={v} placeholder="Add ingredient…" onChange={(e) => setV(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
       <button className="bl-newday" style={{ fontSize: 13, padding: "8px 14px" }} onClick={add}>Add</button>
     </div>
   );
@@ -162,10 +157,9 @@ function BufferedInput({ value, onCommit, className, placeholder, rows }) {
 }
 
 // IngredientInput: clears on focus for typing; dropdown arrow shows saved ingredients
-function IngredientInput({ value, onCommit, className, placeholder, ingredients, kind = "flour" }) {
+function IngredientInput({ value, onCommit, className, placeholder, ingredients }) {
   const [v, setV] = useState(value == null ? "" : value);
   const [open, setOpen] = useState(false);
-  const [browse, setBrowse] = useState(false);
   const last = useRef(value == null ? "" : value);
   const wrapRef = useRef(null);
   useEffect(() => { const nv = value == null ? "" : value; if (nv !== last.current) { last.current = nv; setV(nv); } }, [value]);
@@ -175,18 +169,17 @@ function IngredientInput({ value, onCommit, className, placeholder, ingredients,
     document.addEventListener("mousedown", close); return () => document.removeEventListener("mousedown", close);
   }, [open]);
   const commit = (nv) => { last.current = nv; setV(nv); onCommit(nv); setOpen(false); };
-  const pool = (ingredients || []).filter((i) => i.name && (i.kind || "flour") === kind);
-  const filtered = (browse || !v) ? pool : pool.filter((i) => i.name.toLowerCase().includes(v.toLowerCase()));
+  const filtered = (ingredients || []).filter((i) => i.name && (!v || i.name.toLowerCase().includes(v.toLowerCase())));
   return (
     <div className="bl-ingwrap" ref={wrapRef}>
       <input className={className} value={v} placeholder={placeholder}
-        onFocus={() => { setV(""); setBrowse(true); }}
+        onFocus={() => setV("")}
         onBlur={() => { setTimeout(() => { if (document.activeElement !== wrapRef.current) setOpen(false); }, 150); if (!v.trim()) { setV(last.current); } }}
-        onChange={(e) => { setV(e.target.value); setBrowse(false); onCommit(e.target.value); }} />
-      <button className="bl-ingdrop-btn" type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => { setBrowse(true); setOpen((o) => !o); }}>▾</button>
+        onChange={(e) => { setV(e.target.value); onCommit(e.target.value); }} />
+      <button className="bl-ingdrop-btn" type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => setOpen((o) => !o)}>▾</button>
       {open && (
         <div className="bl-ingdrop">
-          {filtered.length === 0 ? <div className="bl-ingdrop-empty">No saved {kind === "inclusion" ? "inclusions" : "flours"}{(v && !browse) ? " matching" : " yet"}</div>
+          {filtered.length === 0 ? <div className="bl-ingdrop-empty">No saved ingredients{v ? " matching" : " yet"}</div>
             : filtered.map((i) => <div key={i.id} className="bl-ingdrop-item" onMouseDown={(e) => e.preventDefault()} onClick={() => commit(i.name)}>{i.name}</div>)}
         </div>
       )}
@@ -349,29 +342,18 @@ export default function App() {
   const [doneBatches, setDoneBatches] = useState([]);
   const [nowMin, setNowMin] = useState(() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); });
   useEffect(() => { const id = setInterval(() => { const d = new Date(); setNowMin(d.getHours() * 60 + d.getMinutes()); }, 20000); return () => clearInterval(id); }, []);
-  const tabsRef = useRef(null);
-  const lastScrollY = useRef(0);
-  const [navHidden, setNavHidden] = useState(false);
-  // hide the sticky nav when scrolling down, reveal when scrolling up (mobile)
   useEffect(() => {
+    let t;
     const onScroll = () => {
-      const y = window.scrollY || 0;
-      if (y < 150) setNavHidden(false);
-      else if (y > lastScrollY.current + 6) setNavHidden(true);
-      else if (y < lastScrollY.current - 6) setNavHidden(false);
-      lastScrollY.current = y;
+      clearTimeout(t);
+      if (window.scrollY <= 130) { setNavShow(false); return; }
+      setNavShow(false);                       // hide while actively scrolling
+      t = setTimeout(() => setNavShow(true), 420); // reveal when scrolling stops
     };
     window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
+    return () => { window.removeEventListener("scroll", onScroll); clearTimeout(t); };
   }, []);
-  // keep the active tab pill centered in the scrolling nav
-  useEffect(() => {
-    const c = tabsRef.current; if (!c) return;
-    const el = c.querySelector(".bl-tab.on"); if (!el) return;
-    const target = el.offsetLeft - (c.clientWidth - el.clientWidth) / 2;
-    c.scrollTo({ left: Math.max(0, target), behavior: "smooth" });
-  }, [tab]);
-  const goTab = (k) => { setTab(k); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
+  const goTab = (k) => { setTab(k); setNavShow(false); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState("home");
   const [days, setDays] = useState([]);
@@ -453,7 +435,7 @@ export default function App() {
             if (Array.isArray(gc.coreRecipes) && gc.coreRecipes.every((x) => Array.isArray(x.flours))) setCoreRecipes(gc.coreRecipes);
             else if (Array.isArray(gc.library) && gc.library.every((x) => Array.isArray(x.flours))) setCoreRecipes(gc.library); // migrate
             if (Array.isArray(gc.remixes)) setRemixes(gc.remixes);
-            if (Array.isArray(gc.ingredients)) setIngredients(gc.ingredients.map((i) => ({ ...i, kind: i.kind === "inclusion" ? "inclusion" : "flour" })));
+            if (Array.isArray(gc.ingredients)) setIngredients(gc.ingredients);
             if (gc.starter && typeof gc.starter === "object") setStarter({ ...DEFAULT_STARTER, ...gc.starter });
             if (Array.isArray(gc.inocCal) && gc.inocCal.length === 2) setInocCal(gc.inocCal);
             else if (typeof gc.inocDoubleHrs === "number") setInocCal([{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + gc.inocDoubleHrs }]);
@@ -787,9 +769,8 @@ export default function App() {
   const promoteRemixToCore = (id) => { const r = remixes.find((x) => x.id === id); if (!r) return; setCoreRecipes((rs) => [{ ...r, id: uid() }, ...rs]); setRemixes((rs) => rs.filter((x) => x.id !== id)); };
   const deleteCoreRecipe = (id) => { if (typeof window !== "undefined" && window.confirm && !window.confirm("Delete this core recipe?")) return; setCoreRecipes((rs) => rs.filter((x) => x.id !== id)); };
   const deleteRemix = (id) => setRemixes((rs) => rs.filter((x) => x.id !== id));
-  const addIngredient = (name, kind) => { const n = name.trim(); if (!n || ingredients.some((i) => i.name.toLowerCase() === n.toLowerCase())) return; setIngredients((is) => [{ id: uid(), name: n, price: null, kind: kind === "inclusion" ? "inclusion" : "flour" }, ...is]); };
+  const addIngredient = (name) => { const n = name.trim(); if (!n || ingredients.some((i) => i.name.toLowerCase() === n.toLowerCase())) return; setIngredients((is) => [{ id: uid(), name: n, price: null }, ...is]); };
   const deleteIngredient = (id) => setIngredients((is) => is.filter((i) => i.id !== id));
-  const toggleIngredientKind = (id) => setIngredients((is) => is.map((i) => i.id === id ? { ...i, kind: (i.kind || "flour") === "inclusion" ? "flour" : "inclusion" } : i));
   const patchEdit = (patch) => setEditingDraft((d) => d ? { ...d, ...patch } : d);
   const patchEditFlour = (idx, patch) => setEditingDraft((d) => { if (!d) return d; const f = [...d.flours]; f[idx] = { ...f[idx], ...patch }; return { ...d, flours: f }; });
   const addEditFlour = () => setEditingDraft((d) => d ? { ...d, flours: [...d.flours, mk("Flour " + (d.flours.length + 1), 0)] } : d);
@@ -808,7 +789,7 @@ export default function App() {
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
         * { box-sizing:border-box; }
-        .bl-root{--chrome:#1a0f07;--chrome2:#2f1c0f;--chrome3:#3d2010;--chrome-t:#f5efe3;--chrome-m:#b09070;--paper:#f4eeda;--paper2:#e8d9be;--cream:#fffdf8;--ink:#241508;--ink2:#7a5a3a;--line:#d4c4a8;--crust:#b5651d;--crust2:#8a4a14;--active:#c4521f;--passive:#dfc99a;--passive-line:#c9ad79;--sand:#a08060;--alert:#b32d24;--alert-bg:#f6d9d4;font-family:'DM Sans',system-ui,sans-serif;color:var(--ink);background:var(--paper);padding:0 22px 40px;min-height:100vh;overflow-x:clip;}
+        .bl-root{--chrome:#1a0f07;--chrome2:#2f1c0f;--chrome3:#3d2010;--chrome-t:#f5efe3;--chrome-m:#b09070;--paper:#f4eeda;--paper2:#e8d9be;--cream:#fffdf8;--ink:#241508;--ink2:#7a5a3a;--line:#d4c4a8;--crust:#b5651d;--crust2:#8a4a14;--active:#c4521f;--passive:#dfc99a;--passive-line:#c9ad79;--sand:#a08060;--alert:#b32d24;--alert-bg:#f6d9d4;font-family:'DM Sans',system-ui,sans-serif;color:var(--ink);background:var(--paper);padding:0 22px 40px;min-height:100vh;overflow-x:hidden;}
         .bl-head{background:var(--chrome);margin:0 -22px;padding:14px 22px 0;border-bottom:none;display:flex;flex-direction:column;gap:0;}
         .bl-brandstrip{display:flex;align-items:center;gap:11px;padding-bottom:12px;border-bottom:1px solid rgba(245,239,227,.08);margin-bottom:12px;}
         .bl-hap-logo-sm{height:20px;width:auto;color:var(--chrome-t);display:block;}
@@ -1011,18 +992,12 @@ export default function App() {
         .bl-ing-manager{display:flex;flex-direction:column;gap:6px;}
         .bl-ing-list{display:flex;flex-direction:column;gap:4px;}
         .bl-ing-row{display:flex;align-items:center;gap:8px;padding:6px 10px;background:#fffdf8;border:1px solid var(--line);border-radius:7px;}
-        .bl-ing-row .ir-kind{font-family:'DM Sans';font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;border:none;border-radius:6px;padding:4px 9px;cursor:pointer;}
-        .bl-ing-row .ir-kind.flr{background:var(--paper2);color:var(--crust2);}
-        .bl-ing-row .ir-kind.inc{background:#e7eef0;color:#3a6b80;}
-        .bl-ing-kindtoggle{display:inline-flex;border:1.5px solid var(--line);border-radius:8px;overflow:hidden;flex:none;}
-        .bl-ing-kindtoggle button{font-family:'DM Sans';font-size:12px;font-weight:600;padding:8px 12px;border:none;background:var(--cream);color:var(--ink2);cursor:pointer;}
-        .bl-ing-kindtoggle button.on{background:var(--chrome2);color:var(--chrome-t);}
         .bl-ing-row .ir-name{flex:1;font-family:'DM Sans';font-size:14px;color:var(--ink);}
         .bl-ing-row .ir-price{font-family:'JetBrains Mono';font-size:12px;color:var(--crust2);}
-        .bl-ing-add{display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;align-items:center;}
-        .bl-ing-input{flex:1;min-width:140px;font-family:'DM Sans';font-size:14px;padding:8px 10px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);}
-        .bl-ingwrap{position:relative;display:flex;align-items:center;flex:1;min-width:0;}
-        .bl-ingwrap .ing-name{flex:1;min-width:0;width:100%;padding-right:30px;}
+        .bl-ing-add{display:flex;gap:8px;margin-top:6px;}
+        .bl-ing-input{flex:1;font-family:'DM Sans';font-size:14px;padding:8px 10px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);}
+        .bl-ingwrap{position:relative;display:flex;align-items:center;}
+        .bl-ingwrap .ing-name{flex:1;padding-right:30px;}
         .bl-ingdrop-btn{position:absolute;right:4px;width:24px;height:100%;border:none;background:transparent;color:var(--ink2);cursor:pointer;font-size:11px;display:flex;align-items:center;justify-content:center;}
         .bl-ingdrop{position:absolute;top:100%;left:0;right:0;z-index:200;background:#fff;border:1.5px solid var(--crust);border-radius:8px;box-shadow:0 6px 18px rgba(42,29,18,.14);max-height:160px;overflow-y:auto;margin-top:3px;}
         .bl-ingdrop-item{padding:9px 12px;font-family:'DM Sans';font-size:13px;color:var(--ink);cursor:pointer;}
@@ -1099,15 +1074,14 @@ export default function App() {
         .bl-item{display:grid;grid-template-columns:62px 1fr auto;gap:12px;align-items:center;padding:8px 12px;border-radius:7px;background:var(--paper);border:1px solid var(--line);}
         .bl-item.hit{border-color:var(--alert);background:var(--alert-bg);} .bl-item .tm{font-family:'JetBrains Mono';font-weight:600;font-size:14px;} .bl-item .lb{font-size:13px;} .bl-item .lb b{font-family:'JetBrains Mono';font-weight:600;color:var(--crust2);font-size:11px;} .bl-item .dn{font-family:'JetBrains Mono';font-size:11px;color:var(--ink2);} .bl-item .flag{font-size:10px;font-weight:700;color:var(--alert);}
         .bl-note{font-size:11px;color:var(--ink2);margin-top:10px;line-height:1.5;}
-        .bl-tabs{position:sticky;top:0;z-index:90;background:var(--chrome);display:flex;gap:8px;margin:0 -22px 22px;padding:11px 18px;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;scroll-snap-type:x proximity;scrollbar-width:none;box-shadow:0 6px 18px -10px rgba(0,0,0,.5);transition:transform .25s ease;}
-        .bl-tabs::-webkit-scrollbar{display:none;}
-        .bl-tab{font-family:'DM Sans';font-weight:600;font-size:15px;letter-spacing:.2px;cursor:pointer;border:none;background:rgba(245,239,227,.08);color:var(--chrome-m);padding:11px 20px;border-radius:999px;display:flex;align-items:center;gap:7px;flex:0 0 auto;white-space:nowrap;scroll-snap-align:center;transition:background .15s,color .15s;}
-        .bl-tab:hover{color:var(--chrome-t);background:rgba(245,239,227,.15);}
-        .bl-tab.on{background:var(--crust);color:#fff;}
-        .bl-tab .num{display:none;}
-        .bl-tab .tlabel{display:none;}
-        .bl-tab .tshort{display:inline;}
-        .bl-mininav{display:none;}
+        .bl-tabs{background:var(--chrome);display:flex;gap:0;margin:0 -22px 24px;border-bottom:none;overflow-x:auto;-webkit-overflow-scrolling:touch;padding:0 12px;}
+        .bl-tab{font-family:'DM Sans';font-weight:600;font-size:13px;letter-spacing:.2px;cursor:pointer;border:none;background:transparent;color:var(--chrome-m);padding:11px 14px 13px;border-bottom:2px solid transparent;margin-bottom:0;display:flex;align-items:center;gap:7px;flex:none;white-space:nowrap;}
+        .bl-tab:hover{color:var(--chrome-t);}
+        .bl-tab.on{color:var(--crust);border-bottom-color:var(--crust);}
+        .bl-tab .num{font-family:'JetBrains Mono';font-size:10px;background:rgba(245,239,227,.1);color:var(--chrome-m);border-radius:9px;padding:1px 6px;font-weight:600;}
+        .bl-tab.on .num{background:var(--crust);color:var(--chrome-t);}
+        .bl-tab .tshort{display:none;}
+        .bl-mininav{position:fixed;top:0;left:0;right:0;z-index:80;display:flex;gap:3px;justify-content:center;background:rgba(26,15,7,.95);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid rgba(245,239,227,.1);padding:7px 8px;transform:translateY(-115%);transition:transform .26s ease;box-shadow:0 3px 16px rgba(0,0,0,.3);}
         .bl-home{max-width:1100px;margin:0 auto;padding-top:28px;}
         .bl-home-hd{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:24px;padding-bottom:18px;border-bottom:1.5px solid var(--line);}
         .bl-newday{font-family:'DM Sans';font-size:14px;font-weight:600;color:var(--chrome-t);background:var(--chrome2);border:none;border-radius:9px;padding:11px 18px;cursor:pointer;white-space:nowrap;}
@@ -1127,15 +1101,13 @@ export default function App() {
         .dc-body .dc-recipes{font-size:13px;color:var(--ink2);line-height:1.35;}
         .dc-body .dc-bake{font-family:'JetBrains Mono';font-size:11px;color:var(--sand);}
         .dc-body .dc-open{margin-top:4px;font-family:'DM Sans';font-size:13px;font-weight:600;color:var(--crust);}
-        .bl-dayhd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;}
-        .bl-back{display:inline-flex;align-items:center;justify-content:center;order:0;color:var(--crust2);background:#fff;border:1.5px solid var(--line);border-radius:8px;width:40px;height:40px;padding:0;cursor:pointer;flex:none;}
+        .bl-dayhd{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:12px;}
+        .bl-back{display:inline-flex;align-items:center;justify-content:center;color:var(--crust2);background:#fff;border:1.5px solid var(--line);border-radius:8px;width:40px;height:40px;padding:0;cursor:pointer;}
         .bl-back:hover{background:var(--paper2);color:var(--crust);}
         .bl-dayid{display:flex;align-items:center;gap:10px;flex-wrap:wrap;flex:1;min-width:0;}
-        .bl-dayname{order:1;font-family:'Fraunces',serif;font-weight:600;font-size:24px;color:var(--chrome-t);background:transparent;border:none;border-bottom:1.5px solid transparent;padding:2px 2px;min-width:120px;flex:1;}
-        .bl-dayname:hover{border-bottom-color:rgba(245,239,227,.25);} .bl-dayname:focus{outline:none;border-bottom-color:var(--crust);}
-        .bl-dayname::placeholder{color:var(--chrome-m);}
-        .bl-daydate{order:2;font-family:'JetBrains Mono';font-size:13px;color:var(--ink2);background:#fff;border:1.5px solid var(--line);border-radius:8px;padding:0 10px;height:40px;flex:none;}
-        .bl-unittoggle-hd{order:3;}
+        .bl-dayname{font-family:'Fraunces',serif;font-weight:600;font-size:24px;color:var(--ink);background:transparent;border:none;border-bottom:1.5px solid transparent;padding:2px 2px;min-width:160px;flex:1;}
+        .bl-dayname:hover{border-bottom-color:var(--line);} .bl-dayname:focus{outline:none;border-bottom-color:var(--crust);}
+        .bl-daydate{font-family:'JetBrains Mono';font-size:13px;color:var(--ink2);background:#fff;border:1.5px solid var(--line);border-radius:8px;padding:7px 10px;}
         .bl-mininav.show{transform:translateY(0);}
         .bl-mininav button{font-family:'DM Sans';font-weight:600;font-size:12px;letter-spacing:.2px;color:var(--chrome-m);background:transparent;border:none;border-radius:7px;padding:7px 15px;cursor:pointer;}
         .bl-mininav button:hover{color:var(--chrome-t);}
@@ -1383,35 +1355,14 @@ export default function App() {
         @media (max-width:600px){
           .bl-root{padding:0 12px 34px;}
           .bl-head{margin:0 -12px;padding:12px 12px 0;}
-          .bl-tabs{margin:0 -12px 20px;padding:11px 14px;}
-          .bl-title{font-size:20px;} .bl-title small{font-size:9px;letter-spacing:1.8px;} .bl-hap-logo{height:33px;} .bl-prodname{font-size:21px;}
-          .bl-hap-logo-sm{height:32px;} .bl-prodname-sm{font-size:20px;}
+          .bl-tabs{margin:0 -12px 20px;padding:0 6px;}
+          .bl-title{font-size:20px;} .bl-title small{font-size:9px;letter-spacing:1.8px;} .bl-hap-logo{height:21px;} .bl-prodname{font-size:17px;}
           .bl-panel{padding:13px;}
           /* 16px inputs stop iOS zoom-on-tap; taller targets for fingers */
           .bl-root input, .bl-root select{font-size:16px;min-height:40px;}
           .ing-pct.main{min-height:40px;}
-          .bl-tab{padding:12px 20px;font-size:15px;}
-          /* sticky nav slides up out of the way on scroll-down, returns on scroll-up */
-          .bl-tabs.navhidden{transform:translateY(-100%);}
-          /* day name drops to its own full-width row; home + date + units align above it */
-          .bl-dayname{order:5;flex:1 0 100%;font-size:21px;min-width:0;}
-          /* home header: stack so the toggle + new-day button never clip */
-          .bl-home-hd{flex-direction:column;align-items:stretch;gap:14px;}
-          .bl-home-tabs{display:flex;width:100%;}
-          .bl-home-tabs button{flex:1;text-align:center;padding:12px 8px;font-size:15px;}
-          .bl-newday{width:100%;padding:13px 18px;font-size:15px;}
-          /* food safety: narrower columns so two readings show before scroll */
-          .fsm-head,.fsm-row{grid-template-columns:minmax(104px,1fr) repeat(3,minmax(96px,1fr));min-width:440px;}
-          /* lift the smallest labels off the floor for scannability */
-          .bl-subhead{font-size:11.5px;}
-          .bl-note{font-size:13px;}
-          .lr-spec,.dc-bake,.dc-date{font-size:12px;}
-          .ing-pct.main b{font-size:8.5px;}
-          .fsm-sub{font-size:10px;}
-          .fsm-ts{font-size:12px;}
-          .bl-field2 label{font-size:11.5px;}
-          .bl-fixed .cell label{font-size:11px;}
-          .bl-lev-exp label,.bl-lev-grid label{font-size:11px;}
+          .bl-tab .num{display:none;} .bl-tab .tlabel{display:none;} .bl-tab .tshort{display:inline;}
+          .bl-tab{padding:13px 14px;font-size:13px;flex:1;justify-content:center;}
           .bl-rec-top{grid-template-columns:1fr 1fr;}
           .bl-rec-top > div:first-child{grid-column:1 / -1;}
           .ing-x{width:38px;height:40px;font-size:17px;}
@@ -1506,7 +1457,7 @@ export default function App() {
                 <div className="bl-subhead">Inclusions</div>
                 {(editingDraft.inclusions || []).map((f, idx) => (
                   <div className="ing-row" key={f.id}>
-                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchEditInc(idx, { name: v })} placeholder={"Inclusion " + (idx + 1)} ingredients={ingredients} kind="inclusion" />
+                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchEditInc(idx, { name: v })} placeholder={"Inclusion " + (idx + 1)} ingredients={ingredients} />
                     <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => patchEditInc(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
                     <button className="ing-x" onClick={() => removeEditInc(idx)}>×</button>
                   </div>
@@ -1572,13 +1523,12 @@ export default function App() {
                     <div className="bl-ing-row" key={i.id}>
                       <span className="ir-name">{i.name}</span>
                       {i.price != null && <span className="ir-price">${i.price}</span>}
-                      <button className={"ir-kind " + ((i.kind || "flour") === "inclusion" ? "inc" : "flr")} title="Tap to switch flour / inclusion" onClick={() => toggleIngredientKind(i.id)}>{(i.kind || "flour") === "inclusion" ? "inclusion" : "flour"}</button>
                       <button className="ing-x" onClick={() => deleteIngredient(i.id)}>×</button>
                     </div>
                   ))}
                 </div>
                 <IngAddRow onAdd={addIngredient} />
-                <div className="bl-note" style={{marginTop:8}}>Saved ingredients appear in the matching dropdown — flours on flour fields, inclusions on inclusion fields. Tap a tag to switch which. Price tracking will come later.</div>
+                <div className="bl-note" style={{marginTop:8}}>Ingredients appear in the dropdown on flour and inclusion fields. Price tracking will come later.</div>
               </div>
             </div>
           )}
@@ -1692,12 +1642,20 @@ export default function App() {
       )}
 
       {view === "editor" && (<>
+      <div className={"bl-mininav" + (navShow ? " show" : "")}>
+        {[["plan", "Plan"], ["prep", "Prep"], ["levain", "Levain"], ["build", "Mix"], ["fold", "Shape"], ["bake", "Bake"], ["safety", "Safety"]].map(([k, l]) => (
+          <button key={k} className={tab === k ? "on" : ""} onClick={() => goTab(k)}>{l}</button>
+        ))}
+      </div>
+
       <div className="bl-head">
         <div className="bl-brandstrip"><HapLogo className="bl-hap-logo-sm" /><span className="bl-prodname-sm">BakeLab</span></div>
         <div className="bl-dayhd">
           <button className="bl-back" onClick={backHome} title="Bake days" aria-label="Home"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 11.5 12 4l9 7.5" /><path d="M5 10v9h5v-5h4v5h5v-9" /></svg></button>
-          <BufferedInput className="bl-dayname" value={dayName} onCommit={(v) => setDayName(v)} placeholder="Bake day name" />
-          <input className="bl-daydate" type="date" value={dayDate} onChange={(e) => handleDayDateChange(e.target.value)} />
+          <div className="bl-dayid">
+            <BufferedInput className="bl-dayname" value={dayName} onCommit={(v) => setDayName(v)} placeholder="Bake day name" />
+            <input className="bl-daydate" type="date" value={dayDate} onChange={(e) => handleDayDateChange(e.target.value)} />
+          </div>
           <div className="bl-unittoggle bl-unittoggle-hd">
             <button className={tempUnit === "C" ? "on" : ""} onClick={() => setTempUnit("C")}>°C</button>
             <button className={tempUnit === "F" ? "on" : ""} onClick={() => setTempUnit("F")}>°F</button>
@@ -1705,14 +1663,14 @@ export default function App() {
         </div>
       </div>
 
-      <div className={"bl-tabs" + (navHidden ? " navhidden" : "")} ref={tabsRef}>
-        <button className={"bl-tab" + (tab === "plan" ? " on" : "")} onClick={() => goTab("plan")}><span className="num">1</span><span className="tlabel">Plan</span><span className="tshort">Plan</span></button>
-        <button className={"bl-tab" + (tab === "prep" ? " on" : "")} onClick={() => goTab("prep")}><span className="num">2</span><span className="tlabel">Prep &amp; Shop</span><span className="tshort">Prep</span></button>
-        <button className={"bl-tab" + (tab === "levain" ? " on" : "")} onClick={() => goTab("levain")}><span className="num">3</span><span className="tlabel">Levain</span><span className="tshort">Levain</span></button>
-        <button className={"bl-tab" + (tab === "build" ? " on" : "")} onClick={() => goTab("build")}><span className="num">4</span><span className="tlabel">Mix</span><span className="tshort">Mix</span></button>
-        <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => goTab("fold")}><span className="num">5</span><span className="tlabel">Fold &amp; Shape</span><span className="tshort">Shape</span></button>
-        <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => goTab("bake")}><span className="num">6</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
-        <button className={"bl-tab" + (tab === "safety" ? " on" : "")} onClick={() => goTab("safety")}><span className="num">7</span><span className="tlabel">Food Safety</span><span className="tshort">Safety</span></button>
+      <div className="bl-tabs">
+        <button className={"bl-tab" + (tab === "plan" ? " on" : "")} onClick={() => setTab("plan")}><span className="num">1</span><span className="tlabel">Plan</span><span className="tshort">Plan</span></button>
+        <button className={"bl-tab" + (tab === "prep" ? " on" : "")} onClick={() => setTab("prep")}><span className="num">2</span><span className="tlabel">Prep &amp; Shop</span><span className="tshort">Prep</span></button>
+        <button className={"bl-tab" + (tab === "levain" ? " on" : "")} onClick={() => setTab("levain")}><span className="num">3</span><span className="tlabel">Levain</span><span className="tshort">Levain</span></button>
+        <button className={"bl-tab" + (tab === "build" ? " on" : "")} onClick={() => setTab("build")}><span className="num">4</span><span className="tlabel">Mix</span><span className="tshort">Mix</span></button>
+        <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => setTab("fold")}><span className="num">5</span><span className="tlabel">Fold &amp; Shape</span><span className="tshort">Shape</span></button>
+        <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => setTab("bake")}><span className="num">6</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
+        <button className={"bl-tab" + (tab === "safety" ? " on" : "")} onClick={() => setTab("safety")}><span className="num">7</span><span className="tlabel">Food Safety</span><span className="tshort">Safety</span></button>
       </div>
 
       {/* ---------- TAB 1: PLANNING ---------- */}
@@ -1811,7 +1769,7 @@ export default function App() {
                 {t.inclusions.length === 0 && <div className="ing-empty">No inclusions</div>}
                 {t.inclusions.map((f, idx) => (
                   <div className="ing-row" key={f.id}>
-                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => setIncName(ti, idx, v)} placeholder={"Inclusion " + (idx + 1)} ingredients={ingredients} kind="inclusion" />
+                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => setIncName(ti, idx, v)} placeholder={"Inclusion " + (idx + 1)} ingredients={ingredients} />
                     <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => setIncPct(ti, idx, e.target.value)} /><em>%</em></div>
                     <button className="ing-x" title="Remove inclusion" onClick={() => removeInc(ti, idx)}>×</button>
                   </div>
