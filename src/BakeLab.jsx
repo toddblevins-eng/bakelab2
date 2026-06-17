@@ -177,6 +177,8 @@ const DEFAULT_STARTER = {
   wholeCal: [ { whole: 0, hrs: 5 }, { whole: 25, hrs: 3.5 } ],
 };
 const DAYS_KEY = "bakelab-days-v1";
+// Avery 6468 — 2" × 4" ID labels, 10 per sheet (US Letter, portrait). Exact published geometry.
+const AVERY_6468 = { pageW: 8.5, pageH: 11, cols: 2, rows: 5, labelW: 4, labelH: 2, top: 0.5, left: 0.15625, hGut: 0.1875, vGut: 0 };
 const normalizeSlots = (sl) => (Array.isArray(sl) && sl.length && sl.every((s) => s && s.draft && Array.isArray(s.draft.flours)))
   ? sl.map((s, i) => ({ ...s, mixOrder: s.mixOrder ?? i + 1, bakeOrder: s.bakeOrder ?? i + 1, coreRecipeId: s.coreRecipeId || null, sessions: Array.isArray(s.sessions) && s.sessions.length ? s.sessions.map((sess) => ({ id: sess.id || uid(), date: sess.date || todayISO(), loaves: +(sess.loaves) || 0 })) : [{ id: uid(), date: addDaysISO(todayISO(), 1), loaves: 0 }] }))
   : DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) }));
@@ -407,6 +409,9 @@ export default function App() {
   const [mixWaterTemp, setMixWaterTemp] = useState(null); // internal °C, null = unset
   const [calcInputs, setCalcInputs] = useState(null); // last calculator inputs, internal °C
   const [delTarget, setDelTarget] = useState(null); // {id,name,kind} recipe pending delete confirmation
+  const [labelOpen, setLabelOpen] = useState(false);
+  const [labelOffX, setLabelOffX] = useState(0); // calibration nudge, mm
+  const [labelOffY, setLabelOffY] = useState(0);
   const [nowMin, setNowMin] = useState(() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); });
   useEffect(() => { const id = setInterval(() => { const d = new Date(); setNowMin(d.getHours() * 60 + d.getMinutes()); }, 20000); return () => clearInterval(id); }, []);
   const tabsRef = useRef(null);
@@ -866,6 +871,7 @@ export default function App() {
   );
 
   return (
+    <>
     <div className="bl-root" onFocusCapture={(e) => { const el = e.target; if (el && ((el.tagName === "INPUT" && (el.type === "text" || el.type === "number")) || el.tagName === "TEXTAREA")) { try { el.select(); } catch (err) {} } }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
@@ -1112,7 +1118,7 @@ export default function App() {
         .ing-pct{display:flex;align-items:center;width:80px;flex:none;position:relative;}
         .ing-pct input{width:100%;font-family:'JetBrains Mono';font-size:13px;padding:6px 17px 6px 7px;border:1.5px solid var(--line);border-radius:6px;background:#fff;text-align:right;}
         .ing-pct em{position:absolute;right:7px;font-style:normal;font-size:11px;color:var(--ink2);pointer-events:none;}
-        .ing-pct.main{background:var(--paper2);border:1.5px dashed var(--line);border-radius:6px;padding:6px 8px;justify-content:flex-end;gap:4px;}
+        .ing-pct.main{background:var(--paper2);border:1.5px dashed var(--line);border-radius:6px;padding:6px 8px;justify-content:flex-end;gap:4px;white-space:nowrap;overflow:hidden;}
         .ing-pct.main span{font-family:'JetBrains Mono';font-size:13px;font-weight:600;color:var(--crust2);} .ing-pct.main em{position:static;}
         .ing-pct.main b{position:absolute;left:6px;font-size:7.5px;letter-spacing:.5px;text-transform:uppercase;color:var(--crust);font-weight:700;}
         .ing-x{width:28px;height:30px;flex:none;border:1.5px solid var(--line);background:#fff;border-radius:6px;cursor:pointer;color:var(--ink2);font-size:15px;line-height:1;display:flex;align-items:center;justify-content:center;padding:0;}
@@ -1519,6 +1525,50 @@ export default function App() {
           .bl-hero .big{font-size:21px;} .bl-clock{font-size:23px;}
           .bl-types{gap:14px;}
         }
+
+        /* ---- mix toolbar alt button + label generator ---- */
+        .bl-mixwater-btn.alt{background:#2a3c44;}
+        .bl-mixwater-btn.alt:hover{background:#1f2d33;}
+        .bl-mixwater-btn:disabled{opacity:.45;cursor:not-allowed;}
+        .label-print-overlay{position:fixed;inset:0;z-index:300;background:#241811;overflow:auto;}
+        .label-print-ui{position:sticky;top:0;z-index:3;display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:13px 18px;background:#1a0f07;color:#f5efe3;font-family:'DM Sans',sans-serif;}
+        .label-print-ui .lpu-title{font-family:'Fraunces',serif;font-weight:600;font-size:18px;display:flex;flex-direction:column;line-height:1.15;}
+        .label-print-ui .lpu-title small{font-family:'DM Sans';font-weight:500;font-size:11px;color:#b09070;}
+        .lpu-ctl{display:flex;align-items:center;gap:7px;font-size:12px;color:#b09070;font-weight:600;}
+        .lpu-ctl select{font-family:'DM Sans';font-size:13px;padding:8px 10px;border-radius:8px;border:1.5px solid rgba(245,239,227,.18);background:#2f1c0f;color:#f5efe3;cursor:pointer;}
+        .lpu-ctl.sm input{width:58px;font-family:'JetBrains Mono';font-size:13px;padding:7px 8px;border-radius:7px;border:1.5px solid rgba(245,239,227,.18);background:#2f1c0f;color:#f5efe3;text-align:right;}
+        .lpu-ctl.sm em{font-style:normal;font-size:11px;}
+        .lpu-spacer{flex:1;}
+        .lpu-print{font-family:'DM Sans';font-weight:700;font-size:14px;padding:11px 18px;border:none;border-radius:9px;background:#b5651d;color:#fff;cursor:pointer;}
+        .lpu-print:hover{background:#8a4a14;}
+        .lpu-close{flex:none;border:none;background:rgba(245,239,227,.12);color:#f5efe3;border-radius:8px;width:36px;height:36px;font-size:19px;line-height:1;cursor:pointer;}
+        .label-print-hint{font-family:'DM Sans';font-size:12px;color:#d8c4a8;background:#2f1c0f;padding:9px 18px;line-height:1.45;}
+        .label-print-hint b{color:#f5efe3;}
+        .label-stage{display:flex;justify-content:center;padding:24px 12px 48px;zoom:.62;}
+        .label-sheets{display:flex;flex-direction:column;gap:22px;}
+        .label-sheet{background:#fff;box-shadow:0 6px 30px rgba(0,0,0,.45);}
+        .label-cell{box-sizing:border-box;width:100%;height:100%;overflow:hidden;padding:0.13in 0.16in;display:flex;flex-direction:row;gap:0.16in;color:#1a1a1a;font-family:'DM Sans',sans-serif;}
+        .lc-left{flex:none;width:1.55in;display:flex;flex-direction:column;justify-content:center;border-right:1pt solid #1a1a1a;padding-right:0.14in;overflow:hidden;}
+        .lc-left .lc-n{font-family:'JetBrains Mono';font-weight:700;font-size:11pt;color:#fff;background:#1a1a1a;border-radius:3pt;padding:1.5pt 6pt;align-self:flex-start;margin-bottom:5pt;letter-spacing:.5pt;}
+        .lc-left .lc-name{font-family:'Fraunces',serif;font-weight:600;font-size:17pt;line-height:1.04;}
+        .lc-right{flex:1;display:flex;flex-direction:column;min-width:0;}
+        .lc-lines{flex:1;display:flex;flex-direction:column;gap:1pt;justify-content:center;}
+        .lc-line{display:flex;justify-content:space-between;align-items:baseline;gap:6pt;font-size:9pt;line-height:1.3;}
+        .lc-line .lc-ing{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
+        .lc-line .lc-g{font-family:'JetBrains Mono';font-weight:700;flex:none;}
+        .lc-foot{font-size:7pt;color:#555;border-top:0.5pt solid #ccc;padding-top:2pt;margin-top:3pt;}
+        @media (max-width:600px){ .label-stage{zoom:.42;} .label-print-ui{gap:9px;padding:11px 12px;} .lpu-spacer{flex-basis:100%;height:0;} }
+        @media print {
+          @page { size: 8.5in 11in; margin: 0; }
+          html, body { background:#fff !important; }
+          .bl-root { display: none !important; }
+          .label-print-overlay { position: static !important; inset:auto !important; background:#fff !important; overflow:visible !important; }
+          .label-print-ui, .label-print-hint { display: none !important; }
+          .label-stage { zoom:1 !important; padding:0 !important; display:block !important; }
+          .label-sheets { gap:0 !important; display:block !important; }
+          .label-sheet { box-shadow:none !important; margin:0 !important; break-after:page; page-break-after:always; }
+          .label-sheet:last-child { break-after:auto; page-break-after:auto; }
+        }
       `}</style>
 
       {view === "home" && (
@@ -1592,8 +1642,10 @@ export default function App() {
                 {(editingDraft.flours || []).map((f, idx) => (
                   <div className="ing-row" key={f.id}>
                     <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchEditFlour(idx, { name: v })} placeholder={"Flour " + (idx + 1)} ingredients={ingredients} />
-                    <div className="ing-pct">{idx === 0 ? <span className="ing-main">MAIN {Math.max(0, 100 - (editingDraft.flours.slice(1).reduce((a, x) => a + (+x.pct || 0), 0)))}%</span> : <><input type="number" min="0" value={f.pct} onChange={(e) => patchEditFlour(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></>}</div>
-                    {idx > 0 && <button className="ing-x" onClick={() => removeEditFlour(idx)}>×</button>}
+                    {idx === 0
+                      ? <div className="ing-pct main"><b>main</b><span>{Math.max(0, 100 - (editingDraft.flours.slice(1).reduce((a, x) => a + (+x.pct || 0), 0)))}</span><em>%</em></div>
+                      : <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => patchEditFlour(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>}
+                    {idx === 0 ? <span className="ing-x ph" /> : <button className="ing-x" onClick={() => removeEditFlour(idx)}>×</button>}
                   </div>
                 ))}
                 <button className="bl-add" onClick={addEditFlour}>+ Flour</button>
@@ -2216,6 +2268,10 @@ export default function App() {
               <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 14.76V5a2 2 0 0 0-4 0v9.76a4 4 0 1 0 4 0Z"/></svg>
               Dough temp calculator
             </button>
+            <button className="bl-mixwater-btn alt" onClick={() => setLabelOpen(true)} disabled={!plan.list || plan.list.length === 0}>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8" rx="1"/></svg>
+              Print labels
+            </button>
             {mixWaterTemp != null && (
               <span className="bl-mixwater-cur">Mix water <b>{showTemp(mixWaterTemp)}</b><button onClick={() => setMixWaterTemp(null)} title="Clear" aria-label="Clear mix water">×</button></span>
             )}
@@ -2521,5 +2577,57 @@ export default function App() {
         </div>
       )}
     </div>
+
+    {labelOpen && (() => {
+      const P = AVERY_6468;
+      const data = (plan.list || []).map((b, i) => {
+        const t = types[b.ti];
+        return { n: i + 1, name: t.name, size: b.size, dough: b.dough, lines: ingLines(t).filter((l) => l.pct > 0).map((l) => ({ name: l.name, g: b.weights[l.key] })) };
+      });
+      const per = P.cols * P.rows;
+      const sheets = [];
+      for (let i = 0; i < data.length; i += per) sheets.push(data.slice(i, i + per));
+      if (sheets.length === 0) sheets.push([]);
+      const sheetStyle = { width: P.pageW + "in", height: P.pageH + "in", boxSizing: "border-box", paddingTop: `calc(${P.top}in + ${labelOffY}mm)`, paddingLeft: `calc(${P.left}in + ${labelOffX}mm)` };
+      const gridStyle = { display: "grid", gridTemplateColumns: `repeat(${P.cols}, ${P.labelW}in)`, gridAutoRows: `${P.labelH}in`, columnGap: `${P.hGut}in`, rowGap: `${P.vGut}in` };
+      return (
+        <div className="label-print-overlay">
+          <div className="label-print-ui">
+            <div className="lpu-title">Bucket labels<small>Avery 6468 · 2&quot;×4&quot; · {data.length} label{data.length === 1 ? "" : "s"} · {sheets.length} sheet{sheets.length === 1 ? "" : "s"}</small></div>
+            <label className="lpu-ctl sm">Nudge&nbsp;→<input type="number" step="0.5" value={labelOffX} onChange={(e) => setLabelOffX(+e.target.value || 0)} /><em>mm</em></label>
+            <label className="lpu-ctl sm">Nudge&nbsp;↓<input type="number" step="0.5" value={labelOffY} onChange={(e) => setLabelOffY(+e.target.value || 0)} /><em>mm</em></label>
+            <div className="lpu-spacer" />
+            <button className="lpu-print" onClick={() => window.print()}>Print / Save PDF</button>
+            <button className="lpu-close" onClick={() => setLabelOpen(false)} aria-label="Close">×</button>
+          </div>
+          <div className="label-print-hint">Set the print dialog to <b>100% scale</b> and <b>margins: None</b>. Run one test sheet on plain paper held against a label sheet; if it's off, nudge in mm above.</div>
+          <div className="label-stage">
+            <div className="label-sheets">
+              {sheets.map((sheet, si) => (
+                <div className="label-sheet" key={si} style={sheetStyle}>
+                  <div style={gridStyle}>
+                    {sheet.map((L) => (
+                      <div className="label-cell" key={L.n}>
+                        <div className="lc-left">
+                          <span className="lc-n">B{L.n}</span>
+                          <span className="lc-name">{L.name}</span>
+                        </div>
+                        <div className="lc-right">
+                          <div className="lc-lines">
+                            {L.lines.map((ln, j) => <div className="lc-line" key={j}><span className="lc-ing">{ln.name}</span><span className="lc-g">{fmtG(ln.g)} g</span></div>)}
+                          </div>
+                          <div className="lc-foot">{L.size} loaves · {fmtG(L.dough)} g dough</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    })()}
+    </>
   );
 }
