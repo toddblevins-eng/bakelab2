@@ -207,7 +207,7 @@ const normalizeFoodSafety = (fs) => {
   };
 };
 const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
-const newDayEntry = (name, day) => ({ id: uid(), name: name || "New bake day", date: todayISO(), updatedAt: Date.now(), day: day || defaultDay() });
+const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), day: day || defaultDay() });
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
 // big parent re-render that each keystroke triggers; still commits upward live.
@@ -443,7 +443,7 @@ export default function App() {
   const [view, setView] = useState("home");
   const [days, setDays] = useState([]);
   const [currentDayId, setCurrentDayId] = useState(null);
-  const [dayName, setDayName] = useState("New bake day");
+  const [dayName, setDayName] = useState("New run");
   const [dayDate, setDayDate] = useState(todayISO());
   const persist = (k, v) => { try { if (typeof window !== "undefined" && window.storage) window.storage.set(k, JSON.stringify(v)); } catch (e) {} };
   const loadDayVars = (d) => {
@@ -469,8 +469,8 @@ export default function App() {
     setCalcInputs(d.calcInputs && typeof d.calcInputs === "object" ? d.calcInputs : null);
   };
   const openDay = (id) => { const e = days.find((x) => x.id === id); if (!e) return; loadDayVars(e.day || {}); setDayName(e.name || "Untitled"); setDayDate(e.date || todayISO()); setCurrentDayId(id); setTab("plan"); setActiveBatch(null); setDoneBatches([]); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
-  const newDay = () => { const e = newDayEntry("New bake day", defaultDay()); setDays((ds) => { const nd = [e, ...ds]; persist(DAYS_KEY, nd); return nd; }); loadDayVars(e.day); setDayName(e.name); setDayDate(e.date); setCurrentDayId(e.id); setTab("plan"); setActiveBatch(null); setDoneBatches([]); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
-  const dupDay = (id) => setDays((ds) => { const src = ds.find((d) => d.id === id); if (!src) return ds; const copy = { ...src, id: uid(), name: (src.name || "Bake day") + " (copy)", updatedAt: Date.now(), day: JSON.parse(JSON.stringify(src.day || defaultDay())) }; const nd = [copy, ...ds]; persist(DAYS_KEY, nd); return nd; });
+  const newDay = () => { const e = newDayEntry("New run", defaultDay()); setDays((ds) => { const nd = [e, ...ds]; persist(DAYS_KEY, nd); return nd; }); loadDayVars(e.day); setDayName(e.name); setDayDate(e.date); setCurrentDayId(e.id); setTab("plan"); setActiveBatch(null); setDoneBatches([]); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
+  const dupDay = (id) => setDays((ds) => { const src = ds.find((d) => d.id === id); if (!src) return ds; const copy = { ...src, id: uid(), name: (src.name || "Run") + " (copy)", updatedAt: Date.now(), day: JSON.parse(JSON.stringify(src.day || defaultDay())) }; const nd = [copy, ...ds]; persist(DAYS_KEY, nd); return nd; });
   const delDay = (id) => { setDays((ds) => { const nd = ds.filter((d) => d.id !== id); persist(DAYS_KEY, nd); return nd; }); if (currentDayId === id) { setCurrentDayId(null); setView("home"); } };
   const backHome = () => { setView("home"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
   const stages = useMemo(() => buildStages(params), [params]);
@@ -532,7 +532,7 @@ export default function App() {
           const dRec = await window.storage.get(DAYS_KEY);
           if (dRec && dRec.value) { const arr = JSON.parse(dRec.value); if (Array.isArray(arr)) loadedDays = arr; }
           if (!loadedDays) {
-            // migrate the previous single-day config into one saved bake day + globals
+            // migrate the previous single-day config into one saved run + globals
             const old = await window.storage.get(STORAGE_KEY);
             if (old && old.value) {
               const c = JSON.parse(old.value);
@@ -541,17 +541,17 @@ export default function App() {
                 persist(GLOBALS_KEY, { coreRecipes: c.library, remixes: [], ingredients: [], inocCal: [{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + (typeof c.inocDoubleHrs === "number" ? c.inocDoubleHrs : 1.5) }], tempUnit: c.tempUnit === "F" ? "F" : "C" });
               }
               const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, foodSafety: defaultFoodSafety() };
-              loadedDays = [{ id: uid(), name: "Imported bake day", date: todayISO(), updatedAt: Date.now(), day }];
+              loadedDays = [{ id: uid(), name: "Imported run", date: todayISO(), updatedAt: Date.now(), day }];
             } else {
-              loadedDays = [newDayEntry("My first bake day", defaultDay())];
+              loadedDays = [newDayEntry("My first run", defaultDay())];
             }
             persist(DAYS_KEY, loadedDays);
           }
           setDays(loadedDays);
         } else {
-          setDays([newDayEntry("My first bake day", defaultDay())]);
+          setDays([newDayEntry("My first run", defaultDay())]);
         }
-      } catch (e) { setDays([newDayEntry("Bake day", defaultDay())]); }
+      } catch (e) { setDays([newDayEntry("Run", defaultDay())]); }
       setLoaded(true);
     })();
   }, []);
@@ -1608,17 +1608,17 @@ export default function App() {
           <div className="bl-home-hd">
             <div className="bl-title"><HapLogo className="bl-hap-logo" /><span className="bl-prodname">BakeLab</span><small>production studio</small></div>
             <div className="bl-home-tabs">
-              <button className={homeTab === "bakedays" ? "on" : ""} onClick={() => setHomeTab("bakedays")}>Bake days</button>
+              <button className={homeTab === "bakedays" ? "on" : ""} onClick={() => setHomeTab("bakedays")}>Runs</button>
               <button className={homeTab === "recipes" ? "on" : ""} onClick={() => { setHomeTab("recipes"); setBuilderView("list"); }}>Recipes</button>
               <button className={homeTab === "starter" ? "on" : ""} onClick={() => setHomeTab("starter")}>Starter</button>
             </div>
-            {homeTab === "bakedays" && <button className="bl-newday" onClick={newDay}>+ New bake day</button>}
+            {homeTab === "bakedays" && <button className="bl-newday" onClick={newDay}>+ New run</button>}
             {homeTab === "recipes" && builderView === "list" && <button className="bl-newday" onClick={openNewCore}>+ New recipe</button>}
           </div>
 
           {homeTab === "bakedays" && (<>
           {days.length === 0 ? (
-            <div className="bl-emptytab">No bake days yet — create your first.</div>
+            <div className="bl-emptytab">No runs yet — create your first.</div>
           ) : (
             <div className="bl-daygrid">
               {[...days].sort((a, b) => ((b.date || "").localeCompare(a.date || "")) || ((b.updatedAt || 0) - (a.updatedAt || 0))).map((d) => {
@@ -1652,7 +1652,7 @@ export default function App() {
               })}
             </div>
           )}
-          <div className="bl-note">Each bake day saves its own recipes, loaf counts, schedule, temperatures and levain feed plan. Your recipe library and starter settings are shared across every day.</div>
+          <div className="bl-note">Each run saves its own recipes, loaf counts, schedule, temperatures and levain feed plan. Your recipe library and starter settings are shared across every run.</div>
           </>)}
 
           {homeTab === "recipes" && (<>
@@ -1735,7 +1735,7 @@ export default function App() {
                 ))}
               </div>
               <div className="bl-subhead bl-builder-sh">Remixes</div>
-              {remixes.length === 0 && <div className="bl-emptytab" style={{marginBottom:8}}>No remixes yet — adjust a recipe on a bake day and hit Remix →</div>}
+              {remixes.length === 0 && <div className="bl-emptytab" style={{marginBottom:8}}>No remixes yet — adjust a recipe on a run and hit Remix →</div>}
               <div className="bl-recipe-grid">
                 {remixes.map((r) => (
                   <div className="bl-recipe-card remix" key={r.id} onClick={() => openEditRemix(r.id)}>
@@ -1883,8 +1883,8 @@ export default function App() {
       <div className="bl-head">
         <div className="bl-brandstrip"><HapLogo className="bl-hap-logo-sm" /><span className="bl-prodname-sm">BakeLab</span></div>
         <div className="bl-dayhd">
-          <button className="bl-back" onClick={backHome} title="Bake days" aria-label="Home"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 11.5 12 4l9 7.5" /><path d="M5 10v9h5v-5h4v5h5v-9" /></svg></button>
-          <BufferedInput className="bl-dayname" value={dayName} onCommit={(v) => setDayName(v)} placeholder="Bake day name" />
+          <button className="bl-back" onClick={backHome} title="Runs" aria-label="Home"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 11.5 12 4l9 7.5" /><path d="M5 10v9h5v-5h4v5h5v-9" /></svg></button>
+          <BufferedInput className="bl-dayname" value={dayName} onCommit={(v) => setDayName(v)} placeholder="Run name" />
           <input className="bl-daydate" type="date" value={dayDate} onChange={(e) => handleDayDateChange(e.target.value)} />
           <div className="bl-unittoggle bl-unittoggle-hd">
             <button className={tempUnit === "C" ? "on" : ""} onClick={() => setTempUnit("C")}>°C</button>
@@ -1897,10 +1897,10 @@ export default function App() {
         <button className={"bl-tab" + (tab === "plan" ? " on" : "")} onClick={() => goTab("plan")}><span className="num">1</span><span className="tlabel">Plan</span><span className="tshort">Plan</span></button>
         <button className={"bl-tab" + (tab === "prep" ? " on" : "")} onClick={() => goTab("prep")}><span className="num">2</span><span className="tlabel">Prep &amp; Shop</span><span className="tshort">Prep</span></button>
         <button className={"bl-tab" + (tab === "levain" ? " on" : "")} onClick={() => goTab("levain")}><span className="num">3</span><span className="tlabel">Levain</span><span className="tshort">Levain</span></button>
-        <button className={"bl-tab" + (tab === "build" ? " on" : "")} onClick={() => goTab("build")}><span className="num">4</span><span className="tlabel">Mix</span><span className="tshort">Mix</span></button>
-        <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => goTab("fold")}><span className="num">5</span><span className="tlabel">Fold &amp; Shape</span><span className="tshort">Shape</span></button>
-        <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => goTab("bake")}><span className="num">6</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
-        <button className={"bl-tab" + (tab === "safety" ? " on" : "")} onClick={() => goTab("safety")}><span className="num">7</span><span className="tlabel">Food Safety</span><span className="tshort">Safety</span></button>
+        <button className={"bl-tab" + (tab === "safety" ? " on" : "")} onClick={() => goTab("safety")}><span className="num">4</span><span className="tlabel">Food Safety</span><span className="tshort">Safety</span></button>
+        <button className={"bl-tab" + (tab === "build" ? " on" : "")} onClick={() => goTab("build")}><span className="num">5</span><span className="tlabel">Mix</span><span className="tshort">Mix</span></button>
+        <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => goTab("fold")}><span className="num">6</span><span className="tlabel">Bulk/Shape</span><span className="tshort">Bulk/Shape</span></button>
+        <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => goTab("bake")}><span className="num">7</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
       </div>
 
       {/* ---------- TAB 1: PLANNING ---------- */}
@@ -2104,7 +2104,7 @@ export default function App() {
 
           <div className="bl-sched">
             <h3>Schedule overview</h3>
-            <div className="sub">{collisionCount > 0 ? `${collisionCount} step(s) collide — drag a cycle apart, or hit Auto-space.` : "No collisions — this day is workable as scheduled."}</div>
+            <div className="sub">{collisionCount > 0 ? `${collisionCount} step(s) collide — drag a cycle apart, or hit Auto-space.` : "No collisions — this run is workable as scheduled."}</div>
           </div>
         </div>
       </div>
@@ -2578,7 +2578,7 @@ export default function App() {
             ))}
           </div>
           <button className="bl-addrec" onClick={addFridge}>+ Add fridge</button>
-          <div className="bl-note">Cold-holding target is <b>4°C / 40°F or below</b>. The time stamps itself the moment you enter a reading — tap a stamp to reset it to now. Out-of-range readings flag red. Up to three readings per fridge per bake day.</div>
+          <div className="bl-note">Cold-holding target is <b>4°C / 40°F or below</b>. The time stamps itself the moment you enter a reading — tap a stamp to reset it to now. Out-of-range readings flag red. Up to three readings per fridge per run.</div>
         </div>
 
         <div className="bl-panel">
@@ -2612,7 +2612,7 @@ export default function App() {
             ))}
           </div>
           <button className="bl-addrec" onClick={addSanitizer}>+ Add station</button>
-          <div className="bl-note">Chlorine sanitizer must read <b>100–200 ppm</b> to pass. The time stamps itself when you enter a reading — tap a stamp to reset it to now. Up to three readings per station per bake day.</div>
+          <div className="bl-note">Chlorine sanitizer must read <b>100–200 ppm</b> to pass. The time stamps itself when you enter a reading — tap a stamp to reset it to now. Up to three readings per station per run.</div>
         </div>
       </>)}
 
@@ -2629,7 +2629,7 @@ export default function App() {
       {delTarget && (
         <div className="bl-modal-overlay" onClick={() => setDelTarget(null)}>
           <div className="bl-modal bl-confirm" onClick={(e) => e.stopPropagation()}>
-            <h3>{delTarget.kind === "day" ? "Delete bake day?" : "Delete recipe?"}</h3>
+            <h3>{delTarget.kind === "day" ? "Delete run?" : "Delete recipe?"}</h3>
             <p>“<b>{delTarget.name || "Untitled"}</b>” will be permanently removed. This can’t be undone.</p>
             <div className="bl-confirm-acts">
               <button className="bl-confirm-cancel" onClick={() => setDelTarget(null)}>Cancel</button>
