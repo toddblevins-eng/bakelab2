@@ -15,17 +15,19 @@ const uid = () => Math.random().toString(36).slice(2, 9);
 const mk = (name, pct) => ({ id: uid(), name, pct });
 
 // deep-copy a recipe with fresh ingredient ids (so slots never share refs)
+const DDT_DEFAULT_C = (76 - 32) * 5 / 9; // 76°F target dough temp, stored internally in °C
 const cloneRecipe = (r) => ({
   name: r.name, loafWeight: r.loafWeight, shape: r.shape || "round", water: r.water, salt: r.salt, levain: r.levain,
   levHyd: r.levHyd ?? 80, levInoc: r.levInoc ?? 10, levRefInoc: r.levRefInoc ?? 10, levBuildHrs: r.levBuildHrs ?? 5, levRefTemp: r.levRefTemp ?? 24,
   levWhole: r.levWhole ?? 0, levExpNote: r.levExpNote || "",
+  ddt: r.ddt ?? DDT_DEFAULT_C,
   bakeTemp: r.bakeTemp ?? 245, bakeMin: r.bakeMin ?? 45, steamMin: r.steamMin ?? 20,
   autolyse: r.autolyse ?? 45,
   calNote: r.calNote || "",
   flours: r.flours.map((f) => mk(f.name, f.pct)),
   inclusions: r.inclusions.map((f) => mk(f.name, f.pct)),
 });
-const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", inclusions: [] });
+const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", inclusions: [] });
 
 // date helpers — defined early because DEFAULT_SLOTS uses them at module-eval time
 const todayISO = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
@@ -794,6 +796,18 @@ export default function App() {
     return () => { window.removeEventListener("resize", onR); document.body.style.overflow = prev; clearTimeout(id); };
   }, [liveFull]); // eslint-disable-line
   const onLiveScroll = () => { if (progScroll.current) return; if (follow) setFollow(false); };
+  // ---- bake Gantt scroll refs (one per date) + center-on-now -----------------
+  const bakeRefs = useRef({});
+  const centerBake = useCallback((date, bs) => {
+    const el = bakeRefs.current[date]; if (!el) return;
+    const x = Math.max(0, LIVE_LABEL + (nowMin - bs) * LIVE_PX - el.clientWidth / 3);
+    el.scrollTo({ left: x, behavior: "smooth" });
+  }, [nowMin]);
+  useEffect(() => {
+    if (tab !== "bake") return;
+    const id = setTimeout(() => { (bakePlan.dateSchedules || []).forEach((ds) => centerBake(ds.date, parseTime(bakeDateTimes[ds.date] || "08:00"))); }, 60);
+    return () => clearTimeout(id);
+  }, [tab]); // eslint-disable-line
   const liveDown = (e, b) => { if (!recal) return; e.currentTarget.setPointerCapture(e.pointerId); setFollow(false); liveDragRef.current = { b, startX: e.clientX, startOff: offsets[b] }; };
   const liveMove = (e) => { const d = liveDragRef.current; if (!d) return; const dm = Math.round(((e.clientX - d.startX) / LIVE_PX) / SNAP) * SNAP; const no = Math.max(0, d.startOff + dm); setOffsets((o) => o.map((v, i) => (i === d.b ? no : v))); };
   const liveUp = (e) => { if (liveDragRef.current) { try { e.currentTarget.releasePointerCapture(e.pointerId); } catch (x) {} liveDragRef.current = null; } };
@@ -1242,6 +1256,8 @@ export default function App() {
         .bl-mixwater-cur b{font-family:'JetBrains Mono';font-weight:700;color:#1f6f86;}
         .bl-mixwater-cur button{border:none;background:rgba(31,111,134,.12);color:#1f6f86;border-radius:6px;width:22px;height:22px;cursor:pointer;font-size:14px;line-height:1;}
         .bl-watertemp{font-style:normal;font-family:'JetBrains Mono';font-weight:700;color:#1f6f86;}
+        .bl-build-ddt{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 13px;font-size:12px;color:#2a5c6e;background:#eef4f6;border-bottom:1px solid var(--paper2);}
+        .bl-build-ddt b{font-family:'JetBrains Mono';font-weight:700;font-size:13px;color:#1f6f86;}
         .bl-modal-overlay{position:fixed;inset:0;z-index:200;background:rgba(26,15,7,.55);display:flex;align-items:center;justify-content:center;padding:18px;backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);}
         .bl-modal{background:var(--cream);border-radius:16px;width:100%;max-width:440px;max-height:90vh;overflow-y:auto;box-shadow:0 24px 70px -14px rgba(0,0,0,.55);}
         .dtc{padding:20px;}
@@ -1345,6 +1361,22 @@ export default function App() {
         .lv-screen.full .bl-note{display:none;}
         .lv-screen.full .bl-livestatus{margin-bottom:10px;}
         .lv-screen.full .lv-wrap{flex:1;min-height:0;overflow:auto;}
+        /* bake Gantt — same engine as live timeline, ember palette */
+        .lv-wrap.bake{background:#fbf3e4;border-color:#e4c9a0;}
+        .lv-bar.pre{background:#cba24a;}
+        .lv-bar.steam{background:#d98841;}
+        .lv-bar.dry{background:#a0501a;}
+        .lv-bar.pre .lv-lab.in{color:#3a2410;}
+        .lv-bar.steam .lv-lab.in,.lv-bar.dry .lv-lab.in{color:#fff;}
+        .bl-bakegantt-wrap{margin:10px 0 4px;}
+        .bl-bakegantt-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:9px;}
+        .bg-foot-note{font-family:'DM Sans';font-size:12px;color:var(--ink2);}
+        .bgleg{display:flex;gap:13px;}
+        .bgk{font-family:'DM Sans';font-size:10.5px;color:var(--ink2);display:flex;align-items:center;gap:5px;}
+        .bgk::before{content:"";width:11px;height:11px;border-radius:3px;display:inline-block;}
+        .bgk.pre::before{background:#cba24a;}
+        .bgk.steam::before{background:#d98841;}
+        .bgk.dry::before{background:#a0501a;}
         .lv-row.recal{cursor:grab;touch-action:none;background:rgba(196,82,31,.05);}
         .lv-row.recal:active{cursor:grabbing;}
         .bl-recalhint{font-size:11.5px;color:var(--crust2);background:#fff4e6;border:1px solid #f0d6b0;border-radius:7px;padding:8px 11px;margin-bottom:12px;line-height:1.4;}
@@ -1664,6 +1696,10 @@ export default function App() {
                   </div>
                 ))}
                 <button className="bl-add" onClick={addEditInc}>+ Inclusion</button>
+                <div className="bl-subhead">Dough</div>
+                <div className="bl-re-row">
+                  <div className="bl-field2"><label>Target dough temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(editingDraft.ddt ?? DDT_DEFAULT_C))} onChange={(e) => patchEdit({ ddt: uToC(Number(e.target.value) || 0) })} /></div>
+                </div>
                 <div className="bl-subhead">Bake</div>
                 <div className="bl-re-row">
                   <div className="bl-field2"><label>Temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(editingDraft.bakeTemp ?? 245))} onChange={(e) => patchEdit({ bakeTemp: uToC(Number(e.target.value) || 0) })} /></div>
@@ -2296,6 +2332,7 @@ export default function App() {
                     <div className="bh"><span className="bn">B{i + 1}</span><span className="bt">{t.name}{isD ? " · ✓ built" : ""}</span></div>
                     <div className="meta"><span>Autolyse <b>{fmtClock(startMin + base)}</b></span><span>Mix <b>{fmtClock(startMin + mixStart)}</b></span></div>
                     <div className="meta"><span><b>{b.size}</b> loaves</span><span><b>{fmtG(b.dough)}</b> g dough</span><span>{(t.shape || "round") === "oval" ? "Oval" : "Round"}</span></div>
+                    <div className="bl-build-ddt">Target dough temp<b>{showTemp(t.ddt ?? DDT_DEFAULT_C)}</b></div>
                     {cols.map((l) => <div className="ing" key={l.key}><span className="nm">{l.name}</span><span className="g">{fmtG(b.weights[l.key])} g{l.key === "water" && mixWaterTemp != null ? <em className="bl-watertemp"> · {showTemp(mixWaterTemp)}</em> : null}</span></div>)}
                     {isA && <button className="bl-donebtn" onClick={(e) => { e.stopPropagation(); completeAndNext(i); }}>Done — built ✓</button>}
                   </div>
@@ -2446,31 +2483,56 @@ export default function App() {
                         ))}
                       </div>
                       {(() => {
-                        const span = Math.max(30, ds.lastOut);
-                        const pad = span * 0.03, lo = -pad, hi = ds.lastOut + pad, tot = hi - lo;
-                        const pct = (o) => ((o - lo) / tot) * 100;
-                        const step = tot > 240 ? 60 : 30;
-                        const ticks = []; for (let tk = 0; tk <= ds.lastOut; tk += step) ticks.push(tk);
+                        const isToday = ds.date === todayISO();
+                        const bakeSpan = Math.max(ds.lastOut, 60);
+                        const nowOff = nowMin - bs;
+                        const nowX = LIVE_LABEL + Math.min(Math.max(nowOff, 0), bakeSpan) * LIVE_PX;
+                        const ticks = []; for (let tk = 0; tk <= bakeSpan + 30; tk += 30) ticks.push(tk);
+                        const rows = [];
+                        if (bakePlan.preheat > 0) rows.push({ tag: "Oven", sub: "preheat", blocks: [{ startOff: 0, min: bakePlan.preheat, name: "preheat", type: "pre" }] });
+                        ds.sched.forEach((ld) => {
+                          const blocks = [{ startOff: ld.startOff, min: Math.max(1, ld.ventOff - ld.startOff), name: "steam", type: "steam" }];
+                          if (ld.endOff > ld.ventOff) blocks.push({ startOff: ld.ventOff, min: ld.endOff - ld.ventOff, name: "dry", type: "dry" });
+                          rows.push({ tag: "#" + (ld.i + 1), sub: ld.name + " · " + ld.n + "×", blocks });
+                        });
+                        const rowH = LIVE_ROW, barH = 24, barTop = (rowH - barH) / 2;
+                        const innerH = LIVE_AXIS + rows.length * rowH;
                         return (
-                          <div className="bl-bake-gantt">
-                            <div className="bg-axis">
-                              {ticks.map((tk) => <div className="bg-tick" key={tk} style={{ left: pct(tk) + "%" }}><span>{fmtClock(bs + tk)}</span></div>)}
-                            </div>
-                            <div className="bg-preheat" style={{ left: pct(0) + "%", width: Math.max(0.5, pct(bakePlan.preheat) - pct(0)) + "%" }} title="preheat"><span>preheat</span></div>
-                            {ds.sched.map((ld, idx) => {
-                              const x0 = pct(ld.startOff), xv = pct(ld.ventOff), x1 = pct(ld.endOff);
-                              return (
-                                <div className="bg-row" key={idx}>
-                                  <div className="bg-rowlabel"><b>{ld.name}</b><span>{ld.n}×</span></div>
-                                  <div className="bg-track">
-                                    <div className="bg-bar steam" style={{ left: x0 + "%", width: Math.max(0.4, xv - x0) + "%" }} title="steam" />
-                                    {x1 > xv && <div className="bg-bar dry" style={{ left: xv + "%", width: Math.max(0.4, x1 - xv) + "%" }} title="dry" />}
-                                    {ld.steamMin > 0 && ld.steamMin < ld.bakeMin && <div className="bg-vent" style={{ left: xv + "%" }} title={"steam release " + fmtClock(bs + ld.ventOff)} />}
-                                  </div>
+                          <div className="bl-bakegantt-wrap">
+                            <div className="lv-wrap bake" ref={(el) => { bakeRefs.current[ds.date] = el; }}>
+                              <div className="lv-inner" style={{ width: LIVE_LABEL + bakeSpan * LIVE_PX + 24, height: innerH }}>
+                                <div className="lv-axis">
+                                  {ticks.map((tk) => <div className="lv-tick" key={tk} style={{ left: LIVE_LABEL + tk * LIVE_PX }}>{fmtClock(bs + tk)}</div>)}
                                 </div>
-                              );
-                            })}
-                            <div className="bg-legend"><span className="bg-key steam">steam</span><span className="bg-key dry">dry</span><span className="bg-key ventk">│ release</span></div>
+                                {rows.map((row, ri) => (
+                                  <div className="lv-row" key={ri} style={{ height: rowH }}>
+                                    <div className="lv-label"><span className="b">{row.tag}</span><span className="s">{row.sub}</span></div>
+                                    {row.blocks.map((bl, i) => {
+                                      const w = bl.min * LIVE_PX;
+                                      const cx = LIVE_LABEL + (bl.startOff + bl.min / 2) * LIVE_PX;
+                                      const inside = w >= bl.name.length * 5.2 + 10;
+                                      return (
+                                        <React.Fragment key={i}>
+                                          <div className={"lv-bar " + bl.type} style={{ left: LIVE_LABEL + bl.startOff * LIVE_PX, width: Math.max(w, 2), top: barTop, height: barH }}>
+                                            {inside && <span className="lv-lab in">{bl.name}</span>}
+                                          </div>
+                                          {!inside && <span className="lv-lab above" style={{ left: cx, top: Math.max(1, barTop - 11) }}>{bl.name}</span>}
+                                        </React.Fragment>
+                                      );
+                                    })}
+                                  </div>
+                                ))}
+                                {isToday && (
+                                  <div className="lv-now" style={{ left: nowX, height: innerH }}>
+                                    <span className="lv-nowtag">{fmtClock(nowMin)}</span>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                            <div className="bl-bakegantt-foot">
+                              {isToday ? <button className="bl-anchor ghost" onClick={() => centerBake(ds.date, bs)}>Jump to now</button> : <span className="bg-foot-note">Scheduled for {ds.date}</span>}
+                              <div className="bgleg"><span className="bgk pre">preheat</span><span className="bgk steam">steam</span><span className="bgk dry">dry</span></div>
+                            </div>
                           </div>
                         );
                       })()}
