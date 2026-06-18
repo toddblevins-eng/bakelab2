@@ -1192,6 +1192,7 @@ export default function App() {
         .bl-mininav{display:none;}
         .bl-home{max-width:1100px;margin:0 auto;padding-top:28px;}
         .bl-home-hd{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:24px;padding-bottom:18px;border-bottom:1.5px solid var(--line);}
+        .bl-home-actions{display:flex;justify-content:flex-end;margin-bottom:18px;}
         .bl-newday{font-family:'DM Sans';font-size:14px;font-weight:600;color:var(--chrome-t);background:var(--chrome2);border:none;border-radius:9px;padding:11px 18px;cursor:pointer;white-space:nowrap;}
         .bl-newday:hover{background:var(--chrome);}
         .bl-daygrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px;}
@@ -1610,13 +1611,12 @@ export default function App() {
             <div className="bl-home-tabs">
               <button className={homeTab === "bakedays" ? "on" : ""} onClick={() => setHomeTab("bakedays")}>Runs</button>
               <button className={homeTab === "recipes" ? "on" : ""} onClick={() => { setHomeTab("recipes"); setBuilderView("list"); }}>Recipes</button>
-              <button className={homeTab === "starter" ? "on" : ""} onClick={() => setHomeTab("starter")}>Starter</button>
+              <button className={homeTab === "starter" ? "on" : ""} onClick={() => setHomeTab("starter")}>{(starter.name && starter.name.trim()) || "Starter"}</button>
             </div>
-            {homeTab === "bakedays" && <button className="bl-newday" onClick={newDay}>+ New run</button>}
-            {homeTab === "recipes" && builderView === "list" && <button className="bl-newday" onClick={openNewCore}>+ New recipe</button>}
           </div>
 
           {homeTab === "bakedays" && (<>
+          <div className="bl-home-actions"><button className="bl-newday" onClick={newDay}>+ New run</button></div>
           {days.length === 0 ? (
             <div className="bl-emptytab">No runs yet — create your first.</div>
           ) : (
@@ -1718,8 +1718,9 @@ export default function App() {
             </div>
           ) : (
             <div className="bl-builder-list">
+              <div className="bl-home-actions"><button className="bl-newday" onClick={openNewCore}>+ New recipe</button></div>
               <div className="bl-subhead bl-builder-sh">Core recipes</div>
-              {coreRecipes.length === 0 && <div className="bl-emptytab">No core recipes yet — create one above.</div>}
+              {coreRecipes.length === 0 && <div className="bl-emptytab">No core recipes yet — create your first.</div>}
               <div className="bl-recipe-grid">
                 {coreRecipes.map((r) => (
                   <div className="bl-recipe-card" key={r.id} onClick={() => openEditCore(r.id)}>
