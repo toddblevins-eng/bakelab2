@@ -33,6 +33,16 @@ const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round"
 const todayISO = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
 const addDaysISO = (iso, n) => { try { const d = new Date((iso || todayISO()) + "T00:00:00"); d.setDate(d.getDate() + n); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); } catch (e) { return todayISO(); } };
 const dateDiffDays = (a, b) => { try { return Math.round((new Date(b + "T00:00:00") - new Date(a + "T00:00:00")) / 86400000); } catch (e) { return 0; } };
+const RUN_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+// Builds "June 19, 20, 21" from a mix day + N bake days (mix+1..mix+N). Re-prefixes month if dates cross a boundary.
+const buildRunName = (mixISO, nBakeDays) => {
+  if (!mixISO) return "New run";
+  const list = [mixISO];
+  for (let i = 1; i <= Math.max(1, nBakeDays); i++) list.push(addDaysISO(mixISO, i));
+  let out = "", lastM = null;
+  list.forEach((iso, idx) => { const p = (iso || "").split("-"); const m = +p[1], d = +p[2]; if (m !== lastM) { out += (idx === 0 ? "" : ", ") + (RUN_MONTHS[m - 1] || "") + " " + d; lastM = m; } else { out += ", " + d; } });
+  return out.trim();
+};
 const sessionLoaves = (slot, si) => { const ss = slot.sessions || []; if (si === 0) return Math.max(0, (slot.loaves || 0) - ss.slice(1).reduce((a, s) => a + Math.max(0, +(s.loaves) || 0), 0)); return Math.max(0, +(ss[si] && ss[si].loaves) || 0); };
 const remixName = (base, iso) => { const [y, m, d] = (iso || todayISO()).split("-"); return `${(base || "Recipe").replace(/\s+/g, "_")}_remix_${d}${m}${y.slice(2)}`; };
 function HapLogo({ className }) {
@@ -396,9 +406,15 @@ export default function App() {
   const setSlotSessionDate = (ti, si, date) => setSlots((ss) => ss.map((s, i) => i !== ti ? s : { ...s, sessions: (s.sessions || []).map((sess, j) => j === si ? { ...sess, date } : sess) }));
   const setSlotSessionLoaves = (ti, si, v) => setSlots((ss) => ss.map((s, i) => i !== ti ? s : { ...s, sessions: (s.sessions || []).map((sess, j) => j === si ? { ...sess, loaves: Math.max(0, Math.floor(Number(v) || 0)) } : sess) }));
   const handleDayDateChange = (nv) => {
-    const delta = dateDiffDays(dayDate, nv);
-    if (delta !== 0) setSlots((ss) => ss.map((s) => ({ ...s, sessions: (s.sessions || []).map((sess) => ({ ...sess, date: addDaysISO(sess.date, delta) })) })));
+    if (!nv) return;
+    // mix day drives everything: bake session i lands at mix + (i+1) days
+    const nBake = slots.length ? Math.max(1, ...slots.map((s) => (s.sessions || []).length || 1)) : 1;
+    setSlots((ss) => ss.map((s) => {
+      const sess = (s.sessions && s.sessions.length) ? s.sessions : [{ id: uid(), date: addDaysISO(nv, 1), loaves: 0 }];
+      return { ...s, sessions: sess.map((x, i) => ({ ...x, date: addDaysISO(nv, i + 1) })) };
+    }));
     setDayDate(nv);
+    setDayName(buildRunName(nv, nBake));
   };
   const [drag, setDrag] = useState(null);
   const [hover, setHover] = useState(null);
@@ -978,6 +994,13 @@ export default function App() {
         .bl-pool-row .pr-rem{font-family:'JetBrains Mono';font-size:11px;font-weight:600;color:var(--crust2);min-width:118px;text-align:right;}
         .bl-pool-row .pr-rem.done{color:#3a7d44;} .bl-pool-row .pr-rem.over{color:var(--alert);}
         .bl-pool-row.over .pr-nm{color:var(--alert);}
+        .bl-mixday{display:flex;align-items:flex-end;gap:18px;flex-wrap:wrap;}
+        .bl-mixday-field{display:flex;flex-direction:column;gap:6px;}
+        .bl-mixday-field label{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink2);font-weight:700;}
+        .bl-mixday-field input{font-family:'JetBrains Mono',monospace;font-size:15px;padding:10px 12px;border:1.5px solid var(--line);border-radius:9px;background:var(--cream);color:var(--ink);}
+        .bl-mixday-note{font-size:13px;color:var(--ink2);margin:0;max-width:340px;line-height:1.5;}
+        .bl-mixday-note strong{color:var(--ink);font-weight:600;}
+        @media(max-width:600px){.bl-mixday{gap:12px;}.bl-mixday-note{max-width:none;}}
         .bl-session{border:1.5px solid var(--line);border-radius:11px;background:#fffdf8;padding:14px;margin-bottom:14px;}
         .bl-session-hd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;padding-bottom:12px;border-bottom:1.5px solid var(--line);}
         .bl-session-hd .ss-no{font-family:'Fraunces',serif;font-weight:600;font-size:18px;color:var(--ink);}
@@ -1906,6 +1929,16 @@ export default function App() {
 
       {/* ---------- TAB 1: PLANNING ---------- */}
       {tab === "plan" && (<>
+      <div className="bl-panel">
+        <h3>Run timing</h3>
+        <div className="bl-mixday">
+          <div className="bl-mixday-field">
+            <label>Mix day</label>
+            <input type="date" value={dayDate} onChange={(e) => handleDayDateChange(e.target.value)} />
+          </div>
+          <p className="bl-mixday-note">Bakes snap to the next two days and the run renames itself — e.g. <strong>{buildRunName(dayDate, slots.length ? Math.max(1, ...slots.map((s) => (s.sessions || []).length || 1)) : 2)}</strong>.</p>
+        </div>
+      </div>
       <div className="bl-panel">
         <h3>Recipes & quantities — baker's %</h3>
         <div className="bl-types">
