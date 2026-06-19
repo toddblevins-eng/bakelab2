@@ -216,7 +216,7 @@ const normalizeFoodSafety = (fs) => {
     })),
   };
 };
-const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
+const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
 const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), day: day || defaultDay() });
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
@@ -373,6 +373,7 @@ export default function App() {
   const [startTime, setStartTime] = useState("07:00");
   const [bakeDateTimes, setBakeDateTimes] = useState({});
   const [retard, setRetard] = useState({});
+  const [levBuffer, setLevBuffer] = useState({});
   const [foodSafety, setFoodSafety] = useState(defaultFoodSafety());
   const addFridge = () => setFoodSafety((fs) => ({ ...fs, fridges: [...fs.fridges, newFridge("Fridge " + (fs.fridges.length + 1))] }));
   const removeFridge = (fi) => setFoodSafety((fs) => ({ ...fs, fridges: fs.fridges.filter((_, i) => i !== fi) }));
@@ -395,6 +396,7 @@ export default function App() {
   const addSanitizer = () => setFoodSafety((fs) => ({ ...fs, sanitizers: [...fs.sanitizers, newSaniStation("Sani Spray #" + (fs.sanitizers.length))] }));
   const removeSanitizer = (si) => setFoodSafety((fs) => ({ ...fs, sanitizers: fs.sanitizers.filter((_, i) => i !== si) }));
   const toggleRetard = (key) => setRetard((r) => ({ ...r, [key]: !r[key] }));
+  const toggleLevBuffer = (key) => setLevBuffer((r) => ({ ...r, [key]: !r[key] }));
   const setOvenTime = (date, v) => setBakeDateTimes((t) => ({ ...t, [date]: v }));
   const addSlotSession = (ti) => setSlots((ss) => {
     const slot = ss[ti]; const last = (slot.sessions || []).slice(-1)[0];
@@ -480,6 +482,7 @@ export default function App() {
     }
     const sl = normalizeSlots(d.slots); void sl; // ensure normalizeSlots runs; sessions already applied in setSlots above
     setRetard(d.retard && typeof d.retard === "object" ? d.retard : {});
+    setLevBuffer(d.levBuffer && typeof d.levBuffer === "object" ? d.levBuffer : {});
     setFoodSafety(normalizeFoodSafety(d.foodSafety));
     setMixWaterTemp(typeof d.mixWaterTemp === "number" ? d.mixWaterTemp : null);
     setCalcInputs(d.calcInputs && typeof d.calcInputs === "object" ? d.calcInputs : null);
@@ -556,7 +559,7 @@ export default function App() {
                 setCoreRecipes(c.library);
                 persist(GLOBALS_KEY, { coreRecipes: c.library, remixes: [], ingredients: [], inocCal: [{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + (typeof c.inocDoubleHrs === "number" ? c.inocDoubleHrs : 1.5) }], tempUnit: c.tempUnit === "F" ? "F" : "C" });
               }
-              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, foodSafety: defaultFoodSafety() };
+              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, foodSafety: defaultFoodSafety() };
               loadedDays = [{ id: uid(), name: "Imported run", date: todayISO(), updatedAt: Date.now(), day }];
             } else {
               loadedDays = [newDayEntry("My first run", defaultDay())];
@@ -576,9 +579,9 @@ export default function App() {
   // autosave the open day's snapshot
   useEffect(() => {
     if (!loaded || view !== "editor" || !currentDayId) return;
-    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, foodSafety, mixWaterTemp, calcInputs };
+    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, foodSafety, mixWaterTemp, calcInputs };
     setDays((ds) => { const nd = ds.map((d) => (d.id === currentDayId ? { ...d, name: dayName, date: dayDate, updatedAt: Date.now(), day: snap } : d)); persist(DAYS_KEY, nd); return nd; });
-  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
+  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
 
   const distribute = (s) => { setStagger(s); setOffsets(Array.from({ length: totalBatches }, (_, b) => b * s)); };
 
@@ -702,16 +705,17 @@ export default function App() {
       const Tlev = retarded ? bd.refTemp : bd.refTemp - 10 * (Math.log(desired / bd.baseAdjMin) / Math.log(q10));
       const retardHold = retarded ? Math.max(0, bd.targetPeak - peakOff) : 0;
       const retardLate = retarded && (peakOff > bd.targetPeak);
-      const M = bd.items.reduce((a, x) => a + x.levW, 0);
+      const buffered = !!levBuffer[key];
+      const M = bd.items.reduce((a, x) => a + x.levW, 0) * (buffered ? 1.02 : 1);
       const denom = 1 + bd.H / 100 + bd.I / 100;
       const flourL = M / denom, waterL = flourL * bd.H / 100, seedL = flourL * bd.I / 100;
       const mTot = flourL + waterL + seedL;
       const Twater = waterL > 0 ? (Tlev * mTot - flourL * ambientTemp - seedL * starterTemp) / waterL : Tlev;
       const holdMin = bd.items[bd.items.length - 1].mixOff - bd.targetPeak;
-      return { ...bd, key, retarded, retardHold, retardLate, peakOff, desired, Tlev, M, flourL, waterL, seedL, Twater, holdMin };
+      return { ...bd, key, retarded, buffered, retardHold, retardLate, peakOff, desired, Tlev, M, flourL, waterL, seedL, Twater, holdMin };
     });
     return { feedOff, autoFeed, builds: out };
-  }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard]);
+  }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard, levBuffer]);
 
   // ---- bake schedule: groups per-recipe sessions by date, one oven sequential ----
   const bakePlan = useMemo(() => {
@@ -1541,6 +1545,8 @@ export default function App() {
         .bl-levcard .ing{display:flex;justify-content:space-between;gap:10px;padding:6px 13px;font-size:13px;}
         .bl-levcard .ing span:last-child{font-family:'JetBrains Mono';font-weight:600;}
         .bl-levcard .ing.tot{background:var(--paper);font-weight:600;border-top:1.5px solid var(--ink);color:var(--crust2);}
+        .bl-levcard .lbuffer{display:flex;align-items:center;gap:7px;padding:5px 13px 7px;font-size:11px;color:var(--ink2);font-family:'DM Sans';cursor:pointer;}
+        .bl-levcard .lbuffer input{width:15px;height:15px;accent-color:var(--crust);cursor:pointer;flex:none;}
         .bl-levcard .lwarn{font-size:11px;color:var(--alert);background:var(--alert-bg);padding:8px 13px;line-height:1.4;}
         @media (max-width:600px){
           .bl-root{padding:0 12px 34px;}
@@ -1624,6 +1630,31 @@ export default function App() {
           .label-sheets { gap:0 !important; display:block !important; }
           .label-sheet { box-shadow:none !important; margin:0 !important; break-after:page; page-break-after:always; }
           .label-sheet:last-child { break-after:auto; page-break-after:auto; }
+        }
+        /* ===== iPad / large touch — landscape-first, bench use ===== */
+        @media (pointer: coarse) and (min-width: 768px){
+          .bl-root input, .bl-root select, .bl-root textarea{ font-size:16px; min-height:46px; }
+          .bl-root input[type=range]{ min-height:0; height:30px; }
+          .bl-btn{ min-height:46px; padding:12px 18px; font-size:14px; }
+          .bl-tab{ min-height:46px; padding:13px 22px; font-size:15px; }
+          .bl-tabs{ gap:10px; padding:13px 22px; }
+          .bl-back{ width:46px; height:46px; }
+          .bl-daydate{ min-height:46px; font-size:14px; }
+          .bl-unittoggle-hd{ height:46px; } .bl-unittoggle-hd button{ font-size:14px; padding:0 16px; }
+          .bl-unittoggle button{ min-height:44px; font-size:14px; padding:0 16px; }
+          .bl-ing-kindtoggle button{ min-height:44px; font-size:13px; padding:11px 16px; }
+          .bl-home-tabs button{ min-height:46px; padding:11px 20px; font-size:15px; }
+          .bl-addrec{ min-height:50px; padding:14px; font-size:15px; }
+          .bl-ing-row .ir-kind{ min-height:36px; padding:7px 12px; }
+          .ing-x{ width:40px; height:40px; font-size:18px; }
+          .bl-rmcard{ padding:8px 11px; font-size:13px; }
+          .bl-panel{ padding:22px 24px; }
+          .bl-panel h3{ font-size:22px; }
+          .bl-rec-title, .bl-load .lo-nm, .bl-pool-row .pr-nm, .bl-session-hd .ss-no{ font-size:17px; }
+          .bl-field label, .bl-field2 label, .bl-orders label, .bl-mixday-field label{ font-size:12.5px; }
+          .bl-mixday-note, .bl-calnote, .bl-preheat, .bl-item .lb{ font-size:14.5px; }
+          .bl-bakesum .v{ font-size:22px; } .bl-bakesum .l{ font-size:11px; }
+          .bl-item .tm{ font-size:16px; }
         }
       `}</style>
 
@@ -2269,7 +2300,8 @@ export default function App() {
                       <div className="ing"><span>Mature starter</span><span>{fmtG(bd.seedL)} g</span></div>
                       <div className="ing"><span>Flour</span><span>{fmtG(bd.flourL)} g</span></div>
                       <div className="ing"><span>Water</span><span>{fmtG(bd.waterL)} g</span></div>
-                      <div className="ing tot"><span>Total levain</span><span>{fmtG(bd.M)} g</span></div>
+                      <label className="lbuffer"><input type="checkbox" checked={bd.buffered} onChange={() => toggleLevBuffer(bd.key)} /><span>+2% buffer — spillage / bucket loss</span></label>
+                      <div className="ing tot"><span>Total levain{bd.buffered ? " · +2%" : ""}</span><span>{fmtG(bd.M)} g</span></div>
                     </div>
                     {bd.retarded && bd.retardLate && <div className="lwarn">⚠ Even at room temp this peaks after the mix — it won't be ready in time. Feed earlier.</div>}
                     {bd.retarded && !bd.retardLate && <div className="lretardnote">Built at normal temp to peak, then held cold to preserve it until mix — no extreme water or seed needed.</div>}
