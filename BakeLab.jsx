@@ -216,7 +216,7 @@ const normalizeFoodSafety = (fs) => {
     })),
   };
 };
-const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
+const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
 const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), day: day || defaultDay() });
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
@@ -311,6 +311,129 @@ const vesselLiters = (g) => Math.ceil((g / DOUGH_DENSITY) * BULK_HEADROOM / 1000
 const CAT_ORDER = { flour: 0, liquid: 1, inc: 2 };
 const LIVE_PX = 4, LIVE_LABEL = 96, LIVE_ROW = 46, LIVE_AXIS = 22;
 
+const TIMER_PHASES = [
+  { key: "autolyse", label: "Autolyse", short: "Autolyse" },
+  { key: "postmix", label: "Post-mix Rest", short: "Rest" },
+  { key: "sf1", label: "Stretch & Fold 1", short: "S&F 1" },
+  { key: "sf2", label: "Stretch & Fold 2", short: "S&F 2" },
+  { key: "sf3", label: "Stretch & Fold 3", short: "S&F 3" },
+  { key: "sf4", label: "Stretch & Fold 4", short: "S&F 4" },
+  { key: "bulk", label: "Bulk Ferment", short: "Bulk" },
+];
+const phLabel = (ph) => { const p = TIMER_PHASES.find((x) => x.key === ph); return p ? p.label : ph; };
+const fmtMMSS = (ms) => { if (ms < 0) ms = 0; const t = Math.round(ms / 1000); const m = Math.floor(t / 60), ss = t % 60; return m + ":" + String(ss).padStart(2, "0"); };
+
+function TimerTab({ batches, types, params, dayId }) {
+  const SKEY = "bakelab-timers-v1:" + (dayId || "none");
+  const [timers, setTimers] = useState({});
+  const [durs, setDurs] = useState(() => ({ postmix: +params.restBetween || 50, sf1: +params.restBetween || 50, sf2: +params.restBetween || 50, sf3: +params.restBetween || 50, sf4: +params.restBetween || 50, bulk: +params.bulkRest || 90 }));
+  const [custom, setCustom] = useState([]);
+  const [, setTick] = useState(0);
+  const acRef = useRef(null), beepRef = useRef(null), wakeRef = useRef(null);
+
+  useEffect(() => { try { const raw = localStorage.getItem(SKEY); if (raw) { const o = JSON.parse(raw); setTimers(o && o.timers ? o.timers : {}); if (o && o.durs) setDurs((d) => ({ ...d, ...o.durs })); setCustom(o && Array.isArray(o.custom) ? o.custom : []); } else { setTimers({}); setCustom([]); } } catch (e) { setTimers({}); } }, [SKEY]);
+  useEffect(() => { try { localStorage.setItem(SKEY, JSON.stringify({ timers, durs, custom })); } catch (e) {} }, [SKEY, timers, durs, custom]);
+
+  const hasTimers = Object.keys(timers).length > 0;
+  useEffect(() => { if (!hasTimers) return; const id = setInterval(() => setTick((t) => t + 1), 1000); return () => clearInterval(id); }, [hasTimers]);
+
+  const ensureAudio = () => { try { if (!acRef.current) acRef.current = new (window.AudioContext || window.webkitAudioContext)(); if (acRef.current.state === "suspended") acRef.current.resume(); } catch (e) {} };
+  const beep = () => { const ac = acRef.current; if (!ac) return; try { const o = ac.createOscillator(), g = ac.createGain(); o.type = "square"; o.frequency.value = 880; o.connect(g); g.connect(ac.destination); const t = ac.currentTime; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.32, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.34); o.start(t); o.stop(t + 0.36); } catch (e) {} };
+
+  const now = Date.now();
+  const entries = Object.entries(timers).map(([k, v]) => { const p = k.split(":"); return { k, bi: +p[0], ph: p[1], end: v.end, dur: v.dur, remaining: v.end - now, done: now >= v.end }; });
+  const ringing = entries.some((e) => e.done);
+  useEffect(() => { if (!ringing) { if (beepRef.current) { clearInterval(beepRef.current); beepRef.current = null; } return; } beep(); const id = setInterval(beep, 1100); beepRef.current = id; return () => { clearInterval(id); beepRef.current = null; }; }, [ringing]);
+
+  useEffect(() => {
+    const acquire = async () => { try { if (hasTimers && "wakeLock" in navigator && document.visibilityState === "visible") wakeRef.current = await navigator.wakeLock.request("screen"); } catch (e) {} };
+    const onVis = () => { if (document.visibilityState === "visible" && hasTimers) acquire(); };
+    if (hasTimers) acquire();
+    document.addEventListener("visibilitychange", onVis);
+    return () => { document.removeEventListener("visibilitychange", onVis); try { if (wakeRef.current) { wakeRef.current.release(); wakeRef.current = null; } } catch (e) {} };
+  }, [hasTimers]);
+
+  const allPhases = TIMER_PHASES.concat(custom.map((c) => ({ key: c.key, label: c.label, short: c.label })));
+  const labelOf = (ph) => { const p = allPhases.find((x) => x.key === ph); return p ? p.label : ph; };
+  const phaseDur = (ph) => { if (ph in durs) return durs[ph] || 0; const c = custom.find((x) => x.key === ph); return c ? (+c.dur || 0) : 0; };
+  const durFor = (b, ph) => ph === "autolyse" ? (+((types[b.ti] && types[b.ti].autolyse)) || +params.autolyse || 45) : phaseDur(ph);
+  const addCustom = () => setCustom((c) => [...c, { key: "c" + Date.now(), label: "Custom " + (c.length + 1), dur: 20 }]);
+  const removeCustom = (key) => { setCustom((c) => c.filter((x) => x.key !== key)); setTimers((t) => { const n = {}; for (const k in t) { if (!k.endsWith(":" + key)) n[k] = t[k]; } return n; }); };
+  const setCustomLabel = (key, label) => setCustom((c) => c.map((x) => x.key === key ? { ...x, label } : x));
+  const setCustomDur = (key, dur) => setCustom((c) => c.map((x) => x.key === key ? { ...x, dur } : x));
+  const start = (bi, ph) => { ensureAudio(); const m = durFor(batches[bi], ph); if (m <= 0) return; setTimers((t) => ({ ...t, [bi + ":" + ph]: { end: Date.now() + m * 60000, dur: m * 60000 } })); };
+  const cancel = (k) => setTimers((t) => { const n = { ...t }; delete n[k]; return n; });
+  const nextPhase = (ph) => { const nF = +params.folds || 4; let ni = allPhases.findIndex((p) => p.key === ph) + 1; while (ni < allPhases.length) { const p = allPhases[ni]; const mm = p.key.match(/^sf(\d)$/); if ((mm && +mm[1] > nF) || phaseDur(p.key) <= 0) { ni++; continue; } return p; } return null; };
+
+  const active = entries.filter((e) => !e.done).sort((a, b) => a.remaining - b.remaining);
+  const done = entries.filter((e) => e.done);
+
+  if (!batches.length) return <div className="bl-panel"><div className="bl-timer-empty">No batches yet — set loaves on the Plan tab first.</div></div>;
+
+  return (<>
+    {done.length > 0 && (
+      <div className="bl-panel bl-timer-done">
+        {done.map((e) => { const np = nextPhase(e.ph); return (
+          <div className="td-row" key={e.k}>
+            <div className="td-info"><span className="td-b">B{e.bi + 1}</span><span className="td-ph">{labelOf(e.ph)}</span><span className="td-done">DONE</span></div>
+            <div className="td-acts">
+              {np && <button className="td-next" onClick={() => { start(e.bi, np.key); cancel(e.k); }}>Start {np.label} ▶</button>}
+              <button className="td-stop" onClick={() => cancel(e.k)}>{np ? "Stop" : "Stop ✓"}</button>
+            </div>
+          </div>
+        ); })}
+      </div>
+    )}
+    <div className="bl-panel">
+      <h3>Active timers</h3>
+      {active.length === 0 ? <div className="bl-timer-empty">No timers running. Start one below.</div> : (
+        <div className="bl-timer-active">
+          {active.map((e) => { const pct = Math.max(0, Math.min(100, 100 * (1 - e.remaining / e.dur))); return (
+            <div className="ta-card" key={e.k}>
+              <div className="ta-top"><span className="ta-b">B{e.bi + 1}</span><span className="ta-ph">{labelOf(e.ph)}</span></div>
+              <div className="ta-time">{fmtMMSS(e.remaining)}</div>
+              <div className="ta-bar"><div className="ta-fill" style={{ width: pct + "%" }} /></div>
+              <button className="ta-cancel" onClick={() => cancel(e.k)}>Cancel</button>
+            </div>
+          ); })}
+        </div>
+      )}
+    </div>
+    <div className="bl-panel">
+      <h3>Start a timer</h3>
+      <div className="bl-timer-durnote">Autolyse pulls from each recipe. Set the rest here — they apply to every batch. Set any phase to <b>0</b> to skip it (Next jumps past it).</div>
+      <div className="bl-timer-durs">
+        {["postmix", "sf1", "sf2", "sf3", "sf4", "bulk"].map((ph) => (
+          <label key={ph} className="dur-cell"><span>{labelOf(ph)}</span><input type="number" min="0" value={durs[ph]} onChange={(e) => setDurs((d) => ({ ...d, [ph]: Math.max(0, Math.floor(Number(e.target.value) || 0)) }))} /></label>
+        ))}
+        {custom.map((c) => (
+          <div key={c.key} className="dur-cell dur-custom">
+            <input className="dur-label" value={c.label} placeholder="Phase name" onChange={(e) => setCustomLabel(c.key, e.target.value)} />
+            <div className="dur-cw"><input type="number" min="0" value={c.dur} onChange={(e) => setCustomDur(c.key, Math.max(0, Math.floor(Number(e.target.value) || 0)))} /><button className="dur-x" title="Remove phase" onClick={() => removeCustom(c.key)}>×</button></div>
+          </div>
+        ))}
+      </div>
+      <button className="bl-addphase" onClick={addCustom}>+ Add phase timer</button>
+      <div className="bl-timer-grid">
+        {batches.map((b, bi) => (
+          <div className="tg-row" key={bi}>
+            <div className="tg-bn"><span className="tg-b">B{bi + 1}</span><span className="tg-nm">{b.name}</span></div>
+            <div className="tg-cells">
+              {allPhases.map((p) => { const k = bi + ":" + p.key; const tm = timers[k]; const run = tm && Date.now() < tm.end; const rng = tm && Date.now() >= tm.end; const m = durFor(b, p.key); return (
+                <button key={p.key} className={"tg-cell" + (run ? " running" : "") + (rng ? " ringing" : "")} onClick={() => (run ? cancel(k) : start(bi, p.key))} disabled={m <= 0}>
+                  <span className="tg-ph">{p.short}</span>
+                  <span className="tg-d">{run ? fmtMMSS(tm.end - Date.now()) : rng ? "done" : m <= 0 ? "skip" : m + "m"}</span>
+                </button>
+              ); })}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="bl-note">Tap a phase to start its countdown; tap a running phase to cancel it. Timers run off the clock, so they stay accurate through a screen-off or tab switch, and the screen is held awake while any timer is running. The alarm sounds while BakeLab is open on this device.</div>
+    </div>
+  </>);
+}
+
 export default function App() {
   const [params, setParams] = useState(DEFAULTS);
   const [library, setLibrary] = useState(DEFAULT_LIBRARY); // kept for migration compat in globals load only
@@ -373,6 +496,7 @@ export default function App() {
   const [startTime, setStartTime] = useState("07:00");
   const [bakeDateTimes, setBakeDateTimes] = useState({});
   const [retard, setRetard] = useState({});
+  const [levBuffer, setLevBuffer] = useState({});
   const [foodSafety, setFoodSafety] = useState(defaultFoodSafety());
   const addFridge = () => setFoodSafety((fs) => ({ ...fs, fridges: [...fs.fridges, newFridge("Fridge " + (fs.fridges.length + 1))] }));
   const removeFridge = (fi) => setFoodSafety((fs) => ({ ...fs, fridges: fs.fridges.filter((_, i) => i !== fi) }));
@@ -395,6 +519,7 @@ export default function App() {
   const addSanitizer = () => setFoodSafety((fs) => ({ ...fs, sanitizers: [...fs.sanitizers, newSaniStation("Sani Spray #" + (fs.sanitizers.length))] }));
   const removeSanitizer = (si) => setFoodSafety((fs) => ({ ...fs, sanitizers: fs.sanitizers.filter((_, i) => i !== si) }));
   const toggleRetard = (key) => setRetard((r) => ({ ...r, [key]: !r[key] }));
+  const toggleLevBuffer = (key) => setLevBuffer((r) => ({ ...r, [key]: !r[key] }));
   const setOvenTime = (date, v) => setBakeDateTimes((t) => ({ ...t, [date]: v }));
   const addSlotSession = (ti) => setSlots((ss) => {
     const slot = ss[ti]; const last = (slot.sessions || []).slice(-1)[0];
@@ -480,6 +605,8 @@ export default function App() {
     }
     const sl = normalizeSlots(d.slots); void sl; // ensure normalizeSlots runs; sessions already applied in setSlots above
     setRetard(d.retard && typeof d.retard === "object" ? d.retard : {});
+    setLevBuffer(d.levBuffer && typeof d.levBuffer === "object" ? d.levBuffer : {});
+    setDoneBatches(Array.isArray(d.doneBatches) ? d.doneBatches : []);
     setFoodSafety(normalizeFoodSafety(d.foodSafety));
     setMixWaterTemp(typeof d.mixWaterTemp === "number" ? d.mixWaterTemp : null);
     setCalcInputs(d.calcInputs && typeof d.calcInputs === "object" ? d.calcInputs : null);
@@ -556,7 +683,7 @@ export default function App() {
                 setCoreRecipes(c.library);
                 persist(GLOBALS_KEY, { coreRecipes: c.library, remixes: [], ingredients: [], inocCal: [{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + (typeof c.inocDoubleHrs === "number" ? c.inocDoubleHrs : 1.5) }], tempUnit: c.tempUnit === "F" ? "F" : "C" });
               }
-              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, foodSafety: defaultFoodSafety() };
+              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, doneBatches: [], foodSafety: defaultFoodSafety() };
               loadedDays = [{ id: uid(), name: "Imported run", date: todayISO(), updatedAt: Date.now(), day }];
             } else {
               loadedDays = [newDayEntry("My first run", defaultDay())];
@@ -576,9 +703,9 @@ export default function App() {
   // autosave the open day's snapshot
   useEffect(() => {
     if (!loaded || view !== "editor" || !currentDayId) return;
-    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, foodSafety, mixWaterTemp, calcInputs };
+    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, doneBatches, foodSafety, mixWaterTemp, calcInputs };
     setDays((ds) => { const nd = ds.map((d) => (d.id === currentDayId ? { ...d, name: dayName, date: dayDate, updatedAt: Date.now(), day: snap } : d)); persist(DAYS_KEY, nd); return nd; });
-  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
+  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
 
   const distribute = (s) => { setStagger(s); setOffsets(Array.from({ length: totalBatches }, (_, b) => b * s)); };
 
@@ -702,16 +829,17 @@ export default function App() {
       const Tlev = retarded ? bd.refTemp : bd.refTemp - 10 * (Math.log(desired / bd.baseAdjMin) / Math.log(q10));
       const retardHold = retarded ? Math.max(0, bd.targetPeak - peakOff) : 0;
       const retardLate = retarded && (peakOff > bd.targetPeak);
-      const M = bd.items.reduce((a, x) => a + x.levW, 0);
+      const buffered = !!levBuffer[key];
+      const M = bd.items.reduce((a, x) => a + x.levW, 0) * (buffered ? 1.02 : 1);
       const denom = 1 + bd.H / 100 + bd.I / 100;
       const flourL = M / denom, waterL = flourL * bd.H / 100, seedL = flourL * bd.I / 100;
       const mTot = flourL + waterL + seedL;
       const Twater = waterL > 0 ? (Tlev * mTot - flourL * ambientTemp - seedL * starterTemp) / waterL : Tlev;
       const holdMin = bd.items[bd.items.length - 1].mixOff - bd.targetPeak;
-      return { ...bd, key, retarded, retardHold, retardLate, peakOff, desired, Tlev, M, flourL, waterL, seedL, Twater, holdMin };
+      return { ...bd, key, retarded, buffered, retardHold, retardLate, peakOff, desired, Tlev, M, flourL, waterL, seedL, Twater, holdMin };
     });
     return { feedOff, autoFeed, builds: out };
-  }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard]);
+  }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard, levBuffer]);
 
   // ---- bake schedule: groups per-recipe sessions by date, one oven sequential ----
   const bakePlan = useMemo(() => {
@@ -1541,6 +1669,8 @@ export default function App() {
         .bl-levcard .ing{display:flex;justify-content:space-between;gap:10px;padding:6px 13px;font-size:13px;}
         .bl-levcard .ing span:last-child{font-family:'JetBrains Mono';font-weight:600;}
         .bl-levcard .ing.tot{background:var(--paper);font-weight:600;border-top:1.5px solid var(--ink);color:var(--crust2);}
+        .bl-levcard .lbuffer{display:flex;align-items:center;gap:7px;padding:5px 13px 7px;font-size:11px;color:var(--ink2);font-family:'DM Sans';cursor:pointer;}
+        .bl-levcard .lbuffer input{width:15px;height:15px;accent-color:var(--crust);cursor:pointer;flex:none;}
         .bl-levcard .lwarn{font-size:11px;color:var(--alert);background:var(--alert-bg);padding:8px 13px;line-height:1.4;}
         @media (max-width:600px){
           .bl-root{padding:0 12px 34px;}
@@ -1625,6 +1755,61 @@ export default function App() {
           .label-sheet { box-shadow:none !important; margin:0 !important; break-after:page; page-break-after:always; }
           .label-sheet:last-child { break-after:auto; page-break-after:auto; }
         }
+        .bl-optimize{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:10px 0 2px;padding:9px 11px;background:var(--paper);border:1px solid var(--line);border-radius:8px;}
+        .bl-optimize.warn{font-size:12px;color:var(--alert);background:var(--alert-bg);border-color:var(--alert);}
+        .bl-optimize .opt-stat{display:flex;gap:9px;align-items:center;font-family:'JetBrains Mono';font-size:11px;color:var(--ink2);margin-right:2px;white-space:nowrap;}
+        .bl-optimize .opt-stat span:first-child{font-weight:700;color:var(--crust2);}
+        .opt-chip{font-family:'DM Sans';font-size:12px;font-weight:600;cursor:pointer;border:1px solid var(--line);background:var(--cream);color:var(--ink);border-radius:7px;padding:7px 11px;display:inline-flex;align-items:center;gap:5px;}
+        .opt-chip:hover{border-color:var(--crust);color:var(--crust2);}
+        .opt-chip em{font-style:normal;font-family:'JetBrains Mono';font-size:11px;color:var(--ink2);}
+        .bl-timer-done{background:var(--alert-bg);border:1.5px solid var(--alert);animation:tflash 1.1s steps(1) infinite;}
+        @keyframes tflash{50%{background:var(--cream);}}
+        .bl-timer-done .td-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:7px 2px;flex-wrap:wrap;}
+        .td-info{display:flex;align-items:center;gap:11px;flex-wrap:wrap;}
+        .td-info .td-b{font-family:'JetBrains Mono';font-weight:700;font-size:17px;color:var(--ink);}
+        .td-info .td-ph{font-family:'Fraunces',serif;font-size:18px;color:var(--ink);}
+        .td-info .td-done{font-family:'DM Sans';font-weight:700;font-size:12px;letter-spacing:1.5px;color:var(--alert);}
+        .td-stop{font-family:'DM Sans';font-weight:700;font-size:14px;cursor:pointer;border:none;border-radius:8px;padding:11px 20px;background:var(--alert);color:#fff;flex:none;}
+        .td-acts{display:flex;align-items:center;gap:9px;flex:none;flex-wrap:wrap;}
+        .td-next{font-family:'DM Sans';font-weight:700;font-size:14px;cursor:pointer;border:none;border-radius:8px;padding:11px 18px;background:var(--ink);color:var(--paper);}
+        .td-next:hover{background:var(--chrome2);}
+        .bl-timer-empty{font-size:13px;color:var(--ink2);}
+        .bl-timer-active{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;}
+        .ta-card{border:none;border-radius:16px;padding:26px 28px;background:var(--chrome);box-shadow:0 4px 16px rgba(26,15,7,.18);}
+        .ta-top{display:flex;align-items:center;gap:12px;margin-bottom:10px;}
+        .ta-top .ta-b{font-family:'JetBrains Mono';font-weight:700;font-size:22px;color:var(--chrome-t);}
+        .ta-top .ta-ph{font-family:'Fraunces',serif;font-size:21px;color:var(--chrome-m);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+        .ta-time{font-family:'JetBrains Mono';font-weight:700;font-size:68px;color:var(--chrome-t);letter-spacing:-3px;line-height:1;}
+        .ta-bar{height:9px;background:rgba(245,239,227,.16);border-radius:5px;margin-top:14px;overflow:hidden;}
+        .ta-fill{height:100%;background:var(--crust);transition:width 1s linear;}
+        .ta-cancel{margin-top:16px;width:100%;font-family:'DM Sans';font-weight:700;font-size:14px;cursor:pointer;border:1.5px solid rgba(245,239,227,.3);background:transparent;color:var(--chrome-t);border-radius:10px;padding:13px;}
+        .ta-cancel:hover{background:rgba(245,239,227,.1);border-color:var(--chrome-t);}
+        .bl-timer-durnote{font-size:13px;color:var(--ink2);margin-bottom:10px;}
+        .bl-timer-durs{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:10px;margin-bottom:12px;align-items:end;}
+        .dur-cell{display:flex;flex-direction:column;gap:4px;}
+        .dur-cell span{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink2);font-weight:700;}
+        .dur-cell input{font-family:'JetBrains Mono';font-size:15px;padding:9px 11px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);width:100%;}
+        .dur-custom{gap:6px;}
+        .dur-label{font-family:'DM Sans';font-weight:600;font-size:13px;padding:8px 10px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);width:100%;}
+        .dur-cw{display:flex;gap:6px;align-items:stretch;}
+        .dur-cw input{flex:1;min-width:0;}
+        .dur-x{flex:none;width:40px;border:1.5px solid var(--line);border-radius:8px;background:var(--paper);color:var(--ink2);font-size:18px;cursor:pointer;line-height:1;}
+        .dur-x:hover{border-color:var(--alert);color:var(--alert);}
+        .bl-addphase{margin:0 0 18px;font-family:'DM Sans';font-weight:600;font-size:13px;cursor:pointer;border:1.5px dashed var(--line);border-radius:8px;background:transparent;color:var(--crust2);padding:11px 16px;}
+        .bl-addphase:hover{border-color:var(--crust);background:var(--cream);}
+        .bl-timer-grid{display:flex;flex-direction:column;gap:11px;}
+        .tg-row{display:flex;align-items:center;gap:13px;flex-wrap:wrap;}
+        .tg-bn{display:flex;align-items:baseline;gap:7px;min-width:118px;}
+        .tg-bn .tg-b{font-family:'JetBrains Mono';font-weight:700;font-size:16px;color:var(--ink);}
+        .tg-bn .tg-nm{font-size:13px;color:var(--ink2);}
+        .tg-cells{display:flex;gap:6px;flex-wrap:wrap;flex:1;}
+        .tg-cell{display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer;border:1.5px solid var(--line);border-radius:8px;background:var(--cream);color:var(--ink);padding:8px 9px;min-width:62px;font-family:'DM Sans';}
+        .tg-cell .tg-ph{font-size:12px;font-weight:600;}
+        .tg-cell .tg-d{font-family:'JetBrains Mono';font-size:11px;color:var(--ink2);}
+        .tg-cell.running{border-color:var(--crust);background:#fff;}
+        .tg-cell.running .tg-d{color:var(--crust2);font-weight:700;}
+        .tg-cell.ringing{border-color:var(--alert);background:var(--alert-bg);}
+        .tg-cell:disabled{opacity:.4;cursor:default;}
         /* ===== iPad / large touch — landscape-first, bench use ===== */
         @media (pointer: coarse) and (min-width: 768px){
           .bl-root input, .bl-root select, .bl-root textarea{ font-size:16px; min-height:46px; }
@@ -1642,6 +1827,8 @@ export default function App() {
           .bl-ing-row .ir-kind{ min-height:36px; padding:7px 12px; }
           .ing-x{ width:40px; height:40px; font-size:18px; }
           .bl-rmcard{ padding:8px 11px; font-size:13px; }
+          .opt-chip{ min-height:44px; font-size:13px; }
+          .tg-cell{ min-height:56px; min-width:72px; } .td-stop{ min-height:48px; } .td-next{ min-height:48px; } .ta-cancel{ min-height:52px; } .bl-addphase{ min-height:48px; } .dur-x{ min-height:46px; }
           .bl-panel{ padding:22px 24px; }
           .bl-panel h3{ font-size:22px; }
           .bl-rec-title, .bl-load .lo-nm, .bl-pool-row .pr-nm, .bl-session-hd .ss-no{ font-size:17px; }
@@ -1950,6 +2137,7 @@ export default function App() {
         <button className={"bl-tab" + (tab === "build" ? " on" : "")} onClick={() => goTab("build")}><span className="num">5</span><span className="tlabel">Mix</span><span className="tshort">Mix</span></button>
         <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => goTab("fold")}><span className="num">6</span><span className="tlabel">Bulk/Shape</span><span className="tshort">Bulk/Shape</span></button>
         <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => goTab("bake")}><span className="num">7</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
+        <button className={"bl-tab" + (tab === "timers" ? " on" : "")} onClick={() => goTab("timers")}><span className="num">8</span><span className="tlabel">Timers</span><span className="tshort">Timers</span></button>
       </div>
 
       {/* ---------- TAB 1: PLANNING ---------- */}
@@ -1987,6 +2175,19 @@ export default function App() {
                   <div><label>Loaf g</label><input className="n" type="number" min="0" value={t.loafWeight} onChange={(e) => setDraft(ti, { loafWeight: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div><label>Autolyse min</label><input className="n" type="number" min="0" value={t.autolyse ?? 45} onChange={(e) => setDraft(ti, { autolyse: Math.max(0, Number(e.target.value) || 0) })} /></div>
                 </div>
+                {(() => {
+                  const N = sm.loaves, mx = sm.maxLPB, bc = sm.batchCount;
+                  if (N <= 0) return null;
+                  if (mx <= 0) return <div className="bl-optimize warn">⚡ One loaf ({fmtG(sm.W)} g) is heavier than the {maxBatch / 1000}kg mixer cap — lower loaf weight or raise capacity.</div>;
+                  const full = bc * mx, fillPct = Math.round((100 * N) / full), maxed = N === full, trimTo = (bc - 1) * mx;
+                  return (
+                    <div className="bl-optimize">
+                      <div className="opt-stat"><span>⚡ {mx}/mix</span><span>{bc} mix{bc > 1 ? "es" : ""} · {fillPct}% full{maxed ? " ✓" : ""}</span></div>
+                      {!maxed && <button className="opt-chip up" onClick={() => setLoaves(ti, full)}>↑ {full} fills {bc} mix{bc > 1 ? "es" : ""} <em>+{full - N}</em></button>}
+                      {bc >= 2 && <button className="opt-chip down" onClick={() => setLoaves(ti, trimTo)}>↓ {trimTo} drops a mix <em>−{N - trimTo}</em></button>}
+                    </div>
+                  );
+                })()}
                 <div className="bl-rec-sessions">
                   {(slots[ti].sessions || []).map((sess, si) => {
                     const lv = sessionLoaves(slots[ti], si);
@@ -2294,7 +2495,8 @@ export default function App() {
                       <div className="ing"><span>Mature starter</span><span>{fmtG(bd.seedL)} g</span></div>
                       <div className="ing"><span>Flour</span><span>{fmtG(bd.flourL)} g</span></div>
                       <div className="ing"><span>Water</span><span>{fmtG(bd.waterL)} g</span></div>
-                      <div className="ing tot"><span>Total levain</span><span>{fmtG(bd.M)} g</span></div>
+                      <label className="lbuffer"><input type="checkbox" checked={bd.buffered} onChange={() => toggleLevBuffer(bd.key)} /><span>+2% buffer — spillage / bucket loss</span></label>
+                      <div className="ing tot"><span>Total levain{bd.buffered ? " · +2%" : ""}</span><span>{fmtG(bd.M)} g</span></div>
                     </div>
                     {bd.retarded && bd.retardLate && <div className="lwarn">⚠ Even at room temp this peaks after the mix — it won't be ready in time. Feed earlier.</div>}
                     {bd.retarded && !bd.retardLate && <div className="lretardnote">Built at normal temp to peak, then held cold to preserve it until mix — no extreme water or seed needed.</div>}
@@ -2380,7 +2582,8 @@ export default function App() {
               {doneBatches.length > 0 && <button onClick={() => { setDoneBatches([]); setActiveBatch(null); }}>Reset progress</button>}
             </div>
             <div className="bl-builds">
-              {plan.list.map((b, i) => {
+              {plan.list.map((_, idx) => idx).sort((a, b) => (doneBatches.includes(a) ? 1 : 0) - (doneBatches.includes(b) ? 1 : 0)).map((i) => {
+                const b = plan.list[i];
                 const t = types[b.ti];
                 const cols = ingLines(t).filter((l) => l.pct > 0);
                 const base = schedule[i] ? schedule[i].base : 0;
@@ -2606,6 +2809,7 @@ export default function App() {
       )}
 
       {/* ---------- TAB 7: FOOD SAFETY ---------- */}
+      {tab === "timers" && <TimerTab batches={plan.list} types={types} params={params} dayId={currentDayId} />}
       {tab === "safety" && (<>
         <div className="bl-panel">
           <h3>Refrigerator temperature log</h3>
