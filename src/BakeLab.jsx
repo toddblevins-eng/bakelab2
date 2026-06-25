@@ -217,7 +217,7 @@ const normalizeFoodSafety = (fs) => {
   };
 };
 const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
-const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), day: day || defaultDay() });
+const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), complete: false, day: day || defaultDay() });
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
 // big parent re-render that each keystroke triggers; still commits upward live.
@@ -250,7 +250,7 @@ function IngredientInput({ value, onCommit, className, placeholder, ingredients,
   return (
     <div className="bl-ingwrap" ref={wrapRef}>
       <input className={className} value={v} placeholder={placeholder}
-        onFocus={() => { setV(""); setBrowse(true); }}
+        onFocus={(e) => { setBrowse(true); e.target.select(); }}
         onBlur={() => { setTimeout(() => { if (document.activeElement !== wrapRef.current) setOpen(false); }, 150); if (!v.trim()) { setV(last.current); } }}
         onChange={(e) => { setV(e.target.value); setBrowse(false); onCommit(e.target.value); }} />
       <button className="bl-ingdrop-btn" type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => { setBrowse(true); setOpen((o) => !o); }}>▾</button>
@@ -265,6 +265,21 @@ function IngredientInput({ value, onCommit, className, placeholder, ingredients,
 }
 const otherFlourSum = (t) => t.flours.slice(1).reduce((a, f) => a + (+f.pct || 0), 0);
 const mainPct = (t) => Math.max(0, 100 - otherFlourSum(t));
+const RECIPE_FORMULA_KEYS = ["name","loafWeight","shape","water","salt","levain","levHyd","levInoc","levRefInoc","levBuildHrs","levRefTemp","levWhole","levExpNote","ddt","bakeTemp","bakeMin","steamMin","autolyse","calNote"];
+const sameIngList = (x, y, skipFirstPct) => {
+  const xs = x || [], ys = y || [];
+  if (xs.length !== ys.length) return false;
+  for (let i = 0; i < xs.length; i++) {
+    if ((xs[i].name || "") !== (ys[i].name || "")) return false;
+    if (!(skipFirstPct && i === 0) && (+xs[i].pct || 0) !== (+ys[i].pct || 0)) return false;
+  }
+  return true;
+};
+const sameFormula = (a, b) => {
+  if (!a || !b) return false;
+  for (const k of RECIPE_FORMULA_KEYS) { if (String(a[k] ?? "") !== String(b[k] ?? "")) return false; }
+  return sameIngList(a.flours, b.flours, true) && sameIngList(a.inclusions, b.inclusions, false);
+};
 const flourPctOf = (t, idx) => (idx === 0 ? mainPct(t) : (+t.flours[idx].pct || 0));
 
 const ingLines = (t) => {
@@ -327,11 +342,12 @@ function TimerTab({ batches, types, params, dayId }) {
   const SKEY = "bakelab-timers-v1:" + (dayId || "none");
   const [timers, setTimers] = useState({});
   const [durs, setDurs] = useState(() => ({ postmix: +params.restBetween || 50, sf1: +params.restBetween || 50, sf2: +params.restBetween || 50, sf3: +params.restBetween || 50, sf4: +params.restBetween || 50, bulk: +params.bulkRest || 90 }));
+  const [custom, setCustom] = useState([]);
   const [, setTick] = useState(0);
   const acRef = useRef(null), beepRef = useRef(null), wakeRef = useRef(null);
 
-  useEffect(() => { try { const raw = localStorage.getItem(SKEY); if (raw) { const o = JSON.parse(raw); setTimers(o && o.timers ? o.timers : {}); if (o && o.durs) setDurs((d) => ({ ...d, ...o.durs })); } else setTimers({}); } catch (e) { setTimers({}); } }, [SKEY]);
-  useEffect(() => { try { localStorage.setItem(SKEY, JSON.stringify({ timers, durs })); } catch (e) {} }, [SKEY, timers, durs]);
+  useEffect(() => { try { const raw = localStorage.getItem(SKEY); if (raw) { const o = JSON.parse(raw); setTimers(o && o.timers ? o.timers : {}); if (o && o.durs) setDurs((d) => ({ ...d, ...o.durs })); setCustom(o && Array.isArray(o.custom) ? o.custom : []); } else { setTimers({}); setCustom([]); } } catch (e) { setTimers({}); } }, [SKEY]);
+  useEffect(() => { try { localStorage.setItem(SKEY, JSON.stringify({ timers, durs, custom })); } catch (e) {} }, [SKEY, timers, durs, custom]);
 
   const hasTimers = Object.keys(timers).length > 0;
   useEffect(() => { if (!hasTimers) return; const id = setInterval(() => setTick((t) => t + 1), 1000); return () => clearInterval(id); }, [hasTimers]);
@@ -352,9 +368,17 @@ function TimerTab({ batches, types, params, dayId }) {
     return () => { document.removeEventListener("visibilitychange", onVis); try { if (wakeRef.current) { wakeRef.current.release(); wakeRef.current = null; } } catch (e) {} };
   }, [hasTimers]);
 
-  const durFor = (b, ph) => ph === "autolyse" ? (+((types[b.ti] && types[b.ti].autolyse)) || +params.autolyse || 45) : (durs[ph] || 0);
-  const start = (bi, ph) => { ensureAudio(); const m = durFor(batches[bi], ph); if (m <= 0) return; setTimers((t) => ({ ...t, [bi + ":" + ph]: { end: Date.now() + m * 60000, dur: m * 60000 } })); };
+  const allPhases = TIMER_PHASES.concat(custom.map((c) => ({ key: c.key, label: c.label, short: c.label })));
+  const labelOf = (ph) => { const p = allPhases.find((x) => x.key === ph); return p ? p.label : ph; };
+  const phaseDur = (ph) => { if (ph in durs) return durs[ph] || 0; const c = custom.find((x) => x.key === ph); return c ? (+c.dur || 0) : 0; };
+  const durFor = (b, ph) => ph === "autolyse" ? (+((types[b.ti] && types[b.ti].autolyse)) || +params.autolyse || 45) : phaseDur(ph);
+  const addCustom = () => setCustom((c) => [...c, { key: "c" + Date.now(), label: "Custom " + (c.length + 1), dur: 20 }]);
+  const removeCustom = (key) => { setCustom((c) => c.filter((x) => x.key !== key)); setTimers((t) => { const n = {}; for (const k in t) { if (!k.endsWith(":" + key)) n[k] = t[k]; } return n; }); };
+  const setCustomLabel = (key, label) => setCustom((c) => c.map((x) => x.key === key ? { ...x, label } : x));
+  const setCustomDur = (key, dur) => setCustom((c) => c.map((x) => x.key === key ? { ...x, dur } : x));
+  const start = (bi, ph) => { ensureAudio(); const m = durFor(batches[bi], ph); if (m <= 0) return; setTimers((t) => { const n = {}; for (const k in t) { if (!k.startsWith(bi + ":")) n[k] = t[k]; } n[bi + ":" + ph] = { end: Date.now() + m * 60000, dur: m * 60000 }; return n; }); };
   const cancel = (k) => setTimers((t) => { const n = { ...t }; delete n[k]; return n; });
+  const nextPhase = (ph) => { const nF = +params.folds || 4; let ni = allPhases.findIndex((p) => p.key === ph) + 1; while (ni < allPhases.length) { const p = allPhases[ni]; const mm = p.key.match(/^sf(\d)$/); if ((mm && +mm[1] > nF) || phaseDur(p.key) <= 0) { ni++; continue; } return p; } return null; };
 
   const active = entries.filter((e) => !e.done).sort((a, b) => a.remaining - b.remaining);
   const done = entries.filter((e) => e.done);
@@ -364,12 +388,15 @@ function TimerTab({ batches, types, params, dayId }) {
   return (<>
     {done.length > 0 && (
       <div className="bl-panel bl-timer-done">
-        {done.map((e) => (
+        {done.map((e) => { const np = nextPhase(e.ph); return (
           <div className="td-row" key={e.k}>
-            <div className="td-info"><span className="td-b">B{e.bi + 1}</span><span className="td-ph">{phLabel(e.ph)}</span><span className="td-done">DONE</span></div>
-            <button className="td-stop" onClick={() => cancel(e.k)}>Stop ✓</button>
+            <div className="td-info"><span className="td-b">B{e.bi + 1}</span><span className="td-ph">{labelOf(e.ph)}</span><span className="td-done">DONE</span></div>
+            <div className="td-acts">
+              {np && <button className="td-next" onClick={() => { start(e.bi, np.key); cancel(e.k); }}>Start {np.label} ▶</button>}
+              <button className="td-stop" onClick={() => cancel(e.k)}>{np ? "Stop" : "Stop ✓"}</button>
+            </div>
           </div>
-        ))}
+        ); })}
       </div>
     )}
     <div className="bl-panel">
@@ -378,7 +405,7 @@ function TimerTab({ batches, types, params, dayId }) {
         <div className="bl-timer-active">
           {active.map((e) => { const pct = Math.max(0, Math.min(100, 100 * (1 - e.remaining / e.dur))); return (
             <div className="ta-card" key={e.k}>
-              <div className="ta-top"><span className="ta-b">B{e.bi + 1}</span><span className="ta-ph">{phLabel(e.ph)}</span></div>
+              <div className="ta-top"><span className="ta-b">B{e.bi + 1}</span><span className="ta-ph">{labelOf(e.ph)}</span></div>
               <div className="ta-time">{fmtMMSS(e.remaining)}</div>
               <div className="ta-bar"><div className="ta-fill" style={{ width: pct + "%" }} /></div>
               <button className="ta-cancel" onClick={() => cancel(e.k)}>Cancel</button>
@@ -389,21 +416,28 @@ function TimerTab({ batches, types, params, dayId }) {
     </div>
     <div className="bl-panel">
       <h3>Start a timer</h3>
-      <div className="bl-timer-durnote">Autolyse pulls from each recipe. Set the rest here — they apply to every batch:</div>
+      <div className="bl-timer-durnote">Autolyse pulls from each recipe. Set the rest here — they apply to every batch. Set any phase to <b>0</b> to skip it (Next jumps past it).</div>
       <div className="bl-timer-durs">
         {["postmix", "sf1", "sf2", "sf3", "sf4", "bulk"].map((ph) => (
-          <label key={ph} className="dur-cell"><span>{phLabel(ph)}</span><input type="number" min="0" value={durs[ph]} onChange={(e) => setDurs((d) => ({ ...d, [ph]: Math.max(0, Math.floor(Number(e.target.value) || 0)) }))} /></label>
+          <label key={ph} className="dur-cell"><span>{labelOf(ph)}</span><input type="number" min="0" value={durs[ph]} onChange={(e) => setDurs((d) => ({ ...d, [ph]: Math.max(0, Math.floor(Number(e.target.value) || 0)) }))} /></label>
+        ))}
+        {custom.map((c) => (
+          <div key={c.key} className="dur-cell dur-custom">
+            <input className="dur-label" value={c.label} placeholder="Phase name" onChange={(e) => setCustomLabel(c.key, e.target.value)} />
+            <div className="dur-cw"><input type="number" min="0" value={c.dur} onChange={(e) => setCustomDur(c.key, Math.max(0, Math.floor(Number(e.target.value) || 0)))} /><button className="dur-x" title="Remove phase" onClick={() => removeCustom(c.key)}>×</button></div>
+          </div>
         ))}
       </div>
+      <button className="bl-addphase" onClick={addCustom}>+ Add phase timer</button>
       <div className="bl-timer-grid">
         {batches.map((b, bi) => (
           <div className="tg-row" key={bi}>
             <div className="tg-bn"><span className="tg-b">B{bi + 1}</span><span className="tg-nm">{b.name}</span></div>
             <div className="tg-cells">
-              {TIMER_PHASES.map((p) => { const k = bi + ":" + p.key; const tm = timers[k]; const run = tm && Date.now() < tm.end; const rng = tm && Date.now() >= tm.end; const m = durFor(b, p.key); return (
+              {allPhases.map((p) => { const k = bi + ":" + p.key; const tm = timers[k]; const run = tm && Date.now() < tm.end; const rng = tm && Date.now() >= tm.end; const m = durFor(b, p.key); return (
                 <button key={p.key} className={"tg-cell" + (run ? " running" : "") + (rng ? " ringing" : "")} onClick={() => (run ? cancel(k) : start(bi, p.key))} disabled={m <= 0}>
                   <span className="tg-ph">{p.short}</span>
-                  <span className="tg-d">{run ? fmtMMSS(tm.end - Date.now()) : rng ? "done" : m + "m"}</span>
+                  <span className="tg-d">{run ? fmtMMSS(tm.end - Date.now()) : rng ? "done" : m <= 0 ? "skip" : m + "m"}</span>
                 </button>
               ); })}
             </div>
@@ -594,8 +628,9 @@ export default function App() {
   };
   const openDay = (id) => { const e = days.find((x) => x.id === id); if (!e) return; loadDayVars(e.day || {}); setDayName(e.name || "Untitled"); setDayDate(e.date || todayISO()); setCurrentDayId(id); setTab("plan"); setActiveBatch(null); setDoneBatches([]); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
   const newDay = () => { const e = newDayEntry("New run", defaultDay()); setDays((ds) => { const nd = [e, ...ds]; persist(DAYS_KEY, nd); return nd; }); loadDayVars(e.day); setDayName(e.name); setDayDate(e.date); setCurrentDayId(e.id); setTab("plan"); setActiveBatch(null); setDoneBatches([]); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
-  const dupDay = (id) => setDays((ds) => { const src = ds.find((d) => d.id === id); if (!src) return ds; const copy = { ...src, id: uid(), name: (src.name || "Run") + " (copy)", updatedAt: Date.now(), day: JSON.parse(JSON.stringify(src.day || defaultDay())) }; const nd = [copy, ...ds]; persist(DAYS_KEY, nd); return nd; });
+  const dupDay = (id) => setDays((ds) => { const src = ds.find((d) => d.id === id); if (!src) return ds; const copy = { ...src, id: uid(), name: (src.name || "Run") + " (copy)", updatedAt: Date.now(), complete: false, day: JSON.parse(JSON.stringify(src.day || defaultDay())) }; const nd = [copy, ...ds]; persist(DAYS_KEY, nd); return nd; });
   const delDay = (id) => { setDays((ds) => { const nd = ds.filter((d) => d.id !== id); persist(DAYS_KEY, nd); return nd; }); if (currentDayId === id) { setCurrentDayId(null); setView("home"); } };
+  const toggleComplete = (id) => setDays((ds) => { const nd = ds.map((d) => d.id === id ? { ...d, complete: !d.complete, updatedAt: Date.now() } : d); persist(DAYS_KEY, nd); return nd; });
   const backHome = () => { setView("home"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
   const stages = useMemo(() => buildStages(params), [params]);
   const cycleMin = useMemo(() => stages.reduce((s, x) => s + x.min, 0), [stages]);
@@ -969,6 +1004,15 @@ export default function App() {
 
   // ---- recipe library ------------------------------------------------------
   const loadCoreRecipe = (ti, id) => { const r = coreRecipes.find((x) => x.id === id); if (r) patchSlot(ti, (s) => ({ ...s, coreRecipeId: id, draft: cloneRecipe(r) })); };
+  const updateCoreFromSlot = (ti) => {
+    const slot = slots[ti]; if (!slot || !slot.coreRecipeId) return;
+    const oldCore = coreRecipes.find((x) => x.id === slot.coreRecipeId);
+    const norm = cloneRecipe(slot.draft); norm.flours = norm.flours.map((f, i) => (i === 0 ? { ...f, pct: mainPct(slot.draft) } : f));
+    const r = { ...norm, id: slot.coreRecipeId };
+    setCoreRecipes((rs) => rs.map((x) => x.id === r.id ? r : x));
+    if (oldCore) setSlots((ss) => ss.map((sl) => (sl.coreRecipeId === r.id && sameFormula(sl.draft, oldCore)) ? { ...sl, draft: cloneRecipe(r) } : sl));
+  };
+  const saveSlotAsRemix = (ti) => { remixRecipe(ti); patchSlot(ti, (sl) => ({ ...sl, coreRecipeId: "" })); };
   const remixRecipe = (ti) => {
     const slot = slots[ti];
     const originName = (slot.coreRecipeId && coreRecipes.find((r) => r.id === slot.coreRecipeId)?.name) || slot.draft?.name || "Recipe";
@@ -987,7 +1031,12 @@ export default function App() {
     const norm = cloneRecipe(editingDraft); norm.flours = norm.flours.map((f, i) => (i === 0 ? { ...f, pct: mainPct(editingDraft) } : f));
     const r = { ...norm, id: editingRecipeId || uid() };
     if (editingIsRemix) setRemixes((rs) => rs.map((x) => x.id === r.id ? r : x));
-    else setCoreRecipes((rs) => editingRecipeId ? rs.map((x) => x.id === r.id ? r : x) : [r, ...rs]);
+    else {
+      const oldCore = coreRecipes.find((x) => x.id === r.id);
+      const curDone = !!(days.find((d) => d.id === currentDayId) || {}).complete;
+      setCoreRecipes((rs) => editingRecipeId ? rs.map((x) => x.id === r.id ? r : x) : [r, ...rs]);
+      if (editingRecipeId && oldCore && !curDone) setSlots((ss) => ss.map((s) => (s.coreRecipeId === r.id && sameFormula(s.draft, oldCore)) ? { ...s, draft: cloneRecipe(r) } : s));
+    }
     setBuilderView("list");
   };
   const promoteRemixToCore = (id) => { const r = remixes.find((x) => x.id === id); if (!r) return; setCoreRecipes((rs) => [{ ...r, id: uid() }, ...rs]); setRemixes((rs) => rs.filter((x) => x.id !== id)); };
@@ -1340,6 +1389,16 @@ export default function App() {
         .dc-body{padding:10px 14px 13px;display:flex;flex-direction:column;gap:4px;}
         .dc-body .dc-sum{font-family:'JetBrains Mono';font-size:12px;color:var(--crust2);font-weight:600;}
         .dc-body .dc-recipes{font-size:13px;color:var(--ink2);line-height:1.35;}
+        .dc-status{font-family:'JetBrains Mono';font-size:10px;font-weight:700;letter-spacing:.02em;padding:3px 8px;border-radius:20px;border:1.5px solid var(--crust);color:var(--crust2);background:#fff;cursor:pointer;white-space:nowrap;}
+        .dc-status.done{border-color:var(--line);color:var(--ink2);background:var(--paper);}
+        .bl-daycard.done{opacity:.62;}
+        .bl-detach{margin:10px 0 2px;padding:10px 12px;border:1.5px solid #e9c47e;background:#fff6e3;border-radius:10px;}
+        .bl-detach-msg{font-size:12.5px;color:var(--crust2);line-height:1.35;margin-bottom:8px;}
+        .bl-detach-acts{display:flex;flex-wrap:wrap;gap:7px;}
+        .bl-detach-acts button{font-family:'DM Sans';font-size:12.5px;font-weight:600;padding:7px 11px;border-radius:8px;cursor:pointer;border:1.5px solid;}
+        .bl-detach-up{background:var(--crust);color:#fff;border-color:var(--crust2);}
+        .bl-detach-remix{background:#fff;color:var(--crust2);border-color:var(--crust);}
+        .bl-detach-dismiss{background:#fff;color:var(--ink2);border-color:var(--line);}
         .dc-body .dc-bake{font-family:'JetBrains Mono';font-size:11px;color:var(--sand);}
         .dc-body .dc-open{margin-top:4px;font-family:'DM Sans';font-size:13px;font-weight:600;color:var(--crust);}
         .bl-dayhd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;}
@@ -1745,12 +1804,15 @@ export default function App() {
         .opt-chip em{font-style:normal;font-family:'JetBrains Mono';font-size:11px;color:var(--ink2);}
         .bl-timer-done{background:var(--alert-bg);border:1.5px solid var(--alert);animation:tflash 1.1s steps(1) infinite;}
         @keyframes tflash{50%{background:var(--cream);}}
-        .bl-timer-done .td-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:7px 2px;}
+        .bl-timer-done .td-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:7px 2px;flex-wrap:wrap;}
         .td-info{display:flex;align-items:center;gap:11px;flex-wrap:wrap;}
         .td-info .td-b{font-family:'JetBrains Mono';font-weight:700;font-size:17px;color:var(--ink);}
         .td-info .td-ph{font-family:'Fraunces',serif;font-size:18px;color:var(--ink);}
         .td-info .td-done{font-family:'DM Sans';font-weight:700;font-size:12px;letter-spacing:1.5px;color:var(--alert);}
         .td-stop{font-family:'DM Sans';font-weight:700;font-size:14px;cursor:pointer;border:none;border-radius:8px;padding:11px 20px;background:var(--alert);color:#fff;flex:none;}
+        .td-acts{display:flex;align-items:center;gap:9px;flex:none;flex-wrap:wrap;}
+        .td-next{font-family:'DM Sans';font-weight:700;font-size:14px;cursor:pointer;border:none;border-radius:8px;padding:11px 18px;background:var(--ink);color:var(--paper);}
+        .td-next:hover{background:var(--chrome2);}
         .bl-timer-empty{font-size:13px;color:var(--ink2);}
         .bl-timer-active{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;}
         .ta-card{border:none;border-radius:16px;padding:26px 28px;background:var(--chrome);box-shadow:0 4px 16px rgba(26,15,7,.18);}
@@ -1763,10 +1825,18 @@ export default function App() {
         .ta-cancel{margin-top:16px;width:100%;font-family:'DM Sans';font-weight:700;font-size:14px;cursor:pointer;border:1.5px solid rgba(245,239,227,.3);background:transparent;color:var(--chrome-t);border-radius:10px;padding:13px;}
         .ta-cancel:hover{background:rgba(245,239,227,.1);border-color:var(--chrome-t);}
         .bl-timer-durnote{font-size:13px;color:var(--ink2);margin-bottom:10px;}
-        .bl-timer-durs{display:grid;grid-template-columns:repeat(auto-fill,minmax(116px,1fr));gap:10px;margin-bottom:18px;padding-bottom:16px;border-bottom:1.5px dashed var(--line);}
+        .bl-timer-durs{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:10px;margin-bottom:12px;align-items:end;}
         .dur-cell{display:flex;flex-direction:column;gap:4px;}
         .dur-cell span{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink2);font-weight:700;}
         .dur-cell input{font-family:'JetBrains Mono';font-size:15px;padding:9px 11px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);width:100%;}
+        .dur-custom{gap:6px;}
+        .dur-label{font-family:'DM Sans';font-weight:600;font-size:13px;padding:8px 10px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);width:100%;}
+        .dur-cw{display:flex;gap:6px;align-items:stretch;}
+        .dur-cw input{flex:1;min-width:0;}
+        .dur-x{flex:none;width:40px;border:1.5px solid var(--line);border-radius:8px;background:var(--paper);color:var(--ink2);font-size:18px;cursor:pointer;line-height:1;}
+        .dur-x:hover{border-color:var(--alert);color:var(--alert);}
+        .bl-addphase{margin:0 0 18px;font-family:'DM Sans';font-weight:600;font-size:13px;cursor:pointer;border:1.5px dashed var(--line);border-radius:8px;background:transparent;color:var(--crust2);padding:11px 16px;}
+        .bl-addphase:hover{border-color:var(--crust);background:var(--cream);}
         .bl-timer-grid{display:flex;flex-direction:column;gap:11px;}
         .tg-row{display:flex;align-items:center;gap:13px;flex-wrap:wrap;}
         .tg-bn{display:flex;align-items:baseline;gap:7px;min-width:118px;}
@@ -1798,7 +1868,7 @@ export default function App() {
           .ing-x{ width:40px; height:40px; font-size:18px; }
           .bl-rmcard{ padding:8px 11px; font-size:13px; }
           .opt-chip{ min-height:44px; font-size:13px; }
-          .tg-cell{ min-height:56px; min-width:72px; } .td-stop{ min-height:48px; } .ta-cancel{ min-height:52px; }
+          .tg-cell{ min-height:56px; min-width:72px; } .td-stop{ min-height:48px; } .td-next{ min-height:48px; } .ta-cancel{ min-height:52px; } .bl-addphase{ min-height:48px; } .dur-x{ min-height:46px; }
           .bl-panel{ padding:22px 24px; }
           .bl-panel h3{ font-size:22px; }
           .bl-rec-title, .bl-load .lo-nm, .bl-pool-row .pr-nm, .bl-session-hd .ss-no{ font-size:17px; }
@@ -1834,12 +1904,14 @@ export default function App() {
                 const sess = Array.isArray(d.day && d.day.slots) ? d.day.slots.flatMap((s) => (s.sessions || [])) : [];
                 const bakeDates = [...new Set(sess.map((s) => s.date).filter(Boolean))].sort();
                 const bakeLine = bakeDates.length ? (bakeDates.length === 1 ? ("bake " + bakeDates[0]) : (bakeDates.length + " bake dates · " + bakeDates.map((d) => d.slice(5)).join(", "))) : "";
+                const done = !!d.complete;
                 return (
-                  <div className="bl-daycard" key={d.id} onClick={() => openDay(d.id)}>
+                  <div className={"bl-daycard" + (done ? " done" : "")} key={d.id} onClick={() => openDay(d.id)}>
                     <div className="dc-band">
                       <div className="dc-top">
                         <span className="dc-date">{d.date || "—"}</span>
                         <div className="dc-acts">
+                          <button className={"dc-status" + (done ? " done" : "")} title="Toggle active / complete" onClick={(e) => { e.stopPropagation(); toggleComplete(d.id); }}>{done ? "✓ Done" : "● Active"}</button>
                           <button title="Duplicate" onClick={(e) => { e.stopPropagation(); dupDay(d.id); }}>⧉</button>
                           <button title="Delete" onClick={(e) => { e.stopPropagation(); setDelTarget({ id: d.id, name: d.name, kind: "day" }); }}>×</button>
                         </div>
@@ -2140,6 +2212,20 @@ export default function App() {
                     {coreRecipes.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
                   </select>
                 </div>
+                {(() => {
+                  const core = slots[ti].coreRecipeId ? coreRecipes.find((x) => x.id === slots[ti].coreRecipeId) : null;
+                  if (!core || sameFormula(slots[ti].draft, core)) return null;
+                  return (
+                    <div className="bl-detach">
+                      <div className="bl-detach-msg">Edited here — differs from <b>{core.name}</b> in your library.</div>
+                      <div className="bl-detach-acts">
+                        <button className="bl-detach-up" onClick={() => updateCoreFromSlot(ti)}>Update main recipe</button>
+                        <button className="bl-detach-remix" onClick={() => saveSlotAsRemix(ti)}>Save as remix</button>
+                        <button className="bl-detach-dismiss" onClick={() => loadCoreRecipe(ti, slots[ti].coreRecipeId)}>Dismiss changes</button>
+                      </div>
+                    </div>
+                  );
+                })()}
                 <div className="bl-rec-top">
                   <div><label>Loaves</label><input className="n" type="number" min="0" value={t.loaves} onChange={(e) => setLoaves(ti, e.target.value)} /></div>
                   <div><label>Loaf g</label><input className="n" type="number" min="0" value={t.loafWeight} onChange={(e) => setDraft(ti, { loafWeight: Math.max(0, Number(e.target.value) || 0) })} /></div>
@@ -2601,9 +2687,8 @@ export default function App() {
               <div className="bl-livebtns">
                 <button className={"bl-anchor" + (follow ? " ghost" : "")} onClick={() => { setFollow(true); centerNow(); }}>{follow ? "● Live" : "Jump to now"}</button>
                 <button className="bl-anchor ghost" onClick={() => setLiveFull((f) => !f)}>{liveFull ? "⤡ Minimize" : "⤢ Full screen"}</button>
-                {!mixed
-                  ? <button className="bl-anchor" onClick={() => { anchorNow(); setMixed(true); setFollow(true); setRecal(false); }}>Mix Now</button>
-                  : <button className={"bl-anchor" + (recal ? "" : " ghost")} onClick={() => { const nx = !recal; setRecal(nx); if (nx) setFollow(false); }}>{recal ? "✓ Done" : "↔ Recalibrate"}</button>}
+                {!mixed && <button className="bl-anchor" onClick={() => { anchorNow(); setMixed(true); setFollow(true); setRecal(false); }}>Mix Now</button>}
+                <button className={"bl-anchor" + (recal ? "" : " ghost")} onClick={() => { const nx = !recal; setRecal(nx); if (nx) setFollow(false); }}>{recal ? "✓ Done" : "↔ Recalibrate"}</button>
               </div>
             </div>
             <div className="bl-livestatus">{status}</div>
