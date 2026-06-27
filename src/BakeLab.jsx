@@ -883,7 +883,7 @@ export default function App() {
       // pool loaves that bake identically (temp / time / steam), then pack into loads up to capacity
       const groups = {};
       items.forEach((it) => {
-        const k = it.temp + "|" + it.bakeMin + "|" + it.steamMin;
+        const k = Math.round(it.temp) + "|" + it.bakeMin + "|" + it.steamMin;
         if (!groups[k]) groups[k] = { order: it.bakeOrder, bakeMin: it.bakeMin, steamMin: it.steamMin, temp: it.temp, items: [] };
         groups[k].order = Math.min(groups[k].order, it.bakeOrder);
         groups[k].items.push(it);
