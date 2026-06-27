@@ -174,7 +174,7 @@ const DEFAULT_SLOTS = [
   { loaves: 50, mixOrder: 2, bakeOrder: 2, coreRecipeId: DEFAULT_LIBRARY[1].id, sessions: [{ id: uid(), date: addDaysISO(todayISO(), 1), loaves: 0 }], draft: cloneRecipe(DEFAULT_LIBRARY[1]) },
 ];
 
-const DEFAULTS = { autolyse: 45, mix: 15, folds: 3, fold: 5, restBetween: 50, bulkRest: 40, preShape: 10, benchRest: 25, shape: 15, ovenCap: 2, preheatMin: 45, recoverMin: 7, bakeStart: "08:00" };
+const DEFAULTS = { autolyse: 45, mix: 15, folds: 3, fold: 5, restBetween: 50, bulkRest: 40, preShape: 10, benchRest: 25, shape: 15, ovenCap: 15, preheatMin: 45, recoverMin: 7, bakeStart: "08:00" };
 const GLOBALS_KEY = "bakelab-globals";
 
 // ---- starter profile: named culture with maintenance protocol + fermentation calibration ----
@@ -216,7 +216,7 @@ const normalizeFoodSafety = (fs) => {
     })),
   };
 };
-const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
+const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
 const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), complete: false, day: day || defaultDay() });
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
@@ -512,6 +512,7 @@ export default function App() {
   const [bakeDateTimes, setBakeDateTimes] = useState({});
   const [retard, setRetard] = useState({});
   const [levBuffer, setLevBuffer] = useState({});
+  const [levBufferPct, setLevBufferPct] = useState({});
   const [foodSafety, setFoodSafety] = useState(defaultFoodSafety());
   const addFridge = () => setFoodSafety((fs) => ({ ...fs, fridges: [...fs.fridges, newFridge("Fridge " + (fs.fridges.length + 1))] }));
   const removeFridge = (fi) => setFoodSafety((fs) => ({ ...fs, fridges: fs.fridges.filter((_, i) => i !== fi) }));
@@ -621,6 +622,7 @@ export default function App() {
     const sl = normalizeSlots(d.slots); void sl; // ensure normalizeSlots runs; sessions already applied in setSlots above
     setRetard(d.retard && typeof d.retard === "object" ? d.retard : {});
     setLevBuffer(d.levBuffer && typeof d.levBuffer === "object" ? d.levBuffer : {});
+    setLevBufferPct(d.levBufferPct && typeof d.levBufferPct === "object" ? d.levBufferPct : {});
     setDoneBatches(Array.isArray(d.doneBatches) ? d.doneBatches : []);
     setFoodSafety(normalizeFoodSafety(d.foodSafety));
     setMixWaterTemp(typeof d.mixWaterTemp === "number" ? d.mixWaterTemp : null);
@@ -699,7 +701,7 @@ export default function App() {
                 setCoreRecipes(c.library);
                 persist(GLOBALS_KEY, { coreRecipes: c.library, remixes: [], ingredients: [], inocCal: [{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + (typeof c.inocDoubleHrs === "number" ? c.inocDoubleHrs : 1.5) }], tempUnit: c.tempUnit === "F" ? "F" : "C" });
               }
-              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, doneBatches: [], foodSafety: defaultFoodSafety() };
+              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, doneBatches: [], foodSafety: defaultFoodSafety() };
               loadedDays = [{ id: uid(), name: "Imported run", date: todayISO(), updatedAt: Date.now(), day }];
             } else {
               loadedDays = [newDayEntry("My first run", defaultDay())];
@@ -719,9 +721,9 @@ export default function App() {
   // autosave the open day's snapshot
   useEffect(() => {
     if (!loaded || view !== "editor" || !currentDayId) return;
-    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, doneBatches, foodSafety, mixWaterTemp, calcInputs };
+    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs };
     setDays((ds) => { const nd = ds.map((d) => (d.id === currentDayId ? { ...d, name: dayName, date: dayDate, updatedAt: Date.now(), day: snap } : d)); persist(DAYS_KEY, nd); return nd; });
-  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
+  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
 
   const distribute = (s) => { setStagger(s); setOffsets(Array.from({ length: totalBatches }, (_, b) => b * s)); };
 
@@ -846,16 +848,18 @@ export default function App() {
       const retardHold = retarded ? Math.max(0, bd.targetPeak - peakOff) : 0;
       const retardLate = retarded && (peakOff > bd.targetPeak);
       const buffered = !!levBuffer[key];
-      const M = bd.items.reduce((a, x) => a + x.levW, 0) * (buffered ? 1.02 : 1);
+      const rawBuf = levBufferPct[key];
+      const bufPct = buffered ? ((rawBuf === undefined || rawBuf === null || rawBuf === "") ? 2 : (Number(rawBuf) || 0)) : 0;
+      const M = bd.items.reduce((a, x) => a + x.levW, 0) * (1 + bufPct / 100);
       const denom = 1 + bd.H / 100 + bd.I / 100;
       const flourL = M / denom, waterL = flourL * bd.H / 100, seedL = flourL * bd.I / 100;
       const mTot = flourL + waterL + seedL;
       const Twater = waterL > 0 ? (Tlev * mTot - flourL * ambientTemp - seedL * starterTemp) / waterL : Tlev;
       const holdMin = bd.items[bd.items.length - 1].mixOff - bd.targetPeak;
-      return { ...bd, key, retarded, buffered, retardHold, retardLate, peakOff, desired, Tlev, M, flourL, waterL, seedL, Twater, holdMin };
+      return { ...bd, key, retarded, buffered, bufPct, retardHold, retardLate, peakOff, desired, Tlev, M, flourL, waterL, seedL, Twater, holdMin };
     });
     return { feedOff, autoFeed, builds: out };
-  }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard, levBuffer]);
+  }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard, levBuffer, levBufferPct]);
 
   // ---- bake schedule: groups per-recipe sessions by date, one oven sequential ----
   const bakePlan = useMemo(() => {
@@ -876,11 +880,28 @@ export default function App() {
     });
     const scheduleDate = (date, items) => {
       items.sort((a, b) => (a.bakeOrder - b.bakeOrder) || (a.ti - b.ti));
+      // pool loaves that bake identically (temp / time / steam), then pack into loads up to capacity
+      const groups = {};
+      items.forEach((it) => {
+        const k = it.temp + "|" + it.bakeMin + "|" + it.steamMin;
+        if (!groups[k]) groups[k] = { order: it.bakeOrder, bakeMin: it.bakeMin, steamMin: it.steamMin, temp: it.temp, items: [] };
+        groups[k].order = Math.min(groups[k].order, it.bakeOrder);
+        groups[k].items.push(it);
+      });
       const loads = [];
-      items.forEach(({ ti, name, loaves, bakeMin, steamMin, temp }) => {
-        const full = Math.floor(loaves / cap), rem = loaves % cap;
-        const sizes = Array(full).fill(cap); if (rem > 0) sizes.push(rem);
-        sizes.forEach((sz) => loads.push({ ti, name, n: sz, bakeMin, steamMin, temp }));
+      Object.values(groups).sort((a, b) => a.order - b.order).forEach((g) => {
+        const queue = g.items.map((it) => ({ ti: it.ti, name: it.name, left: it.loaves })).filter((q) => q.left > 0);
+        let qi = 0;
+        while (qi < queue.length) {
+          const parts = []; let room = cap;
+          while (room > 0 && qi < queue.length) {
+            const q = queue[qi]; const take = Math.min(room, q.left);
+            parts.push({ ti: q.ti, name: q.name, n: take }); q.left -= take; room -= take;
+            if (q.left === 0) qi++;
+          }
+          const label = parts.length === 1 ? parts[0].name : parts.map((p) => p.n + " " + p.name).join(" · ");
+          loads.push({ parts, label, n: parts.reduce((a, p) => a + p.n, 0), bakeMin: g.bakeMin, steamMin: g.steamMin, temp: g.temp });
+        }
       });
       let cur = preheat;
       const sched = loads.map((ld, i) => { const startOff = cur, ventOff = cur + ld.steamMin, endOff = cur + ld.bakeMin; cur = endOff + recover; return { ...ld, i, startOff, ventOff, endOff }; });
@@ -1709,8 +1730,11 @@ export default function App() {
         .bl-levcard .ing{display:flex;justify-content:space-between;gap:10px;padding:6px 13px;font-size:13px;}
         .bl-levcard .ing span:last-child{font-family:'JetBrains Mono';font-weight:600;}
         .bl-levcard .ing.tot{background:var(--paper);font-weight:600;border-top:1.5px solid var(--ink);color:var(--crust2);}
-        .bl-levcard .lbuffer{display:flex;align-items:center;gap:7px;padding:5px 13px 7px;font-size:11px;color:var(--ink2);font-family:'DM Sans';cursor:pointer;}
-        .bl-levcard .lbuffer input{width:15px;height:15px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .bl-levcard .lbuffer{display:flex;align-items:center;flex-wrap:wrap;gap:9px;padding:5px 13px 7px;font-size:11px;color:var(--ink2);font-family:'DM Sans';}
+        .bl-levcard .lbuffer-tog{display:flex;align-items:center;gap:7px;cursor:pointer;}
+        .bl-levcard .lbuffer-tog input{width:15px;height:15px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .bl-levcard .lbuffer-pct{display:flex;align-items:center;gap:3px;color:var(--crust2);font-weight:600;}
+        .bl-levcard .lbuffer-pct input{width:50px;font-family:'JetBrains Mono';font-size:12px;padding:3px 6px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);text-align:right;}
         .bl-levcard .lwarn{font-size:11px;color:var(--alert);background:var(--alert-bg);padding:8px 13px;line-height:1.4;}
         @media (max-width:600px){
           .bl-root{padding:0 12px 34px;}
@@ -2551,8 +2575,11 @@ export default function App() {
                       <div className="ing"><span>Mature starter</span><span>{fmtG(bd.seedL)} g</span></div>
                       <div className="ing"><span>Flour</span><span>{fmtG(bd.flourL)} g</span></div>
                       <div className="ing"><span>Water</span><span>{fmtG(bd.waterL)} g</span></div>
-                      <label className="lbuffer"><input type="checkbox" checked={bd.buffered} onChange={() => toggleLevBuffer(bd.key)} /><span>+2% buffer — spillage / bucket loss</span></label>
-                      <div className="ing tot"><span>Total levain{bd.buffered ? " · +2%" : ""}</span><span>{fmtG(bd.M)} g</span></div>
+                      <div className="lbuffer">
+                        <label className="lbuffer-tog"><input type="checkbox" checked={bd.buffered} onChange={() => toggleLevBuffer(bd.key)} /><span>Buffer — spillage / bucket loss</span></label>
+                        {bd.buffered && <span className="lbuffer-pct"><input type="number" min="0" step="0.5" value={levBufferPct[bd.key] ?? 2} onChange={(e) => setLevBufferPct((r) => ({ ...r, [bd.key]: e.target.value }))} /><span>%</span></span>}
+                      </div>
+                      <div className="ing tot"><span>Total levain{bd.buffered ? " · +" + bd.bufPct + "%" : ""}</span><span>{fmtG(bd.M)} g</span></div>
                     </div>
                     {bd.retarded && bd.retardLate && <div className="lwarn">⚠ Even at room temp this peaks after the mix — it won't be ready in time. Feed earlier.</div>}
                     {bd.retarded && !bd.retardLate && <div className="lretardnote">Built at normal temp to peak, then held cold to preserve it until mix — no extreme water or seed needed.</div>}
@@ -2784,7 +2811,7 @@ export default function App() {
                             <div className="bl-load">
                               <div className="lo-no">{ld.i + 1}</div>
                               <div className="lo-body">
-                                <div className="lo-hd"><span className="lo-nm">{ld.name}</span><span className="lo-n">{ld.n} {ld.n === 1 ? "loaf" : "loaves"}</span><span className="lo-temp">{showTemp(ld.temp)}</span></div>
+                                <div className="lo-hd"><span className="lo-nm">{ld.label}</span><span className="lo-n">{ld.n} {ld.n === 1 ? "loaf" : "loaves"}</span><span className="lo-temp">{showTemp(ld.temp)}</span></div>
                                 <div className="lo-bar">
                                   {ld.steamMin > 0 && <div className="seg steam" style={{ flexGrow: ld.steamMin }} title="steam" />}
                                   {ld.bakeMin - ld.steamMin > 0 && <div className="seg vent" style={{ flexGrow: ld.bakeMin - ld.steamMin }} title="dry (steam released)" />}
@@ -2810,7 +2837,7 @@ export default function App() {
                         ds.sched.forEach((ld) => {
                           const blocks = [{ startOff: ld.startOff, min: Math.max(1, ld.ventOff - ld.startOff), name: "steam", type: "steam" }];
                           if (ld.endOff > ld.ventOff) blocks.push({ startOff: ld.ventOff, min: ld.endOff - ld.ventOff, name: "dry", type: "dry" });
-                          rows.push({ tag: "#" + (ld.i + 1), sub: ld.name + " · " + ld.n + "×", blocks });
+                          rows.push({ tag: "#" + (ld.i + 1), sub: ld.label + " · " + ld.n + "×", blocks });
                         });
                         const rowH = LIVE_ROW, barH = 24, barTop = (rowH - barH) / 2;
                         const innerH = LIVE_AXIS + rows.length * rowH;
@@ -2859,7 +2886,7 @@ export default function App() {
               })}
             </div>
           )}
-          <div className="bl-note">Bake sessions are set on each recipe card in <b>Plan</b>: a date per session, loaves split across them (first session is the remainder). The Bake tab groups everything by date — if two recipes share a date, their loads are sequenced together on one oven that day. Oven-on time is set here per date. Loads don't mix recipes; one oven assumed.</div>
+          <div className="bl-note">Bake sessions are set on each recipe card in <b>Plan</b>: a date per session, loaves split across them (first session is the remainder). The Bake tab groups everything by date — if two recipes share a date, their loads are sequenced together on one oven that day. Oven-on time is set here per date. Loads pool recipes that bake identically (same temp, time, and steam) and fill up to your loaves-per-load capacity; recipes with different bake settings stay in separate loads.</div>
         </div>
       )}
 
