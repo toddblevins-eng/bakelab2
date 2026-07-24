@@ -609,6 +609,7 @@ export default function App() {
   const [delTarget, setDelTarget] = useState(null); // {id,name,kind} recipe pending delete confirmation
   const [labelOpen, setLabelOpen] = useState(false);
   const [labelOffX, setLabelOffX] = useState(0); // calibration nudge, mm
+  const [labelSkip, setLabelSkip] = useState([]); // positions already peeled off sheet 1
   const [labelOffY, setLabelOffY] = useState(0);
   const [nowMin, setNowMin] = useState(() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); });
   useEffect(() => { const id = setInterval(() => { const d = new Date(); setNowMin(d.getHours() * 60 + d.getMinutes()); }, 20000); return () => clearInterval(id); }, []);
@@ -698,7 +699,18 @@ export default function App() {
       else if (loaves > 0) { batchCount = loaves; sizes = Array(loaves).fill(1); }
       const unit = pctSum > 0 ? totalDough / pctSum : 0;
       const perLoaf = {}; lines.forEach((l) => { perLoaf[l.key] = loaves > 0 ? (unit * l.pct) / loaves : 0; });
-      perType[ti] = sizes.map((sz) => { const weights = {}; lines.forEach((l) => { weights[l.key] = perLoaf[l.key] * sz * dbF; }); return { ti, name: t.name, size: sz, dough: sz * W * dbF, weights }; });
+      perType[ti] = sizes.map((sz) => {
+        const weights = {}; lines.forEach((l) => { weights[l.key] = perLoaf[l.key] * sz * dbF; });
+        // weigh-out totals: exactly what goes on the scale as flour and as water.
+        // levain is its own line and is deliberately NOT counted here; nor are milk/egg/other liquids.
+        let tf = 0, tw = 0;
+        lines.forEach((l) => {
+          const g = weights[l.key] || 0;
+          if (l.key.indexOf("fl_") === 0) tf += g;
+          else if (l.key === "water" || l.key === "bassinage") tw += g;
+        });
+        return { ti, name: t.name, size: sz, dough: sz * W * dbF, weights, totalFlour: tf, totalWater: tw };
+      });
       summaries[ti] = { ti, name: t.name, loaves, W, totalDough, batchCount, sizes, maxLPB, impossible: loaves > 0 && maxLPB <= 0, floursOver: otherFlourSum(t) > 100 };
     });
     // batch list ordered by each recipe's chosen mix order (recipe blocks stay contiguous)
@@ -1968,10 +1980,19 @@ export default function App() {
         .label-stage{display:flex;justify-content:center;padding:24px 12px 48px;zoom:.62;}
         .label-sheets{display:flex;flex-direction:column;gap:22px;}
         .label-sheet{background:#fff;box-shadow:0 6px 30px rgba(0,0,0,.45);}
+        .label-skipmap{max-width:340px;margin:0 auto 4px;padding:10px 12px;background:rgba(255,255,255,.06);border:1px solid rgba(245,239,227,.16);border-radius:10px;}
+        .lsm-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:'DM Sans';font-size:11.5px;color:#b09070;margin-bottom:8px;}
+        .lsm-reset{font-family:'DM Sans';font-size:11px;font-weight:600;padding:3px 9px;border-radius:6px;border:1px solid rgba(245,239,227,.28);background:transparent;color:#f5efe3;cursor:pointer;white-space:nowrap;}
+        .lsm-grid{display:grid;gap:5px;}
+        .lsm-cell{position:relative;display:flex;align-items:center;justify-content:center;gap:5px;height:30px;border:1.5px solid rgba(245,239,227,.3);border-radius:5px;background:rgba(245,239,227,.1);cursor:pointer;font-family:'JetBrains Mono';font-size:11px;color:#f5efe3;}
+        .lsm-cell.off{background:transparent;border-style:dashed;border-color:rgba(245,239,227,.16);color:rgba(245,239,227,.32);}
+        .lsm-cell input{width:14px;height:14px;accent-color:#b5651d;cursor:pointer;margin:0;}
         .label-cell{box-sizing:border-box;width:100%;height:100%;overflow:hidden;padding:0.13in 0.16in;display:flex;flex-direction:row;gap:0.16in;color:#1a1a1a;font-family:'DM Sans',sans-serif;}
         .lc-left{flex:none;width:1.55in;display:flex;flex-direction:column;justify-content:center;border-right:1pt solid #1a1a1a;padding-right:0.14in;overflow:hidden;}
         .lc-left .lc-n{font-family:'JetBrains Mono';font-weight:700;font-size:11pt;color:#fff;background:#1a1a1a;border-radius:3pt;padding:1.5pt 6pt;align-self:flex-start;margin-bottom:5pt;letter-spacing:.5pt;}
         .lc-left .lc-name{font-family:'Fraunces',serif;font-weight:600;font-size:17pt;line-height:1.04;}
+        .lc-left .lc-tot{margin-top:auto;display:flex;flex-direction:column;gap:1pt;font-family:'JetBrains Mono';font-size:7.5pt;line-height:1.25;color:#333;border-top:0.5pt solid #bbb;padding-top:2.5pt;}
+        .lc-left .lc-tot b{font-weight:600;color:#1a1a1a;}
         .lc-right{flex:1;display:flex;flex-direction:column;min-width:0;}
         .lc-lines{flex:1;display:flex;flex-direction:column;gap:1pt;justify-content:center;}
         .lc-line{display:flex;justify-content:space-between;align-items:baseline;gap:6pt;font-size:9pt;line-height:1.3;}
@@ -1984,7 +2005,7 @@ export default function App() {
           html, body { background:#fff !important; }
           .bl-root { display: none !important; }
           .label-print-overlay { position: static !important; inset:auto !important; background:#fff !important; overflow:visible !important; }
-          .label-print-ui, .label-print-hint { display: none !important; }
+          .label-print-ui, .label-print-hint, .label-skipmap { display: none !important; }
           .label-stage { zoom:1 !important; padding:0 !important; display:block !important; }
           .label-sheets { gap:0 !important; display:block !important; }
           .label-sheet { box-shadow:none !important; margin:0 !important; break-after:page; page-break-after:always; }
@@ -2932,6 +2953,8 @@ export default function App() {
                     <div className="meta"><span><b>{b.size}</b> loaves</span><span><b>{fmtG(b.dough)}</b> g dough</span><span>{(t.shape || "round") === "oval" ? "Oval" : "Round"}</span></div>
                     <div className="bl-build-ddt">Target dough temp<b>{showTemp(t.ddt ?? DDT_DEFAULT_C)}</b></div>
                     {cols.map((l) => <div className="ing" key={l.key}><span className="nm">{l.name}</span><span className="g">{fmtG(b.weights[l.key])} g{l.key === "water" && mixWaterTemp != null ? <em className="bl-watertemp"> · {showTemp(mixWaterTemp)}</em> : null}</span></div>)}
+                    <div className="ing tot"><span className="nm">Total flour</span><span className="g">{fmtG(b.totalFlour)} g</span></div>
+                    <div className="ing tot"><span className="nm">Total water</span><span className="g">{fmtG(b.totalWater)} g</span></div>
                     {isA && <button className="bl-donebtn" onClick={(e) => { e.stopPropagation(); completeAndNext(i); }}>Done — built ✓</button>}
                   </div>
                 );
@@ -3250,12 +3273,22 @@ export default function App() {
       const P = AVERY_6468;
       const data = (plan.list || []).map((b, i) => {
         const t = types[b.ti];
-        return { n: i + 1, name: t.name, size: b.size, dough: b.dough, lines: ingLines(t).filter((l) => l.pct > 0).map((l) => ({ name: l.name, g: b.weights[l.key] })) };
+        return { n: i + 1, name: t.name, size: b.size, dough: b.dough, totalFlour: b.totalFlour, totalWater: b.totalWater, lines: ingLines(t).filter((l) => l.pct > 0).map((l) => ({ name: l.name, g: b.weights[l.key] })) };
       });
-      const per = P.cols * P.rows;
+      const per = Math.max(1, P.cols * P.rows);
+      const skip = labelSkip.filter((p) => p >= 0 && p < per);
       const sheets = [];
-      for (let i = 0; i < data.length; i += per) sheets.push(data.slice(i, i + per));
-      if (sheets.length === 0) sheets.push([]);
+      let di = 0, sx = 0;
+      while (true) {
+        const cells = [];
+        for (let p = 0; p < per; p++) {
+          const blocked = sx === 0 && skip.indexOf(p) !== -1;
+          cells.push((!blocked && di < data.length) ? data[di++] : null);
+        }
+        sheets.push(cells);
+        sx++;
+        if (di >= data.length) break;
+      }
       const sheetStyle = { width: P.pageW + "in", height: P.pageH + "in", boxSizing: "border-box", paddingTop: `calc(${P.top}in + ${labelOffY}mm)`, paddingLeft: `calc(${P.left}in + ${labelOffX}mm)` };
       const gridStyle = { display: "grid", gridTemplateColumns: `repeat(${P.cols}, ${P.labelW}in)`, gridAutoRows: `${P.labelH}in`, columnGap: `${P.hGut}in`, rowGap: `${P.vGut}in` };
       return (
@@ -3269,16 +3302,34 @@ export default function App() {
             <button className="lpu-close" onClick={() => setLabelOpen(false)} aria-label="Close">×</button>
           </div>
           <div className="label-print-hint">Set the print dialog to <b>100% scale</b> and <b>margins: None</b>. Run one test sheet on plain paper held against a label sheet; if it's off, nudge in mm above.</div>
+          <div className="label-skipmap">
+            <div className="lsm-hd">
+              <span>Sheet 1 — untick any label already peeled off</span>
+              {skip.length > 0 && <button className="lsm-reset" onClick={() => setLabelSkip([])}>All present</button>}
+            </div>
+            <div className="lsm-grid" style={{ gridTemplateColumns: "repeat(" + P.cols + ", 1fr)" }}>
+              {Array.from({ length: per }, (_, p) => {
+                const off = skip.indexOf(p) !== -1;
+                return (
+                  <label className={"lsm-cell" + (off ? " off" : "")} key={p}>
+                    <input type="checkbox" checked={!off} onChange={() => setLabelSkip((st) => st.indexOf(p) !== -1 ? st.filter((x) => x !== p) : [...st, p])} />
+                    <span>{p + 1}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
           <div className="label-stage">
             <div className="label-sheets">
               {sheets.map((sheet, si) => (
                 <div className="label-sheet" key={si} style={sheetStyle}>
                   <div style={gridStyle}>
-                    {sheet.map((L) => (
-                      <div className="label-cell" key={L.n}>
+                    {sheet.map((L, ci) => L === null ? <div className="label-cell" key={ci} /> : (
+                      <div className="label-cell" key={ci}>
                         <div className="lc-left">
                           <span className="lc-n">B{L.n}</span>
                           <span className="lc-name">{L.name}</span>
+                          <span className="lc-tot"><span>Flour <b>{fmtG(L.totalFlour)} g</b></span><span>Water <b>{fmtG(L.totalWater)} g</b></span></span>
                         </div>
                         <div className="lc-right">
                           <div className="lc-lines">
