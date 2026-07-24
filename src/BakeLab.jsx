@@ -13,6 +13,7 @@ const NEW = "__new__";
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 const mk = (name, pct) => ({ id: uid(), name, pct });
+const mkL = (name, pct, factor) => ({ id: uid(), name, pct, factor });
 
 // deep-copy a recipe with fresh ingredient ids (so slots never share refs)
 const DDT_DEFAULT_C = (76 - 32) * 5 / 9; // 76°F target dough temp, stored internally in °C
@@ -24,10 +25,14 @@ const cloneRecipe = (r) => ({
   bakeTemp: r.bakeTemp ?? 245, bakeMin: r.bakeMin ?? 45, steamMin: r.steamMin ?? 20,
   autolyse: r.autolyse ?? 45,
   calNote: r.calNote || "",
+  bassinage: !!r.bassinage,
+  bassinagePct: r.bassinagePct ?? 8,
+  notes: r.notes || "",
   flours: r.flours.map((f) => mk(f.name, f.pct)),
   inclusions: r.inclusions.map((f) => mk(f.name, f.pct)),
+  liquids: (r.liquids || []).map((l) => mkL(l.name, l.pct, l.factor ?? 100)),
 });
-const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", inclusions: [] });
+const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", inclusions: [], liquids: [] });
 
 // date helpers — defined early because DEFAULT_SLOTS uses them at module-eval time
 const todayISO = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
@@ -216,7 +221,7 @@ const normalizeFoodSafety = (fs) => {
     })),
   };
 };
-const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
+const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, doughBuffer: false, doughBufferPct: 4, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
 const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), complete: false, day: day || defaultDay() });
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
@@ -265,7 +270,16 @@ function IngredientInput({ value, onCommit, className, placeholder, ingredients,
 }
 const otherFlourSum = (t) => t.flours.slice(1).reduce((a, f) => a + (+f.pct || 0), 0);
 const mainPct = (t) => Math.max(0, 100 - otherFlourSum(t));
-const RECIPE_FORMULA_KEYS = ["name","loafWeight","shape","water","salt","levain","levHyd","levInoc","levRefInoc","levBuildHrs","levRefTemp","levWhole","levExpNote","ddt","bakeTemp","bakeMin","steamMin","autolyse","calNote"];
+const trueHydration = (t) => {
+  const liq = (t.liquids || []).reduce((a, l) => a + (+l.pct || 0) * ((+l.factor || 100) / 100), 0);
+  const lev = +t.levain || 0, lh = +t.levHyd || 80, den = 100 + lh;
+  const levFlour = den > 0 ? lev * 100 / den : 0;
+  const levWater = den > 0 ? lev * lh / den : 0;
+  const totalFlour = 100 + levFlour;
+  const totalWater = (+t.water || 0) + liq + levWater;
+  return totalFlour > 0 ? (totalWater / totalFlour) * 100 : 0;
+};
+const RECIPE_FORMULA_KEYS = ["name","loafWeight","shape","water","salt","levain","levHyd","levInoc","levRefInoc","levBuildHrs","levRefTemp","levWhole","levExpNote","ddt","bakeTemp","bakeMin","steamMin","autolyse","calNote","bassinage","bassinagePct"];
 const sameIngList = (x, y, skipFirstPct) => {
   const xs = x || [], ys = y || [];
   if (xs.length !== ys.length) return false;
@@ -285,7 +299,16 @@ const flourPctOf = (t, idx) => (idx === 0 ? mainPct(t) : (+t.flours[idx].pct || 
 const ingLines = (t) => {
   const L = [];
   t.flours.forEach((f, i) => L.push({ key: "fl_" + f.id, name: f.name, pct: flourPctOf(t, i) }));
-  L.push({ key: "water", name: "Water", pct: +t.water || 0 });
+  const wTot = +t.water || 0;
+  const bPct = t.bassinage ? Math.max(0, Math.min(50, +t.bassinagePct || 0)) : 0;
+  if (bPct > 0) {
+    const bW = wTot * bPct / 100;
+    L.push({ key: "water", name: "Water (main)", pct: wTot - bW });
+    L.push({ key: "bassinage", name: "Bassinage water", pct: bW });
+  } else {
+    L.push({ key: "water", name: "Water", pct: wTot });
+  }
+  (t.liquids || []).forEach((l) => L.push({ key: "lq_" + l.id, name: l.name, pct: +l.pct || 0 }));
   L.push({ key: "salt", name: "Salt", pct: +t.salt || 0 });
   L.push({ key: "levain", name: "Levain", pct: +t.levain || 0 });
   t.inclusions.forEach((f) => L.push({ key: "in_" + f.id, name: f.name, pct: +f.pct || 0 }));
@@ -298,6 +321,18 @@ const formulaKey = (r) => JSON.stringify({
   lh: +r.levHyd || 80, li: +r.levInoc || 10, ri: +r.levRefInoc || 10, lb: +r.levBuildHrs || 5, lr: +r.levRefTemp || 24, lwh: +r.levWhole || 0, lxn: r.levExpNote || "", bt: +r.bakeTemp || 245, bm: +r.bakeMin || 45, sm: +r.steamMin || 20, au: +r.autolyse || 45, cn: r.calNote || "",
   fl: r.flours.map((f, i) => [f.name, i === 0 ? mainPct(r) : +f.pct || 0]),
   inc: r.inclusions.map((f) => [f.name, +f.pct || 0]),
+  lq: (r.liquids || []).map((l) => [l.name, +l.pct || 0, +l.factor || 100]),
+  bs: !!r.bassinage, bp: +r.bassinagePct || 0,
+});
+
+// signature of the base dough only (flours + hydration + salt + levain build + autolyse + DDT); inclusions / loaf weight / shape / bake ignored
+const baseDoughKey = (r) => JSON.stringify({
+  w: +r.water || 0, s: +r.salt || 0, lv: +r.levain || 0,
+  lh: +r.levHyd || 80, li: +r.levInoc || 10, ri: +r.levRefInoc || 10, lb: +r.levBuildHrs || 5, lr: +r.levRefTemp || 24, lwh: +r.levWhole || 0,
+  au: +r.autolyse || 45, dt: Math.round((+r.ddt || DDT_DEFAULT_C) * 10) / 10,
+  fl: r.flours.map((f, i) => [f.name, i === 0 ? mainPct(r) : +f.pct || 0]),
+  lq: (r.liquids || []).map((l) => [l.name, +l.pct || 0, +l.factor || 100]),
+  bs: !!r.bassinage, bp: +r.bassinagePct || 0,
 });
 
 const buildStages = (p) => {
@@ -513,6 +548,8 @@ export default function App() {
   const [retard, setRetard] = useState({});
   const [levBuffer, setLevBuffer] = useState({});
   const [levBufferPct, setLevBufferPct] = useState({});
+  const [doughBuffer, setDoughBuffer] = useState(false);
+  const [doughBufferPct, setDoughBufferPct] = useState(4);
   const [foodSafety, setFoodSafety] = useState(defaultFoodSafety());
   const addFridge = () => setFoodSafety((fs) => ({ ...fs, fridges: [...fs.fridges, newFridge("Fridge " + (fs.fridges.length + 1))] }));
   const removeFridge = (fi) => setFoodSafety((fs) => ({ ...fs, fridges: fs.fridges.filter((_, i) => i !== fi) }));
@@ -566,6 +603,8 @@ export default function App() {
   const [doneBatches, setDoneBatches] = useState([]);
   const [calcOpen, setCalcOpen] = useState(false);
   const [mixWaterTemp, setMixWaterTemp] = useState(null); // internal °C, null = unset
+  const [aiState, setAiState] = useState({});
+  const [aiLoaves, setAiLoaves] = useState({});
   const [calcInputs, setCalcInputs] = useState(null); // last calculator inputs, internal °C
   const [delTarget, setDelTarget] = useState(null); // {id,name,kind} recipe pending delete confirmation
   const [labelOpen, setLabelOpen] = useState(false);
@@ -623,6 +662,8 @@ export default function App() {
     setRetard(d.retard && typeof d.retard === "object" ? d.retard : {});
     setLevBuffer(d.levBuffer && typeof d.levBuffer === "object" ? d.levBuffer : {});
     setLevBufferPct(d.levBufferPct && typeof d.levBufferPct === "object" ? d.levBufferPct : {});
+    setDoughBuffer(!!d.doughBuffer);
+    setDoughBufferPct(typeof d.doughBufferPct === "number" ? d.doughBufferPct : 4);
     setDoneBatches(Array.isArray(d.doneBatches) ? d.doneBatches : []);
     setFoodSafety(normalizeFoodSafety(d.foodSafety));
     setMixWaterTemp(typeof d.mixWaterTemp === "number" ? d.mixWaterTemp : null);
@@ -643,6 +684,7 @@ export default function App() {
 
   // ---- batch planner -------------------------------------------------------
   const plan = useMemo(() => {
+    const dbF = 1 + (doughBuffer ? Math.max(0, Math.min(25, +doughBufferPct || 0)) : 0) / 100;
     const summaries = [], perType = [];
     types.forEach((t, ti) => {
       const lines = ingLines(t);
@@ -656,7 +698,7 @@ export default function App() {
       else if (loaves > 0) { batchCount = loaves; sizes = Array(loaves).fill(1); }
       const unit = pctSum > 0 ? totalDough / pctSum : 0;
       const perLoaf = {}; lines.forEach((l) => { perLoaf[l.key] = loaves > 0 ? (unit * l.pct) / loaves : 0; });
-      perType[ti] = sizes.map((sz) => { const weights = {}; lines.forEach((l) => { weights[l.key] = perLoaf[l.key] * sz; }); return { ti, name: t.name, size: sz, dough: sz * W, weights }; });
+      perType[ti] = sizes.map((sz) => { const weights = {}; lines.forEach((l) => { weights[l.key] = perLoaf[l.key] * sz * dbF; }); return { ti, name: t.name, size: sz, dough: sz * W * dbF, weights }; });
       summaries[ti] = { ti, name: t.name, loaves, W, totalDough, batchCount, sizes, maxLPB, impossible: loaves > 0 && maxLPB <= 0, floursOver: otherFlourSum(t) > 100 };
     });
     // batch list ordered by each recipe's chosen mix order (recipe blocks stay contiguous)
@@ -664,7 +706,38 @@ export default function App() {
     const list = [];
     order.forEach((ti) => { (perType[ti] || []).forEach((b) => list.push(b)); });
     return { list, summaries };
-  }, [types, maxBatch]);
+  }, [types, maxBatch, doughBuffer, doughBufferPct]);
+
+  // recipes that share a base dough -> combined mix guidance (additive; does not touch the batch/levain engine)
+  const baseDoughGroups = useMemo(() => {
+    const dbF = 1 + (doughBuffer ? Math.max(0, Math.min(25, +doughBufferPct || 0)) : 0) / 100;
+    const groups = {};
+    types.forEach((t, ti) => {
+      const loaves = Math.max(0, Math.floor(+t.loaves || 0));
+      if (loaves <= 0) return;
+      const lines = ingLines(t);
+      const TP = lines.reduce((a, l) => a + l.pct, 0);
+      const W = Math.max(0, +t.loafWeight || 0);
+      const unitPerLoaf = TP > 0 ? W / TP : 0;
+      let BP = 0; const basePcts = {}; const inc = [];
+      lines.forEach((l) => {
+        if (l.key.indexOf("in_") === 0) { if (l.pct > 0) inc.push({ name: l.name, g: unitPerLoaf * l.pct * loaves }); }
+        else { BP += l.pct; basePcts[l.name] = (basePcts[l.name] || 0) + l.pct; }
+      });
+      const baseDoughPerLoaf = unitPerLoaf * BP;
+      const k = baseDoughKey(t);
+      if (!groups[k]) groups[k] = { key: k, BP, basePcts, members: [], totalBase: 0, mixOrder: t.mixOrder || 99 };
+      groups[k].members.push({ ti, name: t.name, loaves, inc });
+      groups[k].totalBase += baseDoughPerLoaf * loaves * dbF;
+      groups[k].mixOrder = Math.min(groups[k].mixOrder, t.mixOrder || 99);
+    });
+    const cap = maxBatch > 0 ? maxBatch : 0;
+    return Object.values(groups).filter((g) => g.members.length >= 2).sort((a, b) => a.mixOrder - b.mixOrder).map((g) => {
+      const nBatches = cap > 0 ? Math.max(1, Math.ceil(g.totalBase / cap)) : 1;
+      const weighOut = Object.keys(g.basePcts).map((name) => ({ name, g: g.BP > 0 ? g.totalBase * g.basePcts[name] / g.BP : 0 }));
+      return { key: g.key, members: g.members, totalBase: g.totalBase, nBatches, weighOut, cap };
+    });
+  }, [types, maxBatch, doughBuffer, doughBufferPct]);
 
   const totalBatches = Math.max(1, plan.list.length);
 
@@ -701,7 +774,7 @@ export default function App() {
                 setCoreRecipes(c.library);
                 persist(GLOBALS_KEY, { coreRecipes: c.library, remixes: [], ingredients: [], inocCal: [{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + (typeof c.inocDoubleHrs === "number" ? c.inocDoubleHrs : 1.5) }], tempUnit: c.tempUnit === "F" ? "F" : "C" });
               }
-              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, doneBatches: [], foodSafety: defaultFoodSafety() };
+              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, doughBuffer: false, doughBufferPct: 4, doneBatches: [], foodSafety: defaultFoodSafety() };
               loadedDays = [{ id: uid(), name: "Imported run", date: todayISO(), updatedAt: Date.now(), day }];
             } else {
               loadedDays = [newDayEntry("My first run", defaultDay())];
@@ -721,9 +794,9 @@ export default function App() {
   // autosave the open day's snapshot
   useEffect(() => {
     if (!loaded || view !== "editor" || !currentDayId) return;
-    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs };
+    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, doughBuffer, doughBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs };
     setDays((ds) => { const nd = ds.map((d) => (d.id === currentDayId ? { ...d, name: dayName, date: dayDate, updatedAt: Date.now(), day: snap } : d)); persist(DAYS_KEY, nd); return nd; });
-  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
+  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, doughBuffer, doughBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
 
   const distribute = (s) => { setStagger(s); setOffsets(Array.from({ length: totalBatches }, (_, b) => b * s)); };
 
@@ -906,7 +979,7 @@ export default function App() {
       let cur = preheat;
       const sched = loads.map((ld, i) => { const startOff = cur, ventOff = cur + ld.steamMin, endOff = cur + ld.bakeMin; cur = endOff + recover; return { ...ld, i, startOff, ventOff, endOff }; });
       const lastOut = sched.length ? sched[sched.length - 1].endOff : preheat;
-      return { date, sched, firstIn: preheat, lastOut, totalLoaves: loads.reduce((a, l) => a + l.n, 0), loadCount: sched.length };
+      return { date, items, sched, firstIn: preheat, lastOut, totalLoaves: loads.reduce((a, l) => a + l.n, 0), loadCount: sched.length };
     };
     const dateSchedules = Object.entries(dateMap).sort(([a], [b]) => a.localeCompare(b)).map(([date, items]) => scheduleDate(date, items));
     const pool = types.map((t, ti) => {
@@ -1034,6 +1107,40 @@ export default function App() {
     if (oldCore) setSlots((ss) => ss.map((sl) => (sl.coreRecipeId === r.id && sameFormula(sl.draft, oldCore)) ? { ...sl, draft: cloneRecipe(r) } : sl));
   };
   const saveSlotAsRemix = (ti) => { remixRecipe(ti); patchSlot(ti, (sl) => ({ ...sl, coreRecipeId: "" })); };
+  const setRecipeNotes = (ti, v) => {
+    patchDraft(ti, (d) => ({ ...d, notes: v }));
+    const cid = slots[ti] && slots[ti].coreRecipeId;
+    if (cid) setCoreRecipes((rs) => rs.map((x) => x.id === cid ? { ...x, notes: v } : x));
+  };
+  const runAnalysis = async (r) => {
+    const id = r.id, loaves = Math.max(1, +aiLoaves[id] || 24), W = +r.loafWeight || 0, cap = +params.ovenCap || 15;
+    setAiState((st) => ({ ...st, [id]: { loading: true } }));
+    try {
+      const payload = {
+        recipe: {
+          name: r.name, loafWeightG: r.loafWeight, shape: r.shape,
+          flours: r.flours.map((fl, i) => ({ name: fl.name, pct: i === 0 ? mainPct(r) : (+fl.pct || 0) })),
+          waterPct: +r.water || 0,
+          liquids: (r.liquids || []).map((l) => ({ name: l.name, pct: +l.pct || 0, waterFactorPct: +l.factor || 100 })),
+          saltPct: +r.salt || 0, levainPct: +r.levain || 0, levainHydrationPct: +r.levHyd || 80, inoculationPct: +r.levInoc || 10,
+          levainBuildHrs: +r.levBuildHrs || 5, levainRefTempC: +r.levRefTemp || 24, levainWholeGrainPct: +r.levWhole || 0,
+          trueHydrationPct: Math.round(trueHydration(r) * 10) / 10,
+          autolyseMin: +r.autolyse || 45, targetDoughTempC: Math.round((+r.ddt || DDT_DEFAULT_C) * 10) / 10,
+          bakeTempC: +r.bakeTemp || 245, bakeMin: +r.bakeMin || 45, steamMin: +r.steamMin || 20,
+          inclusions: (r.inclusions || []).map((fl) => ({ name: fl.name, pct: +fl.pct || 0 })),
+        },
+        loaves,
+        rig: { mixerDoughCapacityG: maxBatch, ovenLoafCapacity: cap },
+        derived: { totalDoughG: Math.round(loaves * W), mixerBatches: maxBatch > 0 ? Math.ceil(loaves * W / maxBatch) : 1, ovenLoads: cap > 0 ? Math.ceil(loaves / cap) : 1 },
+      };
+      const resp = await fetch("/api/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) throw new Error((data && (data.error || data.detail)) || ("Server " + resp.status));
+      setAiState((st) => ({ ...st, [id]: { result: data } }));
+    } catch (e) {
+      setAiState((st) => ({ ...st, [id]: { error: (e && e.message) || "Analysis failed" } }));
+    }
+  };
   const remixRecipe = (ti) => {
     const slot = slots[ti];
     const originName = (slot.coreRecipeId && coreRecipes.find((r) => r.id === slot.coreRecipeId)?.name) || slot.draft?.name || "Recipe";
@@ -1073,6 +1180,9 @@ export default function App() {
   const patchEditInc = (idx, patch) => setEditingDraft((d) => { if (!d) return d; const f = [...d.inclusions]; f[idx] = { ...f[idx], ...patch }; return { ...d, inclusions: f }; });
   const addEditInc = () => setEditingDraft((d) => d ? { ...d, inclusions: [...(d.inclusions || []), mk("Inclusion " + ((d.inclusions || []).length + 1), 0)] } : d);
   const removeEditInc = (idx) => setEditingDraft((d) => d ? { ...d, inclusions: (d.inclusions || []).filter((_, i) => i !== idx) } : d);
+  const patchEditLiq = (idx, patch) => setEditingDraft((d) => { if (!d) return d; const f = [...(d.liquids || [])]; f[idx] = { ...f[idx], ...patch }; return { ...d, liquids: f }; });
+  const addEditLiq = () => setEditingDraft((d) => d ? { ...d, liquids: [...(d.liquids || []), mkL("Milk", 0, 88)] } : d);
+  const removeEditLiq = (idx) => setEditingDraft((d) => d ? { ...d, liquids: (d.liquids || []).filter((_, i) => i !== idx) } : d);
 
   const NUM = (label, key, hi) => (
     <div className="bl-field2"><label className={hi ? "hi" : ""}>{label}</label>
@@ -1420,6 +1530,67 @@ export default function App() {
         .bl-detach-up{background:var(--crust);color:#fff;border-color:var(--crust2);}
         .bl-detach-remix{background:#fff;color:var(--crust2);border-color:var(--crust);}
         .bl-detach-dismiss{background:#fff;color:var(--ink2);border-color:var(--line);}
+        .bl-profiles{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 9px;}
+        .bl-prof-lbl{font-size:10.5px;color:var(--ink2);text-transform:uppercase;letter-spacing:.04em;}
+        .bl-prof{font-family:'JetBrains Mono';font-size:10.5px;color:var(--ink2);background:var(--paper);border:1px solid var(--line);border-radius:6px;padding:2px 7px;}
+        .bl-basedough{background:#fff6e3;border:1.5px solid #e9c47e;border-radius:12px;padding:12px 14px;margin:0 0 16px;}
+        .bl-bd-hd{display:flex;align-items:baseline;gap:9px;margin-bottom:9px;}
+        .bl-bd-title{font-family:'Fraunces';font-size:15px;font-weight:600;color:var(--crust2);}
+        .bl-bd-sub{font-size:11px;color:var(--ink2);text-transform:uppercase;letter-spacing:.04em;}
+        .bl-bd-group{padding:9px 0;border-top:1px solid #e9c47e;}
+        .bl-bd-group:first-of-type{border-top:none;padding-top:0;}
+        .bl-bd-total{font-family:'JetBrains Mono';font-size:12.5px;font-weight:700;color:var(--ink);margin-bottom:6px;}
+        .bl-bd-weigh{display:flex;flex-wrap:wrap;gap:5px 10px;margin-bottom:8px;}
+        .bl-bd-ing{font-family:'JetBrains Mono';font-size:11.5px;color:var(--ink2);}
+        .bl-bd-ing b{color:var(--ink);font-weight:600;}
+        .bl-bd-split{display:flex;flex-direction:column;gap:4px;}
+        .bl-bd-member{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;}
+        .bl-bd-mname{font-family:'DM Sans';font-size:12.5px;font-weight:600;color:var(--ink);}
+        .bl-bd-inc{font-size:11.5px;color:var(--crust2);}
+        .bl-bd-inc.plain{color:var(--ink2);font-style:italic;}
+        .bl-sub-note{font-size:10.5px;font-weight:400;color:var(--ink2);text-transform:none;letter-spacing:0;margin-left:6px;}
+        .liq-row{display:flex;align-items:center;gap:6px;margin-bottom:6px;flex-wrap:wrap;}
+        .liq-row .ing-name{flex:1 1 120px;min-width:100px;}
+        .liq-cell{display:flex;align-items:center;gap:3px;}
+        .liq-cell input{width:54px;font-family:'JetBrains Mono';font-size:13px;padding:5px 6px;border:1px solid var(--line);border-radius:6px;text-align:right;background:#fff;color:var(--ink);}
+        .liq-cell em{font-size:10px;color:var(--ink2);font-style:normal;white-space:nowrap;}
+        .bl-hyd-readout{margin:8px 0 4px;padding:8px 12px;background:#eef4f6;border:1px solid #cfe0e6;border-radius:8px;font-family:'JetBrains Mono';font-size:13px;color:#1f6f86;}
+        .bl-hyd-readout b{font-size:15px;color:#155;}
+        .bl-hyd-note{font-family:'DM Sans';font-size:10.5px;color:var(--ink2);margin-left:6px;}
+        .brc-ai{margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);}
+        .brc-ai-row{display:flex;align-items:center;gap:8px;}
+        .brc-ai-row label{font-size:11px;color:var(--ink2);display:flex;align-items:center;gap:4px;}
+        .brc-ai-row label input{width:46px;font-family:'JetBrains Mono';font-size:12px;padding:3px 5px;border:1px solid var(--line);border-radius:5px;text-align:right;background:#fff;}
+        .brc-ai-btn{font-family:'DM Sans';font-size:12px;font-weight:600;padding:5px 12px;border-radius:7px;border:1.5px solid var(--crust);background:var(--crust);color:#fff;cursor:pointer;}
+        .brc-ai-btn:disabled{opacity:.6;cursor:default;}
+        .brc-ai-err{margin-top:7px;font-size:11.5px;color:var(--alert);line-height:1.35;}
+        .brc-ai-out{margin-top:8px;font-size:12px;color:var(--ink);line-height:1.42;}
+        .brc-ai-sum{font-weight:600;margin-bottom:6px;}
+        .brc-ai-sec{margin-top:6px;}
+        .brc-ai-h{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--crust2);margin-bottom:2px;}
+        .brc-ai-li{margin:2px 0;padding-left:11px;position:relative;}
+        .brc-ai-li:before{content:"·";position:absolute;left:3px;color:var(--ink2);}
+        .brc-ai-raw{white-space:pre-wrap;}
+        .bl-bass{margin:2px 0 10px;padding:9px 11px;background:var(--paper);border:1px solid var(--line);border-radius:9px;display:flex;flex-wrap:wrap;align-items:center;gap:9px;}
+        .bl-bass-tog{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--ink2);cursor:pointer;}
+        .bl-bass-tog input{width:15px;height:15px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .bl-bass-pct{display:flex;align-items:center;gap:4px;}
+        .bl-bass-pct input{width:56px;font-family:'JetBrains Mono';font-size:12px;padding:3px 6px;border:1.5px solid var(--line);border-radius:6px;text-align:right;background:#fff;color:var(--ink);}
+        .bl-bass-pct em{font-size:10.5px;color:var(--ink2);font-style:normal;}
+        .bl-bass-read{flex-basis:100%;font-family:'JetBrains Mono';font-size:11px;color:var(--crust2);}
+        .bl-notes-ta{width:100%;font-family:'DM Sans';font-size:13px;line-height:1.45;padding:9px 11px;border:1.5px solid var(--line);border-radius:9px;background:var(--cream);color:var(--ink);resize:vertical;box-sizing:border-box;}
+        .bl-notes-row{padding:9px 0;border-top:1px solid var(--line);}
+        .bl-notes-row:first-of-type{border-top:none;padding-top:2px;}
+        .bl-notes-hd{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin-bottom:5px;}
+        .bl-notes-nm{font-family:'DM Sans';font-size:13px;font-weight:600;color:var(--ink);}
+        .bl-notes-warn{font-size:10.5px;color:var(--ink2);font-style:italic;}
+        .bl-dbuf{margin:0 0 14px;padding:10px 12px;background:var(--paper);border:1px solid var(--line);border-radius:9px;display:flex;flex-wrap:wrap;align-items:center;gap:9px;}
+        .bl-dbuf-tog{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink2);cursor:pointer;}
+        .bl-dbuf-tog input{width:15px;height:15px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .bl-dbuf-pct{display:flex;align-items:center;gap:4px;}
+        .bl-dbuf-pct input{width:56px;font-family:'JetBrains Mono';font-size:12px;padding:3px 6px;border:1.5px solid var(--line);border-radius:6px;text-align:right;background:#fff;color:var(--ink);}
+        .bl-dbuf-pct em{font-size:11px;color:var(--ink2);font-style:normal;}
+        .bl-dbuf-warn{flex-basis:100%;font-size:11.5px;color:var(--alert);line-height:1.35;}
         .dc-body .dc-bake{font-family:'JetBrains Mono';font-size:11px;color:var(--sand);}
         .dc-body .dc-open{margin-top:4px;font-family:'DM Sans';font-size:13px;font-weight:600;color:var(--crust);}
         .bl-dayhd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;}
@@ -1988,6 +2159,27 @@ export default function App() {
                   <div className="bl-field2"><label>Salt %</label><input type="number" min="0" value={editingDraft.salt || 0} onChange={(e) => patchEdit({ salt: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div className="bl-field2"><label>Levain %</label><input type="number" min="0" value={editingDraft.levain || 0} onChange={(e) => patchEdit({ levain: Math.max(0, Number(e.target.value) || 0) })} /></div>
                 </div>
+                <div className="bl-bass">
+                  <label className="bl-bass-tog"><input type="checkbox" checked={!!editingDraft.bassinage} onChange={(e) => patchEdit({ bassinage: e.target.checked })} /><span>Bassinage — hold water back, work in after gluten development</span></label>
+                  {editingDraft.bassinage && (
+                    <span className="bl-bass-pct"><input type="number" min="0" max="50" step="0.5" value={editingDraft.bassinagePct ?? 8} onChange={(e) => patchEdit({ bassinagePct: Math.max(0, Math.min(50, Number(e.target.value) || 0)) })} /><em>% of water held back</em></span>
+                  )}
+                  {editingDraft.bassinage && (() => {
+                    const w = +editingDraft.water || 0, bp = Math.max(0, Math.min(50, +(editingDraft.bassinagePct ?? 8) || 0)), bw = w * bp / 100;
+                    return <div className="bl-bass-read">main {Math.round((w - bw) * 10) / 10}% · bassinage {Math.round(bw * 10) / 10}% · total still {Math.round(w * 10) / 10}%</div>;
+                  })()}
+                </div>
+                <div className="bl-subhead">Liquids <span className="bl-sub-note">milk 88% · egg 75% · cream 60% · tangzhong liquid counts too</span></div>
+                {(editingDraft.liquids || []).map((l, idx) => (
+                  <div className="liq-row" key={l.id}>
+                    <IngredientInput className="ing-name" value={l.name} onCommit={(v) => patchEditLiq(idx, { name: v })} placeholder="Milk / egg / tangzhong liquid" ingredients={ingredients} kind="liquid" />
+                    <div className="liq-cell"><input type="number" min="0" value={l.pct} onChange={(e) => patchEditLiq(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
+                    <div className="liq-cell"><input type="number" min="0" max="100" value={l.factor} onChange={(e) => patchEditLiq(idx, { factor: Math.max(0, Math.min(100, Number(e.target.value) || 0)) })} /><em>% water</em></div>
+                    <button className="ing-x" onClick={() => removeEditLiq(idx)}>×</button>
+                  </div>
+                ))}
+                <button className="bl-add" onClick={addEditLiq}>+ Liquid</button>
+                <div className="bl-hyd-readout">Total hydration <b>{Math.round(trueHydration(editingDraft) * 10) / 10}%</b> <span className="bl-hyd-note">true water · incl. levain</span></div>
                 <div className="bl-subhead">Inclusions</div>
                 {(editingDraft.inclusions || []).map((f, idx) => (
                   <div className="ing-row" key={f.id}>
@@ -2014,6 +2206,8 @@ export default function App() {
                   <div className="bl-field2"><label>Build to peak (h)</label><input type="number" min="0" step="0.25" value={editingDraft.levBuildHrs ?? 5} onChange={(e) => patchEdit({ levBuildHrs: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div className="bl-field2"><label>Ref temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(editingDraft.levRefTemp ?? 24))} onChange={(e) => patchEdit({ levRefTemp: uToC(Number(e.target.value) || 0) })} /></div>
                 </div>
+                <div className="bl-subhead">Notes <span className="bl-sub-note">carries between bakes · shared with the Prep tab</span></div>
+                <BufferedInput className="bl-notes-ta" rows={4} value={editingDraft.notes || ""} onCommit={(v) => patchEdit({ notes: v })} placeholder="What happened last time, what to change…" />
                 {editingIsRemix && <button className="bl-promote-btn" onClick={() => { promoteRemixToCore(editingRecipeId); setBuilderView("list"); }}>↑ Save as core recipe</button>}
               </div>
             </div>
@@ -2032,6 +2226,24 @@ export default function App() {
                     <div className="brc-body">
                       <div className="brc-meta">{r.flours && r.flours.map((f, i) => (i === 0 ? `${Math.max(0, 100 - (r.flours.slice(1).reduce((a, x) => a + (+x.pct || 0), 0)))}% ${f.name}` : `${f.pct}% ${f.name}`)).join(" · ")}</div>
                       <div className="brc-meta">{r.loafWeight}g · {r.water}% water · {r.levain}% levain</div>
+                      <div className="brc-ai" onClick={(e) => e.stopPropagation()}>
+                        <div className="brc-ai-row">
+                          <label>loaves <input type="number" min="1" value={aiLoaves[r.id] ?? 24} onChange={(e) => setAiLoaves((st) => ({ ...st, [r.id]: Math.max(1, Number(e.target.value) || 1) }))} /></label>
+                          <button className="brc-ai-btn" disabled={aiState[r.id] && aiState[r.id].loading} onClick={() => runAnalysis(r)}>{aiState[r.id] && aiState[r.id].loading ? "Analyzing…" : "✦ Analyze"}</button>
+                        </div>
+                        {aiState[r.id] && aiState[r.id].error && <div className="brc-ai-err">{aiState[r.id].error}</div>}
+                        {aiState[r.id] && aiState[r.id].result && (() => {
+                          const a = aiState[r.id].result;
+                          if (a.raw && !a.expected && !a.optimizations) return <div className="brc-ai-out"><div className="brc-ai-raw">{a.raw}</div></div>;
+                          return (
+                            <div className="brc-ai-out">
+                              {a.summary && <div className="brc-ai-sum">{a.summary}</div>}
+                              {a.expected && a.expected.length > 0 && <div className="brc-ai-sec"><div className="brc-ai-h">Expected</div>{a.expected.map((x, i) => <div className="brc-ai-li" key={i}>{x}</div>)}</div>}
+                              {a.optimizations && a.optimizations.length > 0 && <div className="brc-ai-sec"><div className="brc-ai-h">Optimize</div>{a.optimizations.map((o, i) => <div className="brc-ai-li" key={i}><b>{o.issue}</b> {o.note}</div>)}</div>}
+                            </div>
+                          );
+                        })()}
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -2462,6 +2674,14 @@ export default function App() {
             <div className="bl-rep-stat"><div className="v">{fmtClock(startMin + lastEnd)}</div><div className="l">Shaping done</div></div>
             <div className="bl-rep-stat"><div className="v">{fmtDur(totalActiveMin)}</div><div className="l">Hands-on</div></div>
           </div>
+          <div className="bl-dbuf">
+            <label className="bl-dbuf-tog"><input type="checkbox" checked={doughBuffer} onChange={(e) => setDoughBuffer(e.target.checked)} /><span>Dough buffer — mix extra to cover bowl / bench loss</span></label>
+            {doughBuffer && <span className="bl-dbuf-pct"><input type="number" min="0" max="25" step="0.5" value={doughBufferPct} onChange={(e) => setDoughBufferPct(Math.max(0, Math.min(25, Number(e.target.value) || 0)))} /><em>%</em></span>}
+            {doughBuffer && (() => {
+              const over = plan.list.map((b, i) => (maxBatch > 0 && b.dough > maxBatch) ? ("B" + (i + 1)) : null).filter(Boolean);
+              return over.length > 0 ? <div className="bl-dbuf-warn">Over the {fmtKg(maxBatch)} mixer at this buffer: {over.join(" · ")} — trim the buffer or split the batch.</div> : null;
+            })()}
+          </div>
           <div className="bl-rep-grid">
             <div className="bl-card">
               <div className="ch">Ingredients to have on hand</div>
@@ -2488,6 +2708,18 @@ export default function App() {
                   report.vessels.map((v) => <div className="bl-line" key={v.i}><span className="nm">B{v.i + 1} · {v.name} ({v.size} loaves)</span><span className="v">≥ {v.liters} L</span></div>)}
               </div>
             </div>
+          </div>
+          <div className="bl-card" style={{ marginTop: 16 }}>
+            <div className="ch">Bake notes — saved to the recipe</div>
+            {types.map((t, ti) => (
+              <div className="bl-notes-row" key={ti}>
+                <div className="bl-notes-hd">
+                  <span className="bl-notes-nm">{t.name}</span>
+                  {!(slots[ti] && slots[ti].coreRecipeId) && <span className="bl-notes-warn">this run only — not linked to a core recipe</span>}
+                </div>
+                <BufferedInput className="bl-notes-ta" rows={3} value={t.notes || ""} onCommit={(v) => setRecipeNotes(ti, v)} placeholder="What happened, what to change next time…" />
+              </div>
+            ))}
           </div>
           <div className="bl-note">Vessel size assumes ~{BULK_HEADROOM}× dough volume for bulk expansion plus hand-mixing room, at ~{DOUGH_DENSITY} g/mL dough density — both adjustable. Levain total is what you’ll need to build ahead. Banneton counts assume one per loaf with no reuse across staggered proofs.</div>
         </div>
@@ -2657,6 +2889,27 @@ export default function App() {
             )}
           </div>
           <h3>Batch builds · Autolyse — tap a batch to focus</h3>
+          {baseDoughGroups.length > 0 && (
+            <div className="bl-basedough">
+              <div className="bl-bd-hd"><span className="bl-bd-title">Shared base doughs</span><span className="bl-bd-sub">mix together · split at shaping</span></div>
+              {baseDoughGroups.map((g, gi) => (
+                <div className="bl-bd-group" key={gi}>
+                  <div className="bl-bd-total">{fmtG(g.totalBase)} g base · {g.nBatches} {g.nBatches === 1 ? "mix" : "mixes"}{g.nBatches > 1 ? " (÷ evenly · " + (g.cap / 1000) + " kg cap)" : ""}</div>
+                  <div className="bl-bd-weigh">{g.weighOut.map((w, wi) => <span className="bl-bd-ing" key={wi}>{w.name} <b>{fmtG(w.g)} g</b></span>)}</div>
+                  <div className="bl-bd-split">
+                    {g.members.map((m, mi) => (
+                      <div className="bl-bd-member" key={mi}>
+                        <span className="bl-bd-mname">{m.loaves} × {m.name}</span>
+                        {m.inc.length > 0
+                          ? <span className="bl-bd-inc">+ {m.inc.map((x) => fmtG(x.g) + " g " + x.name).join(" · ")} at shape</span>
+                          : <span className="bl-bd-inc plain">plain</span>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
           {plan.list.length === 0 ? (
             <div className="bl-emptytab">Set loaf counts in Planning to generate batches.</div>
           ) : (<>
@@ -2804,6 +3057,14 @@ export default function App() {
                     </div>
                     {ds.loadCount === 0 ? <div className="bl-sessempty">No loaves for this date.</div> : (<>
                       <div className="bl-preheat">Oven on <b>{fmtClock(bs)}</b> · preheat {bakePlan.preheat} min → first load <b>{fmtClock(bs + ds.firstIn)}</b> · last out <b>{fmtClock(bs + ds.lastOut)}</b> · {fmtDur(ds.lastOut)} running · {ds.loadCount} {ds.loadCount === 1 ? "load" : "loads"} / {ds.totalLoaves} loaves</div>
+                      {ds.items && ds.items.length > 0 && (
+                        <div className="bl-profiles">
+                          <span className="bl-prof-lbl">bake profiles:</span>
+                          {ds.items.map((it, k) => (
+                            <span key={k} className="bl-prof">{it.name} ({it.loaves}) · {showTemp(it.temp)} · {it.bakeMin}m · {it.steamMin}m steam</span>
+                          ))}
+                        </div>
+                      )}
                       <div className="bl-loads">
                         {ds.sched.map((ld, idx) => (
                           <React.Fragment key={idx}>
