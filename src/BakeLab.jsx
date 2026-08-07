@@ -611,6 +611,7 @@ export default function App() {
   const [labelOpen, setLabelOpen] = useState(false);
   const [labelOffX, setLabelOffX] = useState(0); // calibration nudge, mm
   const [labelSkip, setLabelSkip] = useState([]); // positions already peeled off sheet 1
+  const [labelCopies, setLabelCopies] = useState({}); // batch index -> copy count (default 1)
   const [labelOffY, setLabelOffY] = useState(0);
   const [nowMin, setNowMin] = useState(() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); });
   useEffect(() => { const id = setInterval(() => { const d = new Date(); setNowMin(d.getHours() * 60 + d.getMinutes()); }, 20000); return () => clearInterval(id); }, []);
@@ -2001,6 +2002,10 @@ export default function App() {
         .label-stage{display:flex;justify-content:center;padding:24px 12px 48px;zoom:.62;}
         .label-sheets{display:flex;flex-direction:column;gap:22px;}
         .label-sheet{background:#fff;box-shadow:0 6px 30px rgba(0,0,0,.45);}
+        .label-copies{max-width:340px;margin:0 auto 8px;padding:9px 12px;background:rgba(255,255,255,.06);border:1px solid rgba(245,239,227,.16);border-radius:10px;display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;}
+        .lcp-hd{font-family:'DM Sans';font-size:11.5px;color:#b09070;}
+        .lcp-item{display:flex;align-items:center;gap:5px;font-family:'JetBrains Mono';font-size:11px;color:#f5efe3;}
+        .lcp-item input{width:44px;font-family:'JetBrains Mono';font-size:12px;padding:3px 5px;border:1px solid rgba(245,239,227,.3);border-radius:5px;background:rgba(245,239,227,.1);color:#f5efe3;text-align:center;}
         .label-skipmap{max-width:340px;margin:0 auto 4px;padding:10px 12px;background:rgba(255,255,255,.06);border:1px solid rgba(245,239,227,.16);border-radius:10px;}
         .lsm-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:'DM Sans';font-size:11.5px;color:#b09070;margin-bottom:8px;}
         .lsm-reset{font-family:'DM Sans';font-size:11px;font-weight:600;padding:3px 9px;border-radius:6px;border:1px solid rgba(245,239,227,.28);background:transparent;color:#f5efe3;cursor:pointer;white-space:nowrap;}
@@ -2026,7 +2031,7 @@ export default function App() {
           html, body { background:#fff !important; }
           .bl-root { display: none !important; }
           .label-print-overlay { position: static !important; inset:auto !important; background:#fff !important; overflow:visible !important; }
-          .label-print-ui, .label-print-hint, .label-skipmap { display: none !important; }
+          .label-print-ui, .label-print-hint, .label-skipmap, .label-copies { display: none !important; }
           .label-stage { zoom:1 !important; padding:0 !important; display:block !important; }
           .label-sheets { gap:0 !important; display:block !important; }
           .label-sheet { box-shadow:none !important; margin:0 !important; break-after:page; page-break-after:always; }
@@ -3300,6 +3305,8 @@ export default function App() {
         const t = types[b.ti];
         return { n: i + 1, name: t.name, size: b.size, dough: b.dough, totalFlour: b.totalFlour, totalWater: b.totalWater, lines: ingLines(t).filter((l) => l.pct > 0).map((l) => ({ name: l.name, g: b.weights[l.key] })) };
       });
+      const expanded = [];
+      data.forEach((L, i) => { const c = Math.max(1, Math.min(10, Math.floor(+labelCopies[i] || 1))); for (let k = 0; k < c; k++) expanded.push(L); });
       const per = Math.max(1, P.cols * P.rows);
       const skip = labelSkip.filter((p) => p >= 0 && p < per);
       const sheets = [];
@@ -3308,18 +3315,18 @@ export default function App() {
         const cells = [];
         for (let p = 0; p < per; p++) {
           const blocked = sx === 0 && skip.indexOf(p) !== -1;
-          cells.push((!blocked && di < data.length) ? data[di++] : null);
+          cells.push((!blocked && di < expanded.length) ? expanded[di++] : null);
         }
         sheets.push(cells);
         sx++;
-        if (di >= data.length) break;
+        if (di >= expanded.length) break;
       }
       const sheetStyle = { width: P.pageW + "in", height: P.pageH + "in", boxSizing: "border-box", paddingTop: `calc(${P.top}in + ${labelOffY}mm)`, paddingLeft: `calc(${P.left}in + ${labelOffX}mm)` };
       const gridStyle = { display: "grid", gridTemplateColumns: `repeat(${P.cols}, ${P.labelW}in)`, gridAutoRows: `${P.labelH}in`, columnGap: `${P.hGut}in`, rowGap: `${P.vGut}in` };
       return (
         <div className="label-print-overlay">
           <div className="label-print-ui">
-            <div className="lpu-title">Bucket labels<small>Avery 6468 · 2&quot;×4&quot; · {data.length} label{data.length === 1 ? "" : "s"} · {sheets.length} sheet{sheets.length === 1 ? "" : "s"}</small></div>
+            <div className="lpu-title">Bucket labels<small>Avery 6468 · 2&quot;×4&quot; · {expanded.length} label{expanded.length === 1 ? "" : "s"} · {sheets.length} sheet{sheets.length === 1 ? "" : "s"}</small></div>
             <label className="lpu-ctl sm">Nudge&nbsp;→<input type="number" step="0.5" value={labelOffX} onChange={(e) => setLabelOffX(+e.target.value || 0)} /><em>mm</em></label>
             <label className="lpu-ctl sm">Nudge&nbsp;↓<input type="number" step="0.5" value={labelOffY} onChange={(e) => setLabelOffY(+e.target.value || 0)} /><em>mm</em></label>
             <div className="lpu-spacer" />
@@ -3327,6 +3334,16 @@ export default function App() {
             <button className="lpu-close" onClick={() => setLabelOpen(false)} aria-label="Close">×</button>
           </div>
           <div className="label-print-hint">Set the print dialog to <b>100% scale</b> and <b>margins: None</b>. Run one test sheet on plain paper held against a label sheet; if it's off, nudge in mm above.</div>
+          <div className="label-copies">
+            <span className="lcp-hd">Copies</span>
+            {data.map((L, i) => (
+              <label className="lcp-item" key={i}>
+                <span>B{L.n}</span>
+                <input type="number" min="1" max="10" value={labelCopies[i] ?? 1} onChange={(e) => setLabelCopies((st) => ({ ...st, [i]: Math.max(1, Math.min(10, Number(e.target.value) || 1)) }))} />
+              </label>
+            ))}
+            {Object.keys(labelCopies).some((k) => (+labelCopies[k] || 1) > 1) && <button className="lsm-reset" onClick={() => setLabelCopies({})}>×1 all</button>}
+          </div>
           <div className="label-skipmap">
             <div className="lsm-hd">
               <span>Sheet 1 — untick any label already peeled off</span>
