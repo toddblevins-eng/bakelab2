@@ -221,7 +221,7 @@ const normalizeFoodSafety = (fs) => {
     })),
   };
 };
-const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, doughBuffer: false, doughBufferPct: 4, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
+const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
 const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), complete: false, day: day || defaultDay() });
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
@@ -540,6 +540,7 @@ export default function App() {
   const q10 = Math.max(1.05, +starter.q10 || 2);
   const [tempUnit, setTempUnit] = useState("C");
   const [feedMode, setFeedMode] = useState("auto");
+  const [levCombine, setLevCombine] = useState(false);
   const [feedTime, setFeedTime] = useState("21:00");
   const [stagger, setStagger] = useState(45);
   const [offsets, setOffsets] = useState([0, 45, 90, 135]);
@@ -650,6 +651,7 @@ export default function App() {
     setAmbientTemp(typeof d.ambientTemp === "number" ? d.ambientTemp : 21);
     setStarterTemp(typeof d.starterTemp === "number" ? d.starterTemp : 21);
     setFeedMode(d.feedMode === "manual" ? "manual" : "auto");
+    setLevCombine(!!d.levCombine);
     setFeedTime(typeof d.feedTime === "string" ? d.feedTime : "21:00");
     setStagger(typeof d.stagger === "number" ? d.stagger : 45);
     setOffsets(Array.isArray(d.offsets) ? d.offsets : [0, 45, 90, 135]);
@@ -786,7 +788,7 @@ export default function App() {
                 setCoreRecipes(c.library);
                 persist(GLOBALS_KEY, { coreRecipes: c.library, remixes: [], ingredients: [], inocCal: [{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + (typeof c.inocDoubleHrs === "number" ? c.inocDoubleHrs : 1.5) }], tempUnit: c.tempUnit === "F" ? "F" : "C" });
               }
-              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, doughBuffer: false, doughBufferPct: 4, doneBatches: [], foodSafety: defaultFoodSafety() };
+              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, doneBatches: [], foodSafety: defaultFoodSafety() };
               loadedDays = [{ id: uid(), name: "Imported run", date: todayISO(), updatedAt: Date.now(), day }];
             } else {
               loadedDays = [newDayEntry("My first run", defaultDay())];
@@ -806,9 +808,9 @@ export default function App() {
   // autosave the open day's snapshot
   useEffect(() => {
     if (!loaded || view !== "editor" || !currentDayId) return;
-    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, doughBuffer, doughBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs };
+    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs };
     setDays((ds) => { const nd = ds.map((d) => (d.id === currentDayId ? { ...d, name: dayName, date: dayDate, updatedAt: Date.now(), day: snap } : d)); persist(DAYS_KEY, nd); return nd; });
-  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, doughBuffer, doughBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
+  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
 
   const distribute = (s) => { setStagger(s); setOffsets(Array.from({ length: totalBatches }, (_, b) => b * s)); };
 
@@ -876,22 +878,39 @@ export default function App() {
   // ---- levain builds (grouping, timing via water temp) ---------------------
   const levainPlan = useMemo(() => {
     const raw = [];
-    types.forEach((t, ti) => {
-      const batches = plan.list.map((b, gi) => ({ b, gi })).filter((x) => x.b.ti === ti);
-      if (batches.length === 0) return;
-      const withMix = batches.map((x) => {
-        const base = schedule[x.gi] ? schedule[x.gi].base : 0;
-        return { gi: x.gi, mixOff: base + ((types[ti] && types[ti].autolyse != null ? +types[ti].autolyse : +params.autolyse) || 0), levW: x.b.weights["levain"] || 0 };
-      }).sort((a, b) => a.mixOff - b.mixOff);
-      let group = [];
-      const flush = () => { if (group.length) raw.push({ ti, name: t.name, items: group }); group = []; };
-      withMix.forEach((it) => {
-        if (group.length === 0) { group = [it]; return; }
-        if (group.length >= 5 || (it.mixOff - group[0].mixOff) > 90) { flush(); group = [it]; }
-        else group.push(it);
+    if (levCombine) {
+      // one bucket per levain composition, across all recipes and mix times (retard covers early peaks)
+      const sig = {};
+      types.forEach((t, ti) => {
+        const batches = plan.list.map((b, gi) => ({ b, gi })).filter((x) => x.b.ti === ti);
+        if (batches.length === 0) return;
+        const k = [+t.levHyd || 80, +t.levInoc || 10, +t.levRefInoc || 10, +t.levBuildHrs || 5, +t.levRefTemp || 24, +t.levWhole || 0].join("|");
+        if (!sig[k]) sig[k] = { ti, names: [], items: [] };
+        if (sig[k].names.indexOf(t.name) === -1) sig[k].names.push(t.name);
+        batches.forEach((x) => {
+          const base = schedule[x.gi] ? schedule[x.gi].base : 0;
+          sig[k].items.push({ gi: x.gi, mixOff: base + ((t.autolyse != null ? +t.autolyse : +params.autolyse) || 0), levW: x.b.weights["levain"] || 0 });
+        });
       });
-      flush();
-    });
+      Object.values(sig).forEach((g) => { g.items.sort((a, b) => a.mixOff - b.mixOff); raw.push({ ti: g.ti, name: g.names.join(" + "), items: g.items }); });
+    } else {
+      types.forEach((t, ti) => {
+        const batches = plan.list.map((b, gi) => ({ b, gi })).filter((x) => x.b.ti === ti);
+        if (batches.length === 0) return;
+        const withMix = batches.map((x) => {
+          const base = schedule[x.gi] ? schedule[x.gi].base : 0;
+          return { gi: x.gi, mixOff: base + ((types[ti] && types[ti].autolyse != null ? +types[ti].autolyse : +params.autolyse) || 0), levW: x.b.weights["levain"] || 0 };
+        }).sort((a, b) => a.mixOff - b.mixOff);
+        let group = [];
+        const flush = () => { if (group.length) raw.push({ ti, name: t.name, items: group }); group = []; };
+        withMix.forEach((it) => {
+          if (group.length === 0) { group = [it]; return; }
+          if (group.length >= 5 || (it.mixOff - group[0].mixOff) > 90) { flush(); group = [it]; }
+          else group.push(it);
+        });
+        flush();
+      });
+    }
     const builds = raw.map((bd) => {
       const t = types[bd.ti];
       const refTemp = +t.levRefTemp || 24;
@@ -944,7 +963,7 @@ export default function App() {
       return { ...bd, key, retarded, buffered, bufPct, retardHold, retardLate, peakOff, desired, Tlev, M, flourL, waterL, seedL, Twater, holdMin };
     });
     return { feedOff, autoFeed, builds: out };
-  }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard, levBuffer, levBufferPct]);
+  }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard, levBuffer, levBufferPct, levCombine]);
 
   // ---- bake schedule: groups per-recipe sessions by date, one oven sequential ----
   const bakePlan = useMemo(() => {
@@ -1603,6 +1622,8 @@ export default function App() {
         .bl-dbuf-pct input{width:56px;font-family:'JetBrains Mono';font-size:12px;padding:3px 6px;border:1.5px solid var(--line);border-radius:6px;text-align:right;background:#fff;color:var(--ink);}
         .bl-dbuf-pct em{font-size:11px;color:var(--ink2);font-style:normal;}
         .bl-dbuf-warn{flex-basis:100%;font-size:11.5px;color:var(--alert);line-height:1.35;}
+        .bl-levcombine{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink);cursor:pointer;padding:6px 0;}
+        .bl-levcombine input{width:15px;height:15px;accent-color:var(--crust);cursor:pointer;flex:none;}
         .dc-body .dc-bake{font-family:'JetBrains Mono';font-size:11px;color:var(--sand);}
         .dc-body .dc-open{margin-top:4px;font-family:'DM Sans';font-size:13px;font-weight:600;color:var(--crust);}
         .bl-dayhd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;}
@@ -2759,6 +2780,10 @@ export default function App() {
                 <button className={feedMode === "auto" ? "on" : ""} onClick={() => setFeedMode("auto")}>Auto</button>
                 <button className={feedMode === "manual" ? "on" : ""} onClick={() => setFeedMode("manual")}>I'll pick</button>
               </div>
+            </div>
+            <div className="bl-feedmode">
+              <label>Builds</label>
+              <label className="bl-levcombine"><input type="checkbox" checked={levCombine} onChange={(e) => setLevCombine(e.target.checked)} /><span>Combine into one</span></label>
             </div>
             <div className="bl-feedmode">
               <label>Calibration</label>
