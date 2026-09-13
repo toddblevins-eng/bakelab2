@@ -224,7 +224,7 @@ const normalizeFoodSafety = (fs) => {
     })),
   };
 };
-const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, minRetardH: 8, crashTimes: {}, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
+const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, minRetardH: 8, crashTimes: {}, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null, orders: [], ordersActive: false, ovenProfileId: "default" });
 const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), complete: false, day: day || defaultDay() });
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
@@ -519,6 +519,8 @@ export default function App() {
   const [library, setLibrary] = useState(DEFAULT_LIBRARY); // kept for migration compat in globals load only
   const [coreRecipes, setCoreRecipes] = useState(DEFAULT_LIBRARY);
   const [remixes, setRemixes] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [ovenProfiles, setOvenProfiles] = useState([{ id: "default", name: "Rational iCombi Pro", cap: 15, preheatMin: 45, recoverMin: 7, notes: "" }]);
   const [ingredients, setIngredients] = useState([]);
   const [starter, setStarter] = useState(DEFAULT_STARTER);
   const patchStarter = (patch) => setStarter((s) => ({ ...s, ...patch }));
@@ -583,6 +585,10 @@ export default function App() {
   const [doughBufferPct, setDoughBufferPct] = useState(4);
   const [minRetardH, setMinRetardH] = useState(8);
   const [crashTimes, setCrashTimes] = useState({});
+  const [orders, setOrders] = useState([]);
+  const [ordersActive, setOrdersActive] = useState(false);
+  const [ovenProfileId, setOvenProfileId] = useState("default");
+  const [showOvenEditor, setShowOvenEditor] = useState(false);
   const [foodSafety, setFoodSafety] = useState(defaultFoodSafety());
   const addFridge = () => setFoodSafety((fs) => ({ ...fs, fridges: [...fs.fridges, newFridge("Fridge " + (fs.fridges.length + 1))] }));
   const removeFridge = (fi) => setFoodSafety((fs) => ({ ...fs, fridges: fs.fridges.filter((_, i) => i !== fi) }));
@@ -629,7 +635,7 @@ export default function App() {
   };
   const [drag, setDrag] = useState(null);
   const [hover, setHover] = useState(null);
-  const [tab, setTab] = useState("plan");
+  const [tab, setTab] = useState("orders");
   const [navShow, setNavShow] = useState(false);
   const [showCal, setShowCal] = useState(false);
   const [activeBatch, setActiveBatch] = useState(null);
@@ -704,6 +710,9 @@ export default function App() {
     setDoughBufferPct(typeof d.doughBufferPct === "number" ? d.doughBufferPct : 4);
     setMinRetardH(typeof d.minRetardH === "number" ? d.minRetardH : 8);
     setCrashTimes(d.crashTimes && typeof d.crashTimes === "object" ? d.crashTimes : {});
+    setOrders(Array.isArray(d.orders) ? d.orders : []);
+    setOrdersActive(!!d.ordersActive);
+    setOvenProfileId(typeof d.ovenProfileId === "string" ? d.ovenProfileId : "default");
     setDoneBatches(Array.isArray(d.doneBatches) ? d.doneBatches : []);
     setFoodSafety(normalizeFoodSafety(d.foodSafety));
     setMixWaterTemp(typeof d.mixWaterTemp === "number" ? d.mixWaterTemp : null);
@@ -720,7 +729,25 @@ export default function App() {
   const startMin = parseTime(startTime);
 
   // production "types" derived from slots (formula + day quantity)
-  const types = useMemo(() => slots.map((s, i) => ({ ...s.draft, loaves: s.loaves, mixOrder: s.mixOrder ?? i + 1, bakeOrder: s.bakeOrder ?? i + 1 })), [slots]);
+  const orderDerived = useMemo(() => {
+    const byTi = {}; // ti -> { total, sessions: [{date, loaves}], perDateDeliveries: {date -> [{customerId, deliveryTime}]} }
+    slots.forEach((_, ti) => { byTi[ti] = { total: 0, byDate: {} }; });
+    orders.forEach((o) => {
+      Object.entries(o.items || {}).forEach(([ti, qty]) => {
+        const q = +qty || 0; if (q <= 0 || !byTi[ti]) return;
+        byTi[ti].total += q;
+        byTi[ti].byDate[o.date] = (byTi[ti].byDate[o.date] || 0) + q;
+      });
+    });
+    Object.keys(byTi).forEach((ti) => { byTi[ti].sessions = Object.keys(byTi[ti].byDate).sort().map((date) => ({ id: date, date, loaves: byTi[ti].byDate[date] })); });
+    return byTi;
+  }, [orders, slots]);
+  const types = useMemo(() => slots.map((s, i) => {
+    const od = ordersActive ? orderDerived[i] : null;
+    return { ...s.draft, loaves: od ? od.total : s.loaves, mixOrder: s.mixOrder ?? i + 1, bakeOrder: s.bakeOrder ?? i + 1 };
+  }), [slots, ordersActive, orderDerived]);
+  const effSessions = (ti) => (ordersActive && orderDerived[ti]) ? orderDerived[ti].sessions : (slots[ti] ? slots[ti].sessions : []);
+  const currentOvenProfile = ovenProfiles.find((p) => p.id === ovenProfileId) || ovenProfiles[0];
 
   // ---- batch planner -------------------------------------------------------
   const plan = useMemo(() => {
@@ -807,6 +834,8 @@ export default function App() {
             if (Array.isArray(gc.coreRecipes) && gc.coreRecipes.every((x) => Array.isArray(x.flours))) setCoreRecipes(gc.coreRecipes);
             else if (Array.isArray(gc.library) && gc.library.every((x) => Array.isArray(x.flours))) setCoreRecipes(gc.library); // migrate
             if (Array.isArray(gc.remixes)) setRemixes(gc.remixes);
+            if (Array.isArray(gc.customers)) setCustomers(gc.customers);
+            if (Array.isArray(gc.ovenProfiles) && gc.ovenProfiles.length) setOvenProfiles(gc.ovenProfiles);
             if (Array.isArray(gc.ingredients)) setIngredients(gc.ingredients.map((i) => ({ ...i, kind: i.kind === "inclusion" ? "inclusion" : "flour" })));
             if (gc.starter && typeof gc.starter === "object") setStarter({ ...DEFAULT_STARTER, ...gc.starter });
             if (Array.isArray(gc.inocCal) && gc.inocCal.length === 2) setInocCal(gc.inocCal);
@@ -826,7 +855,7 @@ export default function App() {
                 setCoreRecipes(c.library);
                 persist(GLOBALS_KEY, { coreRecipes: c.library, remixes: [], ingredients: [], inocCal: [{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + (typeof c.inocDoubleHrs === "number" ? c.inocDoubleHrs : 1.5) }], tempUnit: c.tempUnit === "F" ? "F" : "C" });
               }
-              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, minRetardH: 8, crashTimes: {}, doneBatches: [], foodSafety: defaultFoodSafety() };
+              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, minRetardH: 8, crashTimes: {}, doneBatches: [], foodSafety: defaultFoodSafety(), orders: [], ordersActive: false, ovenProfileId: "default" };
               loadedDays = [{ id: uid(), name: "Imported run", date: todayISO(), updatedAt: Date.now(), day }];
             } else {
               loadedDays = [newDayEntry("My first run", defaultDay())];
@@ -842,13 +871,13 @@ export default function App() {
     })();
   }, []);
   // persist shared globals
-  useEffect(() => { if (!loaded) return; persist(GLOBALS_KEY, { coreRecipes, remixes, ingredients, starter, inocCal, tempUnit }); }, [coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, loaded]);
+  useEffect(() => { if (!loaded) return; persist(GLOBALS_KEY, { coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, customers, ovenProfiles }); }, [coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, customers, ovenProfiles, loaded]);
   // autosave the open day's snapshot
   useEffect(() => {
     if (!loaded || view !== "editor" || !currentDayId) return;
-    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, minRetardH, crashTimes, doneBatches, foodSafety, mixWaterTemp, calcInputs };
+    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, minRetardH, crashTimes, doneBatches, foodSafety, mixWaterTemp, calcInputs, orders, ordersActive, ovenProfileId };
     setDays((ds) => { const nd = ds.map((d) => (d.id === currentDayId ? { ...d, name: dayName, date: dayDate, updatedAt: Date.now(), day: snap } : d)); persist(DAYS_KEY, nd); return nd; });
-  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, minRetardH, crashTimes, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
+  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, minRetardH, crashTimes, doneBatches, foodSafety, mixWaterTemp, calcInputs, orders, ordersActive, ovenProfileId, dayName, dayDate, currentDayId, view, loaded]);
 
   const distribute = (s) => { setStagger(s); setOffsets(Array.from({ length: totalBatches }, (_, b) => b * s)); };
 
@@ -1029,22 +1058,35 @@ export default function App() {
 
   // ---- bake schedule: groups per-recipe sessions by date, one oven sequential ----
   const bakePlan = useMemo(() => {
-    const cap = Math.max(1, Math.floor(+params.ovenCap || 1));
-    const preheat = Math.max(0, +params.preheatMin || 0);
-    const recover = Math.max(0, +params.recoverMin || 0);
-    // collect per-date recipe entries
+    const prof = currentOvenProfile || { cap: 15, preheatMin: 45, recoverMin: 7 };
+    const cap = Math.max(1, Math.floor(+prof.cap || 1));
+    const preheat = Math.max(0, +prof.preheatMin || 0);
+    const recover = Math.max(0, +prof.recoverMin || 0);
+    const COOL_MIN = 45; // min minutes between last load out and the day's first delivery
+    // per-date customer deliveries (earliest per date) — drives bake priority + day start time
+    const deliveriesByDate = {};
+    if (ordersActive) orders.forEach((o) => { if (!o.customerId || !o.deliveryTime) return; if (!deliveriesByDate[o.date]) deliveriesByDate[o.date] = []; deliveriesByDate[o.date].push({ customerId: o.customerId, time: parseTime(o.deliveryTime) }); });
+    // collect per-date recipe entries, tagged with the earliest delivery deadline that needs them (orders mode only)
     const dateMap = {};
     slots.forEach((slot, ti) => {
       const t = types[ti];
-      (slot.sessions || []).forEach((sess, si) => {
-        const loaves = sessionLoaves(slot, si);
+      const sessions = ordersActive ? effSessions(ti) : (slot.sessions || []);
+      sessions.forEach((sess, si) => {
+        const loaves = ordersActive ? (sess.loaves || 0) : sessionLoaves(slot, si);
         if (loaves <= 0) return;
         const date = sess.date || todayISO();
         if (!dateMap[date]) dateMap[date] = [];
-        dateMap[date].push({ ti, name: t.name, loaves, bakeOrder: t.bakeOrder || ti + 1, bakeMin: Math.max(1, +t.bakeMin || 45), steamMin: Math.min(Math.max(1, +t.bakeMin || 45), Math.max(0, +t.steamMin || 0)), temp: +t.bakeTemp || 245 });
+        // earliest delivery time among customers who ordered this recipe on this date; null = no deadline (extras / non-order mode)
+        let deadline = null;
+        if (ordersActive) {
+          orders.filter((o) => o.date === date && o.customerId && (o.items || {})[ti] > 0 && o.deliveryTime).forEach((o) => { const m = parseTime(o.deliveryTime); if (deadline === null || m < deadline) deadline = m; });
+        }
+        dateMap[date].push({ ti, name: t.name, loaves, bakeOrder: t.bakeOrder || ti + 1, bakeMin: Math.max(1, +t.bakeMin || 45), steamMin: Math.min(Math.max(1, +t.bakeMin || 45), Math.max(0, +t.steamMin || 0)), temp: +t.bakeTemp || 245, deadline });
       });
     });
     const scheduleDate = (date, items) => {
+      const dayDeliveries = deliveriesByDate[date] || [];
+      const earliestDelivery = dayDeliveries.length ? Math.min(...dayDeliveries.map((d) => d.time)) : null;
       items.sort((a, b) => (a.bakeOrder - b.bakeOrder) || (a.ti - b.ti));
       // pool loaves that bake identically (temp / time / steam), then pack into loads up to capacity
       const groups = {};
@@ -1056,23 +1098,33 @@ export default function App() {
       });
       const loads = [];
       Object.values(groups).sort((a, b) => a.order - b.order).forEach((g) => {
-        const queue = g.items.map((it) => ({ ti: it.ti, name: it.name, left: it.loaves })).filter((q) => q.left > 0);
+        // earliest-deadline items fill this group's earliest loads first (deadline null = no rush, packed last)
+        const sortedItems = [...g.items].sort((a, b) => (a.deadline === null ? Infinity : a.deadline) - (b.deadline === null ? Infinity : b.deadline));
+        const queue = sortedItems.map((it) => ({ ti: it.ti, name: it.name, left: it.loaves, deadline: it.deadline })).filter((q) => q.left > 0);
         let qi = 0;
         while (qi < queue.length) {
-          const parts = []; let room = cap;
+          const parts = []; let room = cap; let minDeadline = null;
           while (room > 0 && qi < queue.length) {
             const q = queue[qi]; const take = Math.min(room, q.left);
             parts.push({ ti: q.ti, name: q.name, n: take }); q.left -= take; room -= take;
+            if (q.deadline !== null && (minDeadline === null || q.deadline < minDeadline)) minDeadline = q.deadline;
             if (q.left === 0) qi++;
           }
           const label = parts.length === 1 ? parts[0].name : parts.map((p) => p.n + " " + p.name).join(" · ");
-          loads.push({ parts, label, n: parts.reduce((a, p) => a + p.n, 0), bakeMin: g.bakeMin, steamMin: g.steamMin, temp: g.temp });
+          loads.push({ parts, label, n: parts.reduce((a, p) => a + p.n, 0), bakeMin: g.bakeMin, steamMin: g.steamMin, temp: g.temp, minDeadline });
         }
       });
+      // globally sequence ALL of this date's loads by earliest-served delivery first (max cooling cushion
+      // for the most time-critical bread); loads with no deadline (extras / non-order mode) go last.
+      if (ordersActive) loads.sort((a, b) => (a.minDeadline === null ? Infinity : a.minDeadline) - (b.minDeadline === null ? Infinity : b.minDeadline));
       let cur = preheat;
       const sched = loads.map((ld, i) => { const startOff = cur, ventOff = cur + ld.steamMin, endOff = cur + ld.bakeMin; cur = endOff + recover; return { ...ld, i, startOff, ventOff, endOff }; });
       const lastOut = sched.length ? sched[sched.length - 1].endOff : preheat;
-      return { date, items, sched, firstIn: preheat, lastOut, totalLoaves: loads.reduce((a, l) => a + l.n, 0), loadCount: sched.length };
+      const seqDuration = lastOut; // preheat -> last load out, on the "oven-on = 0" axis
+      // interpretation: ALL baking for the day finishes at least COOL_MIN before the day's EARLIEST delivery.
+      // ovenOnAbs = earliestDelivery − COOL_MIN − seqDuration (minutes-of-day, may be negative = previous day)
+      const computedOvenOnAbs = earliestDelivery !== null ? earliestDelivery - COOL_MIN - seqDuration : null;
+      return { date, items, sched, firstIn: preheat, lastOut, totalLoaves: loads.reduce((a, l) => a + l.n, 0), loadCount: sched.length, earliestDelivery, seqDuration, computedOvenOnAbs, deliveries: dayDeliveries };
     };
     const dateSchedules = Object.entries(dateMap).sort(([a], [b]) => a.localeCompare(b)).map(([date, items]) => scheduleDate(date, items));
     const pool = types.map((t, ti) => {
@@ -1081,7 +1133,7 @@ export default function App() {
       return { ti, name: t.name, shaped, allocated, remaining: shaped - allocated };
     }).filter((p) => p.shaped > 0 || p.allocated > 0);
     return { cap, preheat, recover, dateSchedules, pool };
-  }, [types, plan, slots, params.ovenCap, params.preheatMin, params.recoverMin]);
+  }, [types, plan, slots, orders, ordersActive, currentOvenProfile]);
 
   // temperature unit display/input conversion (math stays in Celsius)
   const cToU = (c) => (tempUnit === "F" ? c * 9 / 5 + 32 : c);
@@ -1209,6 +1261,31 @@ export default function App() {
     if (ph === "bulk") { if (drift !== 0) setOffsets((o) => o.map((x, i) => (i === bi ? x + drift : x))); }
     else if (ph === "bench") { try { const mid = new Date((dayDate || todayISO()) + "T00:00:00").getTime(); const m = Math.round((endTs - mid) / 60000); if (isFinite(m)) setCrashTimes((c) => ({ ...c, [bi]: m })); } catch (e) {} }
   };
+  const orderKey = (date, cid) => date + "|" + (cid || "extras");
+  const getOrder = (date, cid) => orders.find((o) => o.date === date && o.customerId === (cid || null));
+  const setOrderQty = (date, cid, ti, qty) => setOrders((os) => {
+    const idx = os.findIndex((o) => o.date === date && o.customerId === (cid || null));
+    const q = Math.max(0, Math.floor(+qty || 0));
+    if (idx === -1) { if (q <= 0) return os; return [...os, { id: uid(), date, customerId: cid || null, items: { [ti]: q }, deliveryTime: cid ? "08:00" : "" }]; }
+    const items = { ...os[idx].items, [ti]: q };
+    if (q === 0) delete items[ti];
+    const next = [...os]; next[idx] = { ...next[idx], items };
+    return next.filter((o) => o === next[idx] ? Object.keys(items).length > 0 || true : true); // keep row even if 0 items (delivery time may still be set)
+  });
+  const setOrderDelivery = (date, cid, time) => setOrders((os) => {
+    const idx = os.findIndex((o) => o.date === date && o.customerId === (cid || null));
+    if (idx === -1) return [...os, { id: uid(), date, customerId: cid || null, items: {}, deliveryTime: time }];
+    const next = [...os]; next[idx] = { ...next[idx], deliveryTime: time };
+    return next;
+  });
+  const removeOrderRow = (date, cid) => setOrders((os) => os.filter((o) => !(o.date === date && o.customerId === (cid || null))));
+  const orderDates = useMemo(() => Array.from(new Set(orders.map((o) => o.date))).sort(), [orders]);
+  const addCustomer = (name) => { const c = { id: uid(), name: name || "New customer", notes: "" }; setCustomers((cs) => [...cs, c]); return c.id; };
+  const patchCustomer = (id, patch) => setCustomers((cs) => cs.map((c) => c.id === id ? { ...c, ...patch } : c));
+  const removeCustomer = (id) => setCustomers((cs) => cs.filter((c) => c.id !== id));
+  const addOvenProfile = () => { const p = { id: uid(), name: "New oven", cap: 15, preheatMin: 45, recoverMin: 7, notes: "" }; setOvenProfiles((ps) => [...ps, p]); return p.id; };
+  const patchOvenProfile = (id, patch) => setOvenProfiles((ps) => ps.map((p) => p.id === id ? { ...p, ...patch } : p));
+  const removeOvenProfile = (id) => setOvenProfiles((ps) => ps.length > 1 ? ps.filter((p) => p.id !== id) : ps);
   const setRecipeNotes = (ti, v) => {
     patchDraft(ti, (d) => ({ ...d, notes: v }));
     const cid = slots[ti] && slots[ti].coreRecipeId;
@@ -1717,6 +1794,41 @@ export default function App() {
         .bl-retard-warn{margin-top:7px;font-size:12px;color:var(--alert);line-height:1.35;}
         .bl-retard-note{margin-top:6px;font-size:10.5px;color:var(--ink2);}
         .bl-retard-empty{font-size:12px;color:var(--ink2);}
+        .bl-orders-toggle label{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:600;color:var(--ink);cursor:pointer;}
+        .bl-orders-toggle input{width:16px;height:16px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .bl-cust-list{display:flex;flex-direction:column;gap:6px;margin-bottom:10px;}
+        .bl-cust-row{display:flex;align-items:center;gap:8px;}
+        .bl-cust-name{flex:1;font-family:'DM Sans';font-size:13px;padding:6px 10px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);}
+        .bl-orderdate-chips{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-bottom:14px;}
+        .bl-orderdate-chip{font-family:'JetBrains Mono';font-size:11.5px;padding:3px 9px;border-radius:20px;background:var(--paper);border:1px solid var(--line);color:var(--ink2);}
+        .bl-orderdate-add{font-family:'DM Sans';font-size:12.5px;padding:5px 9px;border:1.5px solid var(--crust);border-radius:7px;background:#fff;color:var(--crust2);}
+        .bl-orderdate-block{padding:14px 0;border-top:1px solid var(--line);}
+        .bl-orderdate-block:first-of-type{border-top:none;padding-top:0;}
+        .bl-orderdate-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;}
+        .od-date{font-family:'Fraunces';font-weight:600;font-size:14px;color:var(--crust2);}
+        .bl-order-grid{display:grid;gap:6px 8px;align-items:center;overflow-x:auto;}
+        .og-hd{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink2);padding-bottom:4px;border-bottom:1px solid var(--line);}
+        .og-recipe{text-align:center;}
+        .og-cell{min-width:0;}
+        .og-nm{font-size:12.5px;font-weight:600;color:var(--ink);}
+        .og-extras{color:var(--ink2);font-weight:400;font-style:italic;}
+        .og-extras span{font-size:10.5px;}
+        .og-cell input[type=number]{width:56px;font-family:'JetBrains Mono';font-size:12.5px;padding:4px 6px;border:1.5px solid var(--line);border-radius:6px;text-align:center;background:#fff;color:var(--ink);}
+        .og-cell input[type=time]{font-family:'JetBrains Mono';font-size:12px;padding:4px 6px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);width:100%;}
+        .og-cell select{font-family:'DM Sans';font-size:12px;padding:4px 6px;border:1.5px solid var(--crust);border-radius:6px;background:#fff;color:var(--crust2);}
+        .bl-sess-fromorders.empty{font-size:12px;color:var(--ink2);font-style:italic;}
+        .bl-sess-row.from-orders{background:var(--paper);}
+        .ss-badge{font-size:9.5px;text-transform:uppercase;letter-spacing:.03em;color:var(--crust2);background:#fff6e3;border:1px solid #e9c47e;border-radius:10px;padding:2px 7px;margin-left:auto;}
+        .bl-ovenprof{display:flex;align-items:center;gap:9px;margin-bottom:10px;flex-wrap:wrap;}
+        .bl-ovenprof label{font-size:12px;color:var(--ink2);}
+        .bl-ovenprof select{font-family:'DM Sans';font-size:13px;padding:6px 9px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);}
+        .bl-ovenprof-editor{margin:0 0 14px;padding:10px 12px;background:var(--paper);border:1px solid var(--line);border-radius:9px;display:flex;flex-direction:column;gap:8px;}
+        .bl-ovenprof-row{display:flex;flex-wrap:wrap;align-items:center;gap:9px;}
+        .bl-ovenprof-name{font-family:'DM Sans';font-size:13px;padding:5px 9px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);flex:1 1 140px;min-width:120px;}
+        .bl-ovenprof-row label{display:flex;align-items:center;gap:4px;font-size:11px;color:var(--ink2);}
+        .bl-ovenprof-row input{width:52px;font-family:'JetBrains Mono';font-size:12px;padding:3px 6px;border:1.5px solid var(--line);border-radius:6px;text-align:right;background:#fff;color:var(--ink);}
+        .ss-revert{font-family:'DM Sans';font-size:10.5px;font-weight:600;padding:3px 8px;border-radius:6px;border:1px solid var(--crust);background:#fff;color:var(--crust2);cursor:pointer;white-space:nowrap;}
+        .bl-oven-warn{margin:0 0 9px;font-size:12px;color:var(--alert);line-height:1.35;}
         .dc-body .dc-bake{font-family:'JetBrains Mono';font-size:11px;color:var(--sand);}
         .dc-body .dc-open{margin-top:4px;font-family:'DM Sans';font-size:13px;font-weight:600;color:var(--crust);}
         .bl-dayhd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;}
@@ -2552,17 +2664,93 @@ export default function App() {
       </div>
 
       <div className={"bl-tabs" + (navHidden ? " navhidden" : "")} ref={tabsRef}>
-        <button className={"bl-tab" + (tab === "plan" ? " on" : "")} onClick={() => goTab("plan")}><span className="num">1</span><span className="tlabel">Plan</span><span className="tshort">Plan</span></button>
-        <button className={"bl-tab" + (tab === "prep" ? " on" : "")} onClick={() => goTab("prep")}><span className="num">2</span><span className="tlabel">Prep &amp; Shop</span><span className="tshort">Prep</span></button>
-        <button className={"bl-tab" + (tab === "levain" ? " on" : "")} onClick={() => goTab("levain")}><span className="num">3</span><span className="tlabel">Levain</span><span className="tshort">Levain</span></button>
-        <button className={"bl-tab" + (tab === "safety" ? " on" : "")} onClick={() => goTab("safety")}><span className="num">4</span><span className="tlabel">Food Safety</span><span className="tshort">Safety</span></button>
-        <button className={"bl-tab" + (tab === "build" ? " on" : "")} onClick={() => goTab("build")}><span className="num">5</span><span className="tlabel">Mix</span><span className="tshort">Mix</span></button>
-        <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => goTab("fold")}><span className="num">6</span><span className="tlabel">Bulk/Shape</span><span className="tshort">Bulk/Shape</span></button>
-        <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => goTab("bake")}><span className="num">7</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
-        <button className={"bl-tab" + (tab === "timers" ? " on" : "")} onClick={() => goTab("timers")}><span className="num">8</span><span className="tlabel">Timers</span><span className="tshort">Timers</span></button>
+        <button className={"bl-tab" + (tab === "orders" ? " on" : "")} onClick={() => goTab("orders")}><span className="num">1</span><span className="tlabel">Orders</span><span className="tshort">Orders</span></button>
+        <button className={"bl-tab" + (tab === "plan" ? " on" : "")} onClick={() => goTab("plan")}><span className="num">2</span><span className="tlabel">Plan</span><span className="tshort">Plan</span></button>
+        <button className={"bl-tab" + (tab === "prep" ? " on" : "")} onClick={() => goTab("prep")}><span className="num">3</span><span className="tlabel">Prep &amp; Shop</span><span className="tshort">Prep</span></button>
+        <button className={"bl-tab" + (tab === "levain" ? " on" : "")} onClick={() => goTab("levain")}><span className="num">4</span><span className="tlabel">Levain</span><span className="tshort">Levain</span></button>
+        <button className={"bl-tab" + (tab === "safety" ? " on" : "")} onClick={() => goTab("safety")}><span className="num">5</span><span className="tlabel">Food Safety</span><span className="tshort">Safety</span></button>
+        <button className={"bl-tab" + (tab === "build" ? " on" : "")} onClick={() => goTab("build")}><span className="num">6</span><span className="tlabel">Mix</span><span className="tshort">Mix</span></button>
+        <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => goTab("fold")}><span className="num">7</span><span className="tlabel">Bulk/Shape</span><span className="tshort">Bulk/Shape</span></button>
+        <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => goTab("bake")}><span className="num">8</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
+        <button className={"bl-tab" + (tab === "timers" ? " on" : "")} onClick={() => goTab("timers")}><span className="num">9</span><span className="tlabel">Timers</span><span className="tshort">Timers</span></button>
       </div>
 
       {/* ---------- TAB 1: PLANNING ---------- */}
+      {tab === "orders" && (<>
+        <div className="bl-panel">
+          <div className="bl-orders-toggle">
+            <label><input type="checkbox" checked={ordersActive} onChange={(e) => setOrdersActive(e.target.checked)} /><span>Orders drive production — loaf counts and bake dates below feed Plan automatically</span></label>
+          </div>
+          <div className="bl-note" style={{marginTop:0}}>Off: this run works exactly like before — set loaves and bake sessions by hand on Plan (test bakes, one-offs). On: every number below flows straight into Plan, Mix, Levain, Prep, and Bake — edit an order and the whole run recalculates.</div>
+        </div>
+
+        <div className="bl-panel">
+          <div className="ch" style={{margin:"-18px -18px 14px", borderRadius:"11px 11px 0 0"}}>Customers</div>
+          <div className="bl-cust-list">
+            {customers.map((c) => (
+              <div className="bl-cust-row" key={c.id}>
+                <BufferedInput className="bl-cust-name" value={c.name} onCommit={(v) => patchCustomer(c.id, { name: v })} placeholder="Customer name" />
+                <button className="ing-x" onClick={() => removeCustomer(c.id)}>×</button>
+              </div>
+            ))}
+          </div>
+          <button className="bl-add" onClick={() => addCustomer("New customer")}>+ Customer</button>
+        </div>
+
+        <div className="bl-panel">
+          <div className="ch" style={{margin:"-18px -18px 14px", borderRadius:"11px 11px 0 0"}}>Bake dates &amp; order counts</div>
+          <div className="bl-orderdate-chips">
+            {orderDates.map((d) => <span key={d} className="bl-orderdate-chip">{d}</span>)}
+            <input type="date" className="bl-orderdate-add" onChange={(e) => { const d = e.target.value; if (d) { setOrders((os) => os.some((o) => o.date === d) ? os : [...os, { id: uid(), date: d, customerId: null, items: {}, deliveryTime: "" }]); } e.target.value = ""; }} />
+          </div>
+          {orderDates.length === 0 && <div className="bl-timer-empty">Pick a date above to start entering orders.</div>}
+          {orderDates.map((date) => {
+            const rowsForDate = orders.filter((o) => o.date === date);
+            const customerRows = rowsForDate.filter((o) => o.customerId);
+            const extrasRow = rowsForDate.find((o) => !o.customerId);
+            const usedIds = customerRows.map((o) => o.customerId);
+            return (
+              <div className="bl-orderdate-block" key={date}>
+                <div className="bl-orderdate-hd">
+                  <span className="od-date">{date}</span>
+                  <button className="ing-x" title="Remove this date's orders" onClick={() => setOrders((os) => os.filter((o) => o.date !== date))}>×</button>
+                </div>
+                <div className="bl-order-grid" style={{ gridTemplateColumns: "1fr 90px " + types.map(() => "70px").join(" ") + " 30px" }}>
+                  <div className="og-hd">Customer</div><div className="og-hd">Delivery</div>
+                  {types.map((t, ti) => <div className="og-hd og-recipe" key={ti}>{t.name}</div>)}
+                  <div />
+                  {customerRows.map((o) => {
+                    const cust = customers.find((c) => c.id === o.customerId);
+                    return (
+                      <React.Fragment key={o.id}>
+                        <div className="og-cell og-nm">{cust ? cust.name : "(deleted customer)"}</div>
+                        <div className="og-cell"><input type="time" value={o.deliveryTime || ""} onChange={(e) => setOrderDelivery(date, o.customerId, e.target.value)} /></div>
+                        {types.map((t, ti) => <div className="og-cell" key={ti}><input type="number" min="0" value={(o.items || {})[ti] || 0} onChange={(e) => setOrderQty(date, o.customerId, ti, e.target.value)} /></div>)}
+                        <button className="ing-x" onClick={() => removeOrderRow(date, o.customerId)}>×</button>
+                      </React.Fragment>
+                    );
+                  })}
+                  <div className="og-cell og-nm">
+                    <select value="" onChange={(e) => { if (e.target.value) setOrderDelivery(date, e.target.value, "08:00"); }}>
+                      <option value="">+ Add customer…</option>
+                      {customers.filter((c) => usedIds.indexOf(c.id) === -1).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                    </select>
+                  </div>
+                  <div className="og-cell" />
+                  {types.map((_, ti) => <div className="og-cell" key={ti} />)}
+                  <div />
+                  <div className="og-cell og-nm og-extras">Extras <span>(no delivery)</span></div>
+                  <div className="og-cell" />
+                  {types.map((t, ti) => <div className="og-cell" key={ti}><input type="number" min="0" value={extrasRow ? (extrasRow.items || {})[ti] || 0 : 0} onChange={(e) => setOrderQty(date, null, ti, e.target.value)} /></div>)}
+                  <div />
+                </div>
+              </div>
+            );
+          })}
+          {types.length === 0 && <div className="bl-timer-empty">Add recipes on the Plan tab first — they become the columns here.</div>}
+        </div>
+      </>)}
+
       {tab === "plan" && (<>
       <div className="bl-panel">
         <h3>Run timing</h3>
@@ -2607,7 +2795,7 @@ export default function App() {
                   );
                 })()}
                 <div className="bl-rec-top">
-                  <div><label>Loaves</label><input className="n" type="number" min="0" value={t.loaves} onChange={(e) => setLoaves(ti, e.target.value)} /></div>
+                  <div><label>Loaves{ordersActive ? " (from orders)" : ""}</label>{ordersActive ? <span className="n ss-lv-auto" style={{display:"inline-block"}}>{t.loaves}</span> : <input className="n" type="number" min="0" value={t.loaves} onChange={(e) => setLoaves(ti, e.target.value)} />}</div>
                   <div><label>Loaf g</label><input className="n" type="number" min="0" value={t.loafWeight} onChange={(e) => setDraft(ti, { loafWeight: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div><label>Autolyse min</label><input className="n" type="number" min="0" value={t.autolyse ?? 45} onChange={(e) => setDraft(ti, { autolyse: Math.max(0, Number(e.target.value) || 0) })} /></div>
                 </div>
@@ -2619,28 +2807,40 @@ export default function App() {
                   return (
                     <div className="bl-optimize">
                       <div className="opt-stat"><span>⚡ {mx}/mix</span><span>{bc} mix{bc > 1 ? "es" : ""} · {fillPct}% full{maxed ? " ✓" : ""}</span></div>
-                      {!maxed && <button className="opt-chip up" onClick={() => setLoaves(ti, full)}>↑ {full} fills {bc} mix{bc > 1 ? "es" : ""} <em>+{full - N}</em></button>}
-                      {bc >= 2 && <button className="opt-chip down" onClick={() => setLoaves(ti, trimTo)}>↓ {trimTo} drops a mix <em>−{N - trimTo}</em></button>}
+                      {!ordersActive && !maxed && <button className="opt-chip up" onClick={() => setLoaves(ti, full)}>↑ {full} fills {bc} mix{bc > 1 ? "es" : ""} <em>+{full - N}</em></button>}
+                      {!ordersActive && bc >= 2 && <button className="opt-chip down" onClick={() => setLoaves(ti, trimTo)}>↓ {trimTo} drops a mix <em>−{N - trimTo}</em></button>}
                     </div>
                   );
                 })()}
                 <div className="bl-rec-sessions">
-                  {(slots[ti].sessions || []).map((sess, si) => {
-                    const lv = sessionLoaves(slots[ti], si);
-                    const isMain = si === 0;
-                    const over = (slots[ti].sessions || []).slice(1).reduce((a, s) => a + Math.max(0, +(s.loaves) || 0), 0) > t.loaves;
-                    return (
-                      <div className={"bl-sess-row" + (isMain && over ? " over" : "")} key={sess.id}>
-                        <span className="ss-no">Bake {si + 1}{isMain ? " ←" : ""}</span>
-                        <input type="date" value={sess.date || todayISO()} onChange={(e) => setSlotSessionDate(ti, si, e.target.value)} />
-                        {isMain
-                          ? <span className="ss-lv-auto">{lv} loaves</span>
-                          : <><input className="n ss-lv" type="number" min="0" value={sess.loaves || 0} onChange={(e) => setSlotSessionLoaves(ti, si, e.target.value)} /><span className="ss-lvu">loaves</span><button className="ing-x" onClick={() => removeSlotSession(ti, si)}>×</button></>
-                        }
-                      </div>
-                    );
-                  })}
-                  <button className="bl-addrow" onClick={() => addSlotSession(ti)}>+ Bake session</button>
+                  {ordersActive ? (
+                    <>
+                      {effSessions(ti).length === 0 ? <div className="bl-sess-fromorders empty">No orders yet for this recipe — add them on the Orders tab.</div> : effSessions(ti).map((sess) => (
+                        <div className="bl-sess-row from-orders" key={sess.date}>
+                          <span className="ss-no">{sess.date}</span>
+                          <span className="ss-lv-auto">{sess.loaves} loaves</span>
+                          <span className="ss-badge">from orders</span>
+                        </div>
+                      ))}
+                    </>
+                  ) : (<>
+                    {(slots[ti].sessions || []).map((sess, si) => {
+                      const lv = sessionLoaves(slots[ti], si);
+                      const isMain = si === 0;
+                      const over = (slots[ti].sessions || []).slice(1).reduce((a, s) => a + Math.max(0, +(s.loaves) || 0), 0) > t.loaves;
+                      return (
+                        <div className={"bl-sess-row" + (isMain && over ? " over" : "")} key={sess.id}>
+                          <span className="ss-no">Bake {si + 1}{isMain ? " ←" : ""}</span>
+                          <input type="date" value={sess.date || todayISO()} onChange={(e) => setSlotSessionDate(ti, si, e.target.value)} />
+                          {isMain
+                            ? <span className="ss-lv-auto">{lv} loaves</span>
+                            : <><input className="n ss-lv" type="number" min="0" value={sess.loaves || 0} onChange={(e) => setSlotSessionLoaves(ti, si, e.target.value)} /><span className="ss-lvu">loaves</span><button className="ing-x" onClick={() => removeSlotSession(ti, si)}>×</button></>
+                          }
+                        </div>
+                      );
+                    })}
+                    <button className="bl-addrow" onClick={() => addSlotSession(ti)}>+ Bake session</button>
+                  </>)}
                 </div>
                 {types.length > 1 && (
                   <div className="bl-orders">
@@ -2818,6 +3018,27 @@ export default function App() {
             <div className="bl-rep-stat"><div className="v">{fmtClock(startMin + lastEnd)}</div><div className="l">Shaping done</div></div>
             <div className="bl-rep-stat"><div className="v">{fmtDur(totalActiveMin)}</div><div className="l">Hands-on</div></div>
           </div>
+          <div className="bl-ovenprof">
+            <label>Oven</label>
+            <select value={ovenProfileId} onChange={(e) => setOvenProfileId(e.target.value)}>
+              {ovenProfiles.map((p) => <option key={p.id} value={p.id}>{p.name} — {p.cap}/load</option>)}
+            </select>
+            <button className="bl-add" onClick={() => setShowOvenEditor((v) => !v)}>{showOvenEditor ? "Done" : "Edit ovens"}</button>
+          </div>
+          {showOvenEditor && (
+            <div className="bl-ovenprof-editor">
+              {ovenProfiles.map((p) => (
+                <div className="bl-ovenprof-row" key={p.id}>
+                  <BufferedInput className="bl-ovenprof-name" value={p.name} onCommit={(v) => patchOvenProfile(p.id, { name: v })} placeholder="Oven name" />
+                  <label>cap <input type="number" min="1" value={p.cap} onChange={(e) => patchOvenProfile(p.id, { cap: Math.max(1, Number(e.target.value) || 1) })} /></label>
+                  <label>preheat <input type="number" min="0" value={p.preheatMin} onChange={(e) => patchOvenProfile(p.id, { preheatMin: Math.max(0, Number(e.target.value) || 0) })} /> min</label>
+                  <label>recover <input type="number" min="0" value={p.recoverMin} onChange={(e) => patchOvenProfile(p.id, { recoverMin: Math.max(0, Number(e.target.value) || 0) })} /> min</label>
+                  {ovenProfiles.length > 1 && <button className="ing-x" onClick={() => removeOvenProfile(p.id)}>×</button>}
+                </div>
+              ))}
+              <button className="bl-add" onClick={addOvenProfile}>+ Oven</button>
+            </div>
+          )}
           <div className="bl-dbuf">
             <label className="bl-dbuf-tog"><input type="checkbox" checked={doughBuffer} onChange={(e) => setDoughBuffer(e.target.checked)} /><span>Dough buffer — mix extra to cover bowl / bench loss</span></label>
             {doughBuffer && <span className="bl-dbuf-pct"><input type="number" min="0" max="25" step="0.5" value={doughBufferPct} onChange={(e) => setDoughBufferPct(Math.max(0, Math.min(25, Number(e.target.value) || 0)))} /><em>%</em></span>}
@@ -3209,15 +3430,28 @@ export default function App() {
           ) : (
             <div className="bl-date-schedules">
               {bakePlan.dateSchedules.map((ds) => {
-                const bs = parseTime(bakeDateTimes[ds.date] || "08:00");
+                const manualSet = bakeDateTimes[ds.date] != null;
+                const useComputed = ordersActive && ds.computedOvenOnAbs !== null && !manualSet;
+                const bsAbs = useComputed ? ds.computedOvenOnAbs : parseTime(bakeDateTimes[ds.date] || "08:00");
+                const bs = ((bsAbs % 1440) + 1440) % 1440;
+                const spansMidnight = bsAbs < 0 || bsAbs >= 1440;
+                const veryEarly = useComputed && (bs < 180 || bsAbs < 0); // before 3am, or previous day — worth a second look
                 return (
                   <div className="bl-datesect" key={ds.date}>
                     <div className="bl-datesect-hd">
                       <span className="ds-date">{ds.date}</span>
-                      <div className="ss-start"><label>Oven on</label><input type="time" value={bakeDateTimes[ds.date] || "08:00"} onChange={(e) => setOvenTime(ds.date, e.target.value)} /></div>
+                      <div className="ss-start">
+                        <label>Oven on{useComputed ? " (computed)" : ""}</label>
+                        <input type="time" value={String(Math.floor(bs / 60)).padStart(2, "0") + ":" + String(bs % 60).padStart(2, "0")} onChange={(e) => setOvenTime(ds.date, e.target.value)} />
+                        {useComputed && <button className="ss-revert" onClick={() => setOvenTime(ds.date, String(Math.floor(bs / 60)).padStart(2, "0") + ":" + String(bs % 60).padStart(2, "0"))}>lock this time</button>}
+                        {manualSet && ordersActive && ds.computedOvenOnAbs !== null && <button className="ss-revert" onClick={() => setBakeDateTimes((m) => { const n = { ...m }; delete n[ds.date]; return n; })}>use computed</button>}
+                      </div>
                     </div>
+                    {useComputed && spansMidnight && <div className="bl-oven-warn">Computed start falls the day before — double-check this is workable.</div>}
+                    {useComputed && veryEarly && !spansMidnight && <div className="bl-oven-warn">Computed oven-on is {fmtClock(bs)} — a lot of loads for this delivery window. Consider a later first delivery or splitting the bake.</div>}
                     {ds.loadCount === 0 ? <div className="bl-sessempty">No loaves for this date.</div> : (<>
                       <div className="bl-preheat">Oven on <b>{fmtClock(bs)}</b> · preheat {bakePlan.preheat} min → first load <b>{fmtClock(bs + ds.firstIn)}</b> · last out <b>{fmtClock(bs + ds.lastOut)}</b> · {fmtDur(ds.lastOut)} running · {ds.loadCount} {ds.loadCount === 1 ? "load" : "loads"} / {ds.totalLoaves} loaves</div>
+                      {ordersActive && ds.earliestDelivery !== null && <div className="bl-preheat" style={{marginTop:-6}}>First delivery <b>{fmtClock(ds.earliestDelivery)}</b> · last load out is {fmtDur(Math.max(0, ds.earliestDelivery - (bs + ds.lastOut)))} ahead of it</div>}
                       {ds.items && ds.items.length > 0 && (
                         <div className="bl-profiles">
                           <span className="bl-prof-lbl">bake profiles:</span>
