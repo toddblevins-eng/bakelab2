@@ -27,12 +27,15 @@ const cloneRecipe = (r) => ({
   calNote: r.calNote || "",
   bassinage: !!r.bassinage,
   bassinagePct: r.bassinagePct ?? 8,
+  bulkRisePct: r.bulkRisePct ?? 33,
+  benchRestRisePct: r.benchRestRisePct ?? 50,
+  benchRestMin: r.benchRestMin ?? 50,
   notes: r.notes || "",
   flours: r.flours.map((f) => mk(f.name, f.pct)),
   inclusions: r.inclusions.map((f) => mk(f.name, f.pct)),
   liquids: (r.liquids || []).map((l) => mkL(l.name, l.pct, l.factor ?? 100)),
 });
-const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", inclusions: [], liquids: [] });
+const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, bulkRisePct: 33, benchRestRisePct: 50, benchRestMin: 50, notes: "", inclusions: [], liquids: [] });
 
 // date helpers — defined early because DEFAULT_SLOTS uses them at module-eval time
 const todayISO = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
@@ -221,7 +224,7 @@ const normalizeFoodSafety = (fs) => {
     })),
   };
 };
-const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
+const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, minRetardH: 8, crashTimes: {}, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null, orders: [], ordersActive: false, ovenProfileId: "default" });
 const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), complete: false, day: day || defaultDay() });
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
@@ -279,7 +282,7 @@ const trueHydration = (t) => {
   const totalWater = (+t.water || 0) + liq + levWater;
   return totalFlour > 0 ? (totalWater / totalFlour) * 100 : 0;
 };
-const RECIPE_FORMULA_KEYS = ["name","loafWeight","shape","water","salt","levain","levHyd","levInoc","levRefInoc","levBuildHrs","levRefTemp","levWhole","levExpNote","ddt","bakeTemp","bakeMin","steamMin","autolyse","calNote","bassinage","bassinagePct"];
+const RECIPE_FORMULA_KEYS = ["name","loafWeight","shape","water","salt","levain","levHyd","levInoc","levRefInoc","levBuildHrs","levRefTemp","levWhole","levExpNote","ddt","bakeTemp","bakeMin","steamMin","autolyse","calNote","bassinage","bassinagePct","bulkRisePct","benchRestRisePct","benchRestMin"];
 const sameIngList = (x, y, skipFirstPct) => {
   const xs = x || [], ys = y || [];
   if (xs.length !== ys.length) return false;
@@ -369,17 +372,19 @@ const TIMER_PHASES = [
   { key: "sf3", label: "Stretch & Fold 3", short: "S&F 3" },
   { key: "sf4", label: "Stretch & Fold 4", short: "S&F 4" },
   { key: "bulk", label: "Bulk Ferment", short: "Bulk" },
+  { key: "bench", label: "Bench Rest", short: "Bench" },
 ];
+const GATED = { bulk: { btn: "End bulk" }, bench: { btn: "Crash now" } }; // rise-gated: expiry = check the jar, never auto-done
 const phLabel = (ph) => { const p = TIMER_PHASES.find((x) => x.key === ph); return p ? p.label : ph; };
 const fmtMMSS = (ms) => { if (ms < 0) ms = 0; const t = Math.round(ms / 1000); const m = Math.floor(t / 60), ss = t % 60; return m + ":" + String(ss).padStart(2, "0"); };
 
-function TimerTab({ batches, types, params, dayId }) {
+function TimerTab({ batches, types, params, dayId, onGateDone }) {
   const SKEY = "bakelab-timers-v1:" + (dayId || "none");
   const [timers, setTimers] = useState({});
   const [durs, setDurs] = useState(() => ({ postmix: +params.restBetween || 50, sf1: +params.restBetween || 50, sf2: +params.restBetween || 50, sf3: +params.restBetween || 50, sf4: +params.restBetween || 50, bulk: +params.bulkRest || 90 }));
   const [custom, setCustom] = useState([]);
   const [, setTick] = useState(0);
-  const acRef = useRef(null), beepRef = useRef(null), wakeRef = useRef(null);
+  const acRef = useRef(null), beepRef = useRef(null), wakeRef = useRef(null), beepedRef = useRef(new Set());
 
   useEffect(() => { try { const raw = localStorage.getItem(SKEY); if (raw) { const o = JSON.parse(raw); setTimers(o && o.timers ? o.timers : {}); if (o && o.durs) setDurs((d) => ({ ...d, ...o.durs })); setCustom(o && Array.isArray(o.custom) ? o.custom : []); } else { setTimers({}); setCustom([]); } } catch (e) { setTimers({}); } }, [SKEY]);
   useEffect(() => { try { localStorage.setItem(SKEY, JSON.stringify({ timers, durs, custom })); } catch (e) {} }, [SKEY, timers, durs, custom]);
@@ -391,9 +396,16 @@ function TimerTab({ batches, types, params, dayId }) {
   const beep = () => { const ac = acRef.current; if (!ac) return; try { const o = ac.createOscillator(), g = ac.createGain(); o.type = "square"; o.frequency.value = 880; o.connect(g); g.connect(ac.destination); const t = ac.currentTime; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.32, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.34); o.start(t); o.stop(t + 0.36); } catch (e) {} };
 
   const now = Date.now();
-  const entries = Object.entries(timers).map(([k, v]) => { const p = k.split(":"); return { k, bi: +p[0], ph: p[1], end: v.end, dur: v.dur, remaining: v.end - now, done: now >= v.end }; });
-  const ringing = entries.some((e) => e.done);
+  const entries = Object.entries(timers).map(([k, v]) => { const p = k.split(":"); return { k, bi: +p[0], ph: p[1], end: v.end, dur: v.dur, remaining: v.end - now, done: now >= v.end, gated: !!GATED[p[1]] }; });
+  const ringing = entries.some((e) => e.done && !e.gated);
   useEffect(() => { if (!ringing) { if (beepRef.current) { clearInterval(beepRef.current); beepRef.current = null; } return; } beep(); const id = setInterval(beep, 1100); beepRef.current = id; return () => { clearInterval(id); beepRef.current = null; }; }, [ringing]);
+  const checkKeys = entries.filter((e) => e.done && e.gated).map((e) => e.k).join("|");
+  useEffect(() => {
+    const bset = beepedRef.current;
+    entries.forEach((e) => { if (e.done && e.gated && !bset.has(e.k)) { beep(); bset.add(e.k); } });
+    const live = new Set(entries.map((e) => e.k));
+    Array.from(bset).forEach((k) => { if (!live.has(k)) bset.delete(k); });
+  }, [checkKeys]); // eslint-disable-line
 
   useEffect(() => {
     const acquire = async () => { try { if (hasTimers && "wakeLock" in navigator && document.visibilityState === "visible") wakeRef.current = await navigator.wakeLock.request("screen"); } catch (e) {} };
@@ -406,13 +418,15 @@ function TimerTab({ batches, types, params, dayId }) {
   const allPhases = TIMER_PHASES.concat(custom.map((c) => ({ key: c.key, label: c.label, short: c.label })));
   const labelOf = (ph) => { const p = allPhases.find((x) => x.key === ph); return p ? p.label : ph; };
   const phaseDur = (ph) => { if (ph in durs) return durs[ph] || 0; const c = custom.find((x) => x.key === ph); return c ? (+c.dur || 0) : 0; };
-  const durFor = (b, ph) => ph === "autolyse" ? (+((types[b.ti] && types[b.ti].autolyse)) || +params.autolyse || 45) : phaseDur(ph);
+  const durFor = (b, ph) => ph === "autolyse" ? (+((types[b.ti] && types[b.ti].autolyse)) || +params.autolyse || 45) : ph === "bench" ? (Number.isFinite(+((types[b.ti] || {}).benchRestMin)) ? +types[b.ti].benchRestMin : 50) : phaseDur(ph);
   const addCustom = () => setCustom((c) => [...c, { key: "c" + Date.now(), label: "Custom " + (c.length + 1), dur: 20 }]);
   const removeCustom = (key) => { setCustom((c) => c.filter((x) => x.key !== key)); setTimers((t) => { const n = {}; for (const k in t) { if (!k.endsWith(":" + key)) n[k] = t[k]; } return n; }); };
   const setCustomLabel = (key, label) => setCustom((c) => c.map((x) => x.key === key ? { ...x, label } : x));
   const setCustomDur = (key, dur) => setCustom((c) => c.map((x) => x.key === key ? { ...x, dur } : x));
   const start = (bi, ph) => { ensureAudio(); const m = durFor(batches[bi], ph); if (m <= 0) return; setTimers((t) => { const n = {}; for (const k in t) { if (!k.startsWith(bi + ":")) n[k] = t[k]; } n[bi + ":" + ph] = { end: Date.now() + m * 60000, dur: m * 60000 }; return n; }); };
   const cancel = (k) => setTimers((t) => { const n = { ...t }; delete n[k]; return n; });
+  const gateTarget = (bi, ph) => { const t = types[batches[bi] ? batches[bi].ti : 0] || {}; return ph === "bulk" ? (Number.isFinite(+t.bulkRisePct) ? +t.bulkRisePct : 33) : (Number.isFinite(+t.benchRestRisePct) ? +t.benchRestRisePct : 50); };
+  const gateDone = (e, np) => { const est = Math.round(e.dur / 60000); const actual = Math.max(0, Math.round((Date.now() - (e.end - e.dur)) / 60000)); if (onGateDone) onGateDone(e.bi, e.ph, est, actual, Date.now()); if (np) start(e.bi, np.key); cancel(e.k); };
   const nextPhase = (ph) => { const nF = +params.folds || 4; let ni = allPhases.findIndex((p) => p.key === ph) + 1; while (ni < allPhases.length) { const p = allPhases[ni]; const mm = p.key.match(/^sf(\d)$/); if ((mm && +mm[1] > nF) || phaseDur(p.key) <= 0) { ni++; continue; } return p; } return null; };
 
   const active = entries.filter((e) => !e.done).sort((a, b) => a.remaining - b.remaining);
@@ -421,9 +435,24 @@ function TimerTab({ batches, types, params, dayId }) {
   if (!batches.length) return <div className="bl-panel"><div className="bl-timer-empty">No batches yet — set loaves on the Plan tab first.</div></div>;
 
   return (<>
-    {done.length > 0 && (
+    {done.some((e) => e.gated) && (
+      <div className="bl-panel bl-timer-check">
+        {done.filter((e) => e.gated).map((e) => { const np = nextPhase(e.ph); const tgt = gateTarget(e.bi, e.ph); return (
+          <div className="tc-row" key={e.k}>
+            <div className="tc-info"><span className="td-b">B{e.bi + 1}</span><span className="td-ph">{labelOf(e.ph)}</span><span className="tc-gate">Check aliquot — target {tgt}%</span><span className="tc-over">+{fmtMMSS(now - e.end)} over</span></div>
+            <div className="td-acts">
+              <button className="tc-btn" onClick={() => gateDone(e, null)}>{GATED[e.ph].btn} ✓</button>
+              {np && <button className="td-next" onClick={() => gateDone(e, np)}>Start {np.label} ▶</button>}
+              <button className="td-stop" onClick={() => cancel(e.k)}>✕</button>
+            </div>
+          </div>
+        ); })}
+        {done.some((e) => e.gated && e.ph === "bench") && <div className="tc-note">The jar reads slightly ahead of the loaves after shaping — deliberate; don't correct for it.</div>}
+      </div>
+    )}
+    {done.some((e) => !e.gated) && (
       <div className="bl-panel bl-timer-done">
-        {done.map((e) => { const np = nextPhase(e.ph); return (
+        {done.filter((e) => !e.gated).map((e) => { const np = nextPhase(e.ph); return (
           <div className="td-row" key={e.k}>
             <div className="td-info"><span className="td-b">B{e.bi + 1}</span><span className="td-ph">{labelOf(e.ph)}</span><span className="td-done">DONE</span></div>
             <div className="td-acts">
@@ -443,6 +472,7 @@ function TimerTab({ batches, types, params, dayId }) {
               <div className="ta-top"><span className="ta-b">B{e.bi + 1}</span><span className="ta-ph">{labelOf(e.ph)}</span></div>
               <div className="ta-time">{fmtMMSS(e.remaining)}</div>
               <div className="ta-bar"><div className="ta-fill" style={{ width: pct + "%" }} /></div>
+              {e.gated && <button className="ta-gate" onClick={() => gateDone(e, null)}>{GATED[e.ph].btn} ✓</button>}
               <button className="ta-cancel" onClick={() => cancel(e.k)}>Cancel</button>
             </div>
           ); })}
@@ -451,7 +481,7 @@ function TimerTab({ batches, types, params, dayId }) {
     </div>
     <div className="bl-panel">
       <h3>Start a timer</h3>
-      <div className="bl-timer-durnote">Autolyse pulls from each recipe. Set the rest here — they apply to every batch. Set any phase to <b>0</b> to skip it (Next jumps past it).</div>
+      <div className="bl-timer-durnote">Autolyse and Bench Rest pull from each recipe (Bench Rest is rise-gated: at time it asks you to check the jar instead of alarming). Set the rest here — they apply to every batch. Set any phase to <b>0</b> to skip it (Next jumps past it).</div>
       <div className="bl-timer-durs">
         {["postmix", "sf1", "sf2", "sf3", "sf4", "bulk"].map((ph) => (
           <label key={ph} className="dur-cell"><span>{labelOf(ph)}</span><input type="number" min="0" value={durs[ph]} onChange={(e) => setDurs((d) => ({ ...d, [ph]: Math.max(0, Math.floor(Number(e.target.value) || 0)) }))} /></label>
@@ -472,7 +502,7 @@ function TimerTab({ batches, types, params, dayId }) {
               {allPhases.map((p) => { const k = bi + ":" + p.key; const tm = timers[k]; const run = tm && Date.now() < tm.end; const rng = tm && Date.now() >= tm.end; const m = durFor(b, p.key); return (
                 <button key={p.key} className={"tg-cell" + (run ? " running" : "") + (rng ? " ringing" : "")} onClick={() => (run ? cancel(k) : start(bi, p.key))} disabled={m <= 0}>
                   <span className="tg-ph">{p.short}</span>
-                  <span className="tg-d">{run ? fmtMMSS(tm.end - Date.now()) : rng ? "done" : m <= 0 ? "skip" : m + "m"}</span>
+                  <span className="tg-d">{run ? fmtMMSS(tm.end - Date.now()) : rng ? (GATED[p.key] ? "check" : "done") : m <= 0 ? "skip" : m + "m"}</span>
                 </button>
               ); })}
             </div>
@@ -489,6 +519,8 @@ export default function App() {
   const [library, setLibrary] = useState(DEFAULT_LIBRARY); // kept for migration compat in globals load only
   const [coreRecipes, setCoreRecipes] = useState(DEFAULT_LIBRARY);
   const [remixes, setRemixes] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [ovenProfiles, setOvenProfiles] = useState([{ id: "default", name: "Rational iCombi Pro", cap: 15, preheatMin: 45, recoverMin: 7, notes: "" }]);
   const [ingredients, setIngredients] = useState([]);
   const [starter, setStarter] = useState(DEFAULT_STARTER);
   const patchStarter = (patch) => setStarter((s) => ({ ...s, ...patch }));
@@ -551,6 +583,12 @@ export default function App() {
   const [levBufferPct, setLevBufferPct] = useState({});
   const [doughBuffer, setDoughBuffer] = useState(false);
   const [doughBufferPct, setDoughBufferPct] = useState(4);
+  const [minRetardH, setMinRetardH] = useState(8);
+  const [crashTimes, setCrashTimes] = useState({});
+  const [orders, setOrders] = useState([]);
+  const [ordersActive, setOrdersActive] = useState(false);
+  const [ovenProfileId, setOvenProfileId] = useState("default");
+  const [showOvenEditor, setShowOvenEditor] = useState(false);
   const [foodSafety, setFoodSafety] = useState(defaultFoodSafety());
   const addFridge = () => setFoodSafety((fs) => ({ ...fs, fridges: [...fs.fridges, newFridge("Fridge " + (fs.fridges.length + 1))] }));
   const removeFridge = (fi) => setFoodSafety((fs) => ({ ...fs, fridges: fs.fridges.filter((_, i) => i !== fi) }));
@@ -597,7 +635,7 @@ export default function App() {
   };
   const [drag, setDrag] = useState(null);
   const [hover, setHover] = useState(null);
-  const [tab, setTab] = useState("plan");
+  const [tab, setTab] = useState("orders");
   const [navShow, setNavShow] = useState(false);
   const [showCal, setShowCal] = useState(false);
   const [activeBatch, setActiveBatch] = useState(null);
@@ -644,6 +682,8 @@ export default function App() {
   const [currentDayId, setCurrentDayId] = useState(null);
   const [dayName, setDayName] = useState("New run");
   const [dayDate, setDayDate] = useState(todayISO());
+  const [riseLog, setRiseLog] = useState([]);
+  const RISELOG_KEY = "bakelab-riselog-v1";
   const persist = (k, v) => { try { if (typeof window !== "undefined" && window.storage) window.storage.set(k, JSON.stringify(v)); } catch (e) {} };
   const loadDayVars = (d) => {
     setParams({ ...DEFAULTS, ...(d.params || {}) });
@@ -668,6 +708,11 @@ export default function App() {
     setLevBufferPct(d.levBufferPct && typeof d.levBufferPct === "object" ? d.levBufferPct : {});
     setDoughBuffer(!!d.doughBuffer);
     setDoughBufferPct(typeof d.doughBufferPct === "number" ? d.doughBufferPct : 4);
+    setMinRetardH(typeof d.minRetardH === "number" ? d.minRetardH : 8);
+    setCrashTimes(d.crashTimes && typeof d.crashTimes === "object" ? d.crashTimes : {});
+    setOrders(Array.isArray(d.orders) ? d.orders : []);
+    setOrdersActive(!!d.ordersActive);
+    setOvenProfileId(typeof d.ovenProfileId === "string" ? d.ovenProfileId : "default");
     setDoneBatches(Array.isArray(d.doneBatches) ? d.doneBatches : []);
     setFoodSafety(normalizeFoodSafety(d.foodSafety));
     setMixWaterTemp(typeof d.mixWaterTemp === "number" ? d.mixWaterTemp : null);
@@ -684,7 +729,25 @@ export default function App() {
   const startMin = parseTime(startTime);
 
   // production "types" derived from slots (formula + day quantity)
-  const types = useMemo(() => slots.map((s, i) => ({ ...s.draft, loaves: s.loaves, mixOrder: s.mixOrder ?? i + 1, bakeOrder: s.bakeOrder ?? i + 1 })), [slots]);
+  const orderDerived = useMemo(() => {
+    const byTi = {}; // ti -> { total, sessions: [{date, loaves}], perDateDeliveries: {date -> [{customerId, deliveryTime}]} }
+    slots.forEach((_, ti) => { byTi[ti] = { total: 0, byDate: {} }; });
+    orders.forEach((o) => {
+      Object.entries(o.items || {}).forEach(([ti, qty]) => {
+        const q = +qty || 0; if (q <= 0 || !byTi[ti]) return;
+        byTi[ti].total += q;
+        byTi[ti].byDate[o.date] = (byTi[ti].byDate[o.date] || 0) + q;
+      });
+    });
+    Object.keys(byTi).forEach((ti) => { byTi[ti].sessions = Object.keys(byTi[ti].byDate).sort().map((date) => ({ id: date, date, loaves: byTi[ti].byDate[date] })); });
+    return byTi;
+  }, [orders, slots]);
+  const types = useMemo(() => slots.map((s, i) => {
+    const od = ordersActive ? orderDerived[i] : null;
+    return { ...s.draft, loaves: od ? od.total : s.loaves, mixOrder: s.mixOrder ?? i + 1, bakeOrder: s.bakeOrder ?? i + 1 };
+  }), [slots, ordersActive, orderDerived]);
+  const effSessions = (ti) => (ordersActive && orderDerived[ti]) ? orderDerived[ti].sessions : (slots[ti] ? slots[ti].sessions : []);
+  const currentOvenProfile = ovenProfiles.find((p) => p.id === ovenProfileId) || ovenProfiles[0];
 
   // ---- batch planner -------------------------------------------------------
   const plan = useMemo(() => {
@@ -771,12 +834,15 @@ export default function App() {
             if (Array.isArray(gc.coreRecipes) && gc.coreRecipes.every((x) => Array.isArray(x.flours))) setCoreRecipes(gc.coreRecipes);
             else if (Array.isArray(gc.library) && gc.library.every((x) => Array.isArray(x.flours))) setCoreRecipes(gc.library); // migrate
             if (Array.isArray(gc.remixes)) setRemixes(gc.remixes);
+            if (Array.isArray(gc.customers)) setCustomers(gc.customers);
+            if (Array.isArray(gc.ovenProfiles) && gc.ovenProfiles.length) setOvenProfiles(gc.ovenProfiles);
             if (Array.isArray(gc.ingredients)) setIngredients(gc.ingredients.map((i) => ({ ...i, kind: i.kind === "inclusion" ? "inclusion" : "flour" })));
             if (gc.starter && typeof gc.starter === "object") setStarter({ ...DEFAULT_STARTER, ...gc.starter });
             if (Array.isArray(gc.inocCal) && gc.inocCal.length === 2) setInocCal(gc.inocCal);
             else if (typeof gc.inocDoubleHrs === "number") setInocCal([{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + gc.inocDoubleHrs }]);
             if (gc.tempUnit === "C" || gc.tempUnit === "F") setTempUnit(gc.tempUnit);
           }
+          try { const rl = await window.storage.get(RISELOG_KEY); if (rl && rl.value) { const arr = JSON.parse(rl.value); if (Array.isArray(arr)) setRiseLog(arr); } } catch (e) {}
           let loadedDays = null;
           const dRec = await window.storage.get(DAYS_KEY);
           if (dRec && dRec.value) { const arr = JSON.parse(dRec.value); if (Array.isArray(arr)) loadedDays = arr; }
@@ -789,7 +855,7 @@ export default function App() {
                 setCoreRecipes(c.library);
                 persist(GLOBALS_KEY, { coreRecipes: c.library, remixes: [], ingredients: [], inocCal: [{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + (typeof c.inocDoubleHrs === "number" ? c.inocDoubleHrs : 1.5) }], tempUnit: c.tempUnit === "F" ? "F" : "C" });
               }
-              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, doneBatches: [], foodSafety: defaultFoodSafety() };
+              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, minRetardH: 8, crashTimes: {}, doneBatches: [], foodSafety: defaultFoodSafety(), orders: [], ordersActive: false, ovenProfileId: "default" };
               loadedDays = [{ id: uid(), name: "Imported run", date: todayISO(), updatedAt: Date.now(), day }];
             } else {
               loadedDays = [newDayEntry("My first run", defaultDay())];
@@ -805,13 +871,13 @@ export default function App() {
     })();
   }, []);
   // persist shared globals
-  useEffect(() => { if (!loaded) return; persist(GLOBALS_KEY, { coreRecipes, remixes, ingredients, starter, inocCal, tempUnit }); }, [coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, loaded]);
+  useEffect(() => { if (!loaded) return; persist(GLOBALS_KEY, { coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, customers, ovenProfiles }); }, [coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, customers, ovenProfiles, loaded]);
   // autosave the open day's snapshot
   useEffect(() => {
     if (!loaded || view !== "editor" || !currentDayId) return;
-    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs };
+    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, minRetardH, crashTimes, doneBatches, foodSafety, mixWaterTemp, calcInputs, orders, ordersActive, ovenProfileId };
     setDays((ds) => { const nd = ds.map((d) => (d.id === currentDayId ? { ...d, name: dayName, date: dayDate, updatedAt: Date.now(), day: snap } : d)); persist(DAYS_KEY, nd); return nd; });
-  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
+  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, minRetardH, crashTimes, doneBatches, foodSafety, mixWaterTemp, calcInputs, orders, ordersActive, ovenProfileId, dayName, dayDate, currentDayId, view, loaded]);
 
   const distribute = (s) => { setStagger(s); setOffsets(Array.from({ length: totalBatches }, (_, b) => b * s)); };
 
@@ -832,6 +898,30 @@ export default function App() {
     for (let i = 0; i < acts.length; i++) for (let j = i + 1; j < acts.length; j++) { const a = acts[i], c = acts[j]; if (a.batch === c.batch) continue; if (a.startOff < c.endOff && c.startOff < a.endOff) { set.add(a.key); set.add(c.key); } }
     return { collisionSet: set, collisionCount: set.size };
   }, [schedule]);
+
+  // retard window per batch: (bake-day first load in) − (crash = shape end + bench rest est, or the recorded actual)
+  const retardInfo = useMemo(() => {
+    const startAbs = parseTime(startTime);
+    const rows = [];
+    plan.list.forEach((b, gi) => {
+      const t = types[b.ti]; const slot = slots[b.ti];
+      if (!t || !slot) return;
+      let best = null;
+      (slot.sessions || []).forEach((sess, si) => { if (sessionLoaves(slot, si) > 0) { const d = sess.date || dayDate; if (!best || d < best) best = d; } });
+      if (!best) return;
+      let dd = 0;
+      try { dd = Math.round((new Date(best + "T00:00:00") - new Date((dayDate || todayISO()) + "T00:00:00")) / 86400000); } catch (e) { return; }
+      if (!isFinite(dd) || dd < 0) return;
+      const ovenOn = parseTime(bakeDateTimes[best] || params.bakeStart || "08:00");
+      const bakeInAbs = dd * 1440 + ovenOn + Math.max(0, +params.preheatMin || 0);
+      const benchEst = Number.isFinite(+t.benchRestMin) ? +t.benchRestMin : 50;
+      const actual = Number.isFinite(+crashTimes[gi]);
+      const crashAbs = actual ? +crashTimes[gi] : startAbs + (schedule[gi] ? schedule[gi].end : 0) + benchEst;
+      rows.push({ gi, name: b.name, retardMin: bakeInAbs - crashAbs, actual });
+    });
+    const minMin = Math.max(0, (+minRetardH || 8) * 60);
+    return { rows, warn: rows.filter((r) => r.retardMin < minMin), minMin };
+  }, [plan, types, slots, schedule, dayDate, bakeDateTimes, params, startTime, minRetardH, crashTimes]);
 
   const autoSpace = useCallback(() => {
     const offs = []; let o = 0;
@@ -968,22 +1058,35 @@ export default function App() {
 
   // ---- bake schedule: groups per-recipe sessions by date, one oven sequential ----
   const bakePlan = useMemo(() => {
-    const cap = Math.max(1, Math.floor(+params.ovenCap || 1));
-    const preheat = Math.max(0, +params.preheatMin || 0);
-    const recover = Math.max(0, +params.recoverMin || 0);
-    // collect per-date recipe entries
+    const prof = currentOvenProfile || { cap: 15, preheatMin: 45, recoverMin: 7 };
+    const cap = Math.max(1, Math.floor(+prof.cap || 1));
+    const preheat = Math.max(0, +prof.preheatMin || 0);
+    const recover = Math.max(0, +prof.recoverMin || 0);
+    const COOL_MIN = 45; // min minutes between last load out and the day's first delivery
+    // per-date customer deliveries (earliest per date) — drives bake priority + day start time
+    const deliveriesByDate = {};
+    if (ordersActive) orders.forEach((o) => { if (!o.customerId || !o.deliveryTime) return; if (!deliveriesByDate[o.date]) deliveriesByDate[o.date] = []; deliveriesByDate[o.date].push({ customerId: o.customerId, time: parseTime(o.deliveryTime) }); });
+    // collect per-date recipe entries, tagged with the earliest delivery deadline that needs them (orders mode only)
     const dateMap = {};
     slots.forEach((slot, ti) => {
       const t = types[ti];
-      (slot.sessions || []).forEach((sess, si) => {
-        const loaves = sessionLoaves(slot, si);
+      const sessions = ordersActive ? effSessions(ti) : (slot.sessions || []);
+      sessions.forEach((sess, si) => {
+        const loaves = ordersActive ? (sess.loaves || 0) : sessionLoaves(slot, si);
         if (loaves <= 0) return;
         const date = sess.date || todayISO();
         if (!dateMap[date]) dateMap[date] = [];
-        dateMap[date].push({ ti, name: t.name, loaves, bakeOrder: t.bakeOrder || ti + 1, bakeMin: Math.max(1, +t.bakeMin || 45), steamMin: Math.min(Math.max(1, +t.bakeMin || 45), Math.max(0, +t.steamMin || 0)), temp: +t.bakeTemp || 245 });
+        // earliest delivery time among customers who ordered this recipe on this date; null = no deadline (extras / non-order mode)
+        let deadline = null;
+        if (ordersActive) {
+          orders.filter((o) => o.date === date && o.customerId && (o.items || {})[ti] > 0 && o.deliveryTime).forEach((o) => { const m = parseTime(o.deliveryTime); if (deadline === null || m < deadline) deadline = m; });
+        }
+        dateMap[date].push({ ti, name: t.name, loaves, bakeOrder: t.bakeOrder || ti + 1, bakeMin: Math.max(1, +t.bakeMin || 45), steamMin: Math.min(Math.max(1, +t.bakeMin || 45), Math.max(0, +t.steamMin || 0)), temp: +t.bakeTemp || 245, deadline });
       });
     });
     const scheduleDate = (date, items) => {
+      const dayDeliveries = deliveriesByDate[date] || [];
+      const earliestDelivery = dayDeliveries.length ? Math.min(...dayDeliveries.map((d) => d.time)) : null;
       items.sort((a, b) => (a.bakeOrder - b.bakeOrder) || (a.ti - b.ti));
       // pool loaves that bake identically (temp / time / steam), then pack into loads up to capacity
       const groups = {};
@@ -995,23 +1098,33 @@ export default function App() {
       });
       const loads = [];
       Object.values(groups).sort((a, b) => a.order - b.order).forEach((g) => {
-        const queue = g.items.map((it) => ({ ti: it.ti, name: it.name, left: it.loaves })).filter((q) => q.left > 0);
+        // earliest-deadline items fill this group's earliest loads first (deadline null = no rush, packed last)
+        const sortedItems = [...g.items].sort((a, b) => (a.deadline === null ? Infinity : a.deadline) - (b.deadline === null ? Infinity : b.deadline));
+        const queue = sortedItems.map((it) => ({ ti: it.ti, name: it.name, left: it.loaves, deadline: it.deadline })).filter((q) => q.left > 0);
         let qi = 0;
         while (qi < queue.length) {
-          const parts = []; let room = cap;
+          const parts = []; let room = cap; let minDeadline = null;
           while (room > 0 && qi < queue.length) {
             const q = queue[qi]; const take = Math.min(room, q.left);
             parts.push({ ti: q.ti, name: q.name, n: take }); q.left -= take; room -= take;
+            if (q.deadline !== null && (minDeadline === null || q.deadline < minDeadline)) minDeadline = q.deadline;
             if (q.left === 0) qi++;
           }
           const label = parts.length === 1 ? parts[0].name : parts.map((p) => p.n + " " + p.name).join(" · ");
-          loads.push({ parts, label, n: parts.reduce((a, p) => a + p.n, 0), bakeMin: g.bakeMin, steamMin: g.steamMin, temp: g.temp });
+          loads.push({ parts, label, n: parts.reduce((a, p) => a + p.n, 0), bakeMin: g.bakeMin, steamMin: g.steamMin, temp: g.temp, minDeadline });
         }
       });
+      // globally sequence ALL of this date's loads by earliest-served delivery first (max cooling cushion
+      // for the most time-critical bread); loads with no deadline (extras / non-order mode) go last.
+      if (ordersActive) loads.sort((a, b) => (a.minDeadline === null ? Infinity : a.minDeadline) - (b.minDeadline === null ? Infinity : b.minDeadline));
       let cur = preheat;
       const sched = loads.map((ld, i) => { const startOff = cur, ventOff = cur + ld.steamMin, endOff = cur + ld.bakeMin; cur = endOff + recover; return { ...ld, i, startOff, ventOff, endOff }; });
       const lastOut = sched.length ? sched[sched.length - 1].endOff : preheat;
-      return { date, items, sched, firstIn: preheat, lastOut, totalLoaves: loads.reduce((a, l) => a + l.n, 0), loadCount: sched.length };
+      const seqDuration = lastOut; // preheat -> last load out, on the "oven-on = 0" axis
+      // interpretation: ALL baking for the day finishes at least COOL_MIN before the day's EARLIEST delivery.
+      // ovenOnAbs = earliestDelivery − COOL_MIN − seqDuration (minutes-of-day, may be negative = previous day)
+      const computedOvenOnAbs = earliestDelivery !== null ? earliestDelivery - COOL_MIN - seqDuration : null;
+      return { date, items, sched, firstIn: preheat, lastOut, totalLoaves: loads.reduce((a, l) => a + l.n, 0), loadCount: sched.length, earliestDelivery, seqDuration, computedOvenOnAbs, deliveries: dayDeliveries };
     };
     const dateSchedules = Object.entries(dateMap).sort(([a], [b]) => a.localeCompare(b)).map(([date, items]) => scheduleDate(date, items));
     const pool = types.map((t, ti) => {
@@ -1020,7 +1133,7 @@ export default function App() {
       return { ti, name: t.name, shaped, allocated, remaining: shaped - allocated };
     }).filter((p) => p.shaped > 0 || p.allocated > 0);
     return { cap, preheat, recover, dateSchedules, pool };
-  }, [types, plan, slots, params.ovenCap, params.preheatMin, params.recoverMin]);
+  }, [types, plan, slots, orders, ordersActive, currentOvenProfile]);
 
   // temperature unit display/input conversion (math stays in Celsius)
   const cToU = (c) => (tempUnit === "F" ? c * 9 / 5 + 32 : c);
@@ -1139,6 +1252,40 @@ export default function App() {
     if (oldCore) setSlots((ss) => ss.map((sl) => (sl.coreRecipeId === r.id && sameFormula(sl.draft, oldCore)) ? { ...sl, draft: cloneRecipe(r) } : sl));
   };
   const saveSlotAsRemix = (ti) => { remixRecipe(ti); patchSlot(ti, (sl) => ({ ...sl, coreRecipeId: "" })); };
+  const appendRiseLog = (entry) => setRiseLog((L) => { const nl = [...L, entry]; persist(RISELOG_KEY, nl); return nl; });
+  const onGateDone = (bi, ph, estMin, actualMin, endTs) => {
+    const b = plan.list[bi]; if (!b) return;
+    const t = types[b.ti] || {}; const slot = slots[b.ti] || {};
+    appendRiseLog({ date: dayDate || todayISO(), recipeId: slot.coreRecipeId || t.name || "", flourNote: t.notes || "", phaseId: ph, estimatedMinutes: estMin, actualMinutes: actualMin, riseTargetPct: ph === "bulk" ? (Number.isFinite(+t.bulkRisePct) ? +t.bulkRisePct : 33) : (Number.isFinite(+t.benchRestRisePct) ? +t.benchRestRisePct : 50), ambientTemp: typeof ambientTemp === "number" ? ambientTemp : null });
+    const drift = Math.round(actualMin - estMin);
+    if (ph === "bulk") { if (drift !== 0) setOffsets((o) => o.map((x, i) => (i === bi ? x + drift : x))); }
+    else if (ph === "bench") { try { const mid = new Date((dayDate || todayISO()) + "T00:00:00").getTime(); const m = Math.round((endTs - mid) / 60000); if (isFinite(m)) setCrashTimes((c) => ({ ...c, [bi]: m })); } catch (e) {} }
+  };
+  const orderKey = (date, cid) => date + "|" + (cid || "extras");
+  const getOrder = (date, cid) => orders.find((o) => o.date === date && o.customerId === (cid || null));
+  const setOrderQty = (date, cid, ti, qty) => setOrders((os) => {
+    const idx = os.findIndex((o) => o.date === date && o.customerId === (cid || null));
+    const q = Math.max(0, Math.floor(+qty || 0));
+    if (idx === -1) { if (q <= 0) return os; return [...os, { id: uid(), date, customerId: cid || null, items: { [ti]: q }, deliveryTime: cid ? "08:00" : "" }]; }
+    const items = { ...os[idx].items, [ti]: q };
+    if (q === 0) delete items[ti];
+    const next = [...os]; next[idx] = { ...next[idx], items };
+    return next.filter((o) => o === next[idx] ? Object.keys(items).length > 0 || true : true); // keep row even if 0 items (delivery time may still be set)
+  });
+  const setOrderDelivery = (date, cid, time) => setOrders((os) => {
+    const idx = os.findIndex((o) => o.date === date && o.customerId === (cid || null));
+    if (idx === -1) return [...os, { id: uid(), date, customerId: cid || null, items: {}, deliveryTime: time }];
+    const next = [...os]; next[idx] = { ...next[idx], deliveryTime: time };
+    return next;
+  });
+  const removeOrderRow = (date, cid) => setOrders((os) => os.filter((o) => !(o.date === date && o.customerId === (cid || null))));
+  const orderDates = useMemo(() => Array.from(new Set(orders.map((o) => o.date))).sort(), [orders]);
+  const addCustomer = (name) => { const c = { id: uid(), name: name || "New customer", notes: "" }; setCustomers((cs) => [...cs, c]); return c.id; };
+  const patchCustomer = (id, patch) => setCustomers((cs) => cs.map((c) => c.id === id ? { ...c, ...patch } : c));
+  const removeCustomer = (id) => setCustomers((cs) => cs.filter((c) => c.id !== id));
+  const addOvenProfile = () => { const p = { id: uid(), name: "New oven", cap: 15, preheatMin: 45, recoverMin: 7, notes: "" }; setOvenProfiles((ps) => [...ps, p]); return p.id; };
+  const patchOvenProfile = (id, patch) => setOvenProfiles((ps) => ps.map((p) => p.id === id ? { ...p, ...patch } : p));
+  const removeOvenProfile = (id) => setOvenProfiles((ps) => ps.length > 1 ? ps.filter((p) => p.id !== id) : ps);
   const setRecipeNotes = (ti, v) => {
     patchDraft(ti, (d) => ({ ...d, notes: v }));
     const cid = slots[ti] && slots[ti].coreRecipeId;
@@ -1625,6 +1772,63 @@ export default function App() {
         .bl-dbuf-warn{flex-basis:100%;font-size:11.5px;color:var(--alert);line-height:1.35;}
         .bl-levcombine{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink);cursor:pointer;padding:6px 0;}
         .bl-levcombine input{width:15px;height:15px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .bl-timer-check{border:1.5px solid #e9c47e;background:#fff6e3;}
+        .bl-timer-check .td-b{color:var(--ink);}
+        .bl-timer-check .td-ph{color:var(--crust2);}
+        .bl-timer-check .td-stop{color:var(--ink2);border-color:var(--line);background:#fff;}
+        .tc-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:9px 4px;border-bottom:1px dashed #e9c47e;}
+        .tc-row:last-of-type{border-bottom:none;}
+        .tc-info{display:flex;flex-wrap:wrap;align-items:baseline;gap:9px;}
+        .tc-gate{font-family:'DM Sans';font-size:13px;font-weight:700;color:var(--crust2);}
+        .tc-over{font-family:'JetBrains Mono';font-size:12px;color:var(--ink2);}
+        .tc-btn{font-family:'DM Sans';font-size:13px;font-weight:700;padding:8px 13px;border-radius:8px;border:1.5px solid var(--crust2);background:var(--crust);color:#fff;cursor:pointer;}
+        .tc-note{font-size:11px;color:var(--ink2);font-style:italic;padding:6px 4px 0;}
+        .ta-gate{width:100%;margin-top:7px;font-family:'DM Sans';font-size:13px;font-weight:700;padding:9px;border-radius:8px;border:1.5px solid rgba(245,239,227,.5);background:var(--crust);color:#fff;cursor:pointer;}
+        .bl-retard{margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--cream);}
+        .bl-retard-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;color:var(--ink2);margin-bottom:7px;}
+        .bl-retard-hd label{display:flex;align-items:center;gap:4px;font-size:11px;}
+        .bl-retard-hd input{width:52px;font-family:'JetBrains Mono';font-size:12px;padding:3px 6px;border:1.5px solid var(--line);border-radius:6px;text-align:right;background:#fff;color:var(--ink);}
+        .bl-retard-rows{display:flex;flex-wrap:wrap;gap:6px;}
+        .bl-retard-chip{font-family:'JetBrains Mono';font-size:11.5px;padding:3px 8px;border-radius:6px;border:1px solid var(--line);background:var(--paper);color:var(--ink);}
+        .bl-retard-chip.warn{border-color:var(--alert);color:var(--alert);background:#fdf0ef;}
+        .bl-retard-warn{margin-top:7px;font-size:12px;color:var(--alert);line-height:1.35;}
+        .bl-retard-note{margin-top:6px;font-size:10.5px;color:var(--ink2);}
+        .bl-retard-empty{font-size:12px;color:var(--ink2);}
+        .bl-orders-toggle label{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:600;color:var(--ink);cursor:pointer;}
+        .bl-orders-toggle input{width:16px;height:16px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .bl-cust-list{display:flex;flex-direction:column;gap:6px;margin-bottom:10px;}
+        .bl-cust-row{display:flex;align-items:center;gap:8px;}
+        .bl-cust-name{flex:1;font-family:'DM Sans';font-size:13px;padding:6px 10px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);}
+        .bl-orderdate-chips{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-bottom:14px;}
+        .bl-orderdate-chip{font-family:'JetBrains Mono';font-size:11.5px;padding:3px 9px;border-radius:20px;background:var(--paper);border:1px solid var(--line);color:var(--ink2);}
+        .bl-orderdate-add{font-family:'DM Sans';font-size:12.5px;padding:5px 9px;border:1.5px solid var(--crust);border-radius:7px;background:#fff;color:var(--crust2);}
+        .bl-orderdate-block{padding:14px 0;border-top:1px solid var(--line);}
+        .bl-orderdate-block:first-of-type{border-top:none;padding-top:0;}
+        .bl-orderdate-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;}
+        .od-date{font-family:'Fraunces';font-weight:600;font-size:14px;color:var(--crust2);}
+        .bl-order-grid{display:grid;gap:6px 8px;align-items:center;overflow-x:auto;}
+        .og-hd{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink2);padding-bottom:4px;border-bottom:1px solid var(--line);}
+        .og-recipe{text-align:center;}
+        .og-cell{min-width:0;}
+        .og-nm{font-size:12.5px;font-weight:600;color:var(--ink);}
+        .og-extras{color:var(--ink2);font-weight:400;font-style:italic;}
+        .og-extras span{font-size:10.5px;}
+        .og-cell input[type=number]{width:56px;font-family:'JetBrains Mono';font-size:12.5px;padding:4px 6px;border:1.5px solid var(--line);border-radius:6px;text-align:center;background:#fff;color:var(--ink);}
+        .og-cell input[type=time]{font-family:'JetBrains Mono';font-size:12px;padding:4px 6px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);width:100%;}
+        .og-cell select{font-family:'DM Sans';font-size:12px;padding:4px 6px;border:1.5px solid var(--crust);border-radius:6px;background:#fff;color:var(--crust2);}
+        .bl-sess-fromorders.empty{font-size:12px;color:var(--ink2);font-style:italic;}
+        .bl-sess-row.from-orders{background:var(--paper);}
+        .ss-badge{font-size:9.5px;text-transform:uppercase;letter-spacing:.03em;color:var(--crust2);background:#fff6e3;border:1px solid #e9c47e;border-radius:10px;padding:2px 7px;margin-left:auto;}
+        .bl-ovenprof{display:flex;align-items:center;gap:9px;margin-bottom:10px;flex-wrap:wrap;}
+        .bl-ovenprof label{font-size:12px;color:var(--ink2);}
+        .bl-ovenprof select{font-family:'DM Sans';font-size:13px;padding:6px 9px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);}
+        .bl-ovenprof-editor{margin:0 0 14px;padding:10px 12px;background:var(--paper);border:1px solid var(--line);border-radius:9px;display:flex;flex-direction:column;gap:8px;}
+        .bl-ovenprof-row{display:flex;flex-wrap:wrap;align-items:center;gap:9px;}
+        .bl-ovenprof-name{font-family:'DM Sans';font-size:13px;padding:5px 9px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);flex:1 1 140px;min-width:120px;}
+        .bl-ovenprof-row label{display:flex;align-items:center;gap:4px;font-size:11px;color:var(--ink2);}
+        .bl-ovenprof-row input{width:52px;font-family:'JetBrains Mono';font-size:12px;padding:3px 6px;border:1.5px solid var(--line);border-radius:6px;text-align:right;background:#fff;color:var(--ink);}
+        .ss-revert{font-family:'DM Sans';font-size:10.5px;font-weight:600;padding:3px 8px;border-radius:6px;border:1px solid var(--crust);background:#fff;color:var(--crust2);cursor:pointer;white-space:nowrap;}
+        .bl-oven-warn{margin:0 0 9px;font-size:12px;color:var(--alert);line-height:1.35;}
         .dc-body .dc-bake{font-family:'JetBrains Mono';font-size:11px;color:var(--sand);}
         .dc-body .dc-open{margin-top:4px;font-family:'DM Sans';font-size:13px;font-weight:600;color:var(--crust);}
         .bl-dayhd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;}
@@ -2189,6 +2393,11 @@ export default function App() {
                   <div className="bl-field2"><label>Autolyse (min)</label><input type="number" min="0" value={editingDraft.autolyse ?? 45} onChange={(e) => patchEdit({ autolyse: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div className="bl-field2"><label>Shape</label><select value={editingDraft.shape || "round"} onChange={(e) => patchEdit({ shape: e.target.value })}><option value="round">Round</option><option value="oval">Oval</option></select></div>
                 </div>
+                <div className="bl-re-row">
+                  <div className="bl-field2"><label>Bulk rise target %</label><input type="number" min="0" value={editingDraft.bulkRisePct ?? 33} onChange={(e) => patchEdit({ bulkRisePct: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Bench rest target %</label><input type="number" min="0" value={editingDraft.benchRestRisePct ?? 50} onChange={(e) => patchEdit({ benchRestRisePct: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Bench rest (min)</label><input type="number" min="0" value={editingDraft.benchRestMin ?? 50} onChange={(e) => patchEdit({ benchRestMin: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                </div>
                 <div className="bl-subhead">Flours · main balances to 100%</div>
                 {(editingDraft.flours || []).map((f, idx) => (
                   <div className="ing-row" key={f.id}>
@@ -2455,17 +2664,93 @@ export default function App() {
       </div>
 
       <div className={"bl-tabs" + (navHidden ? " navhidden" : "")} ref={tabsRef}>
-        <button className={"bl-tab" + (tab === "plan" ? " on" : "")} onClick={() => goTab("plan")}><span className="num">1</span><span className="tlabel">Plan</span><span className="tshort">Plan</span></button>
-        <button className={"bl-tab" + (tab === "prep" ? " on" : "")} onClick={() => goTab("prep")}><span className="num">2</span><span className="tlabel">Prep &amp; Shop</span><span className="tshort">Prep</span></button>
-        <button className={"bl-tab" + (tab === "levain" ? " on" : "")} onClick={() => goTab("levain")}><span className="num">3</span><span className="tlabel">Levain</span><span className="tshort">Levain</span></button>
-        <button className={"bl-tab" + (tab === "safety" ? " on" : "")} onClick={() => goTab("safety")}><span className="num">4</span><span className="tlabel">Food Safety</span><span className="tshort">Safety</span></button>
-        <button className={"bl-tab" + (tab === "build" ? " on" : "")} onClick={() => goTab("build")}><span className="num">5</span><span className="tlabel">Mix</span><span className="tshort">Mix</span></button>
-        <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => goTab("fold")}><span className="num">6</span><span className="tlabel">Bulk/Shape</span><span className="tshort">Bulk/Shape</span></button>
-        <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => goTab("bake")}><span className="num">7</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
-        <button className={"bl-tab" + (tab === "timers" ? " on" : "")} onClick={() => goTab("timers")}><span className="num">8</span><span className="tlabel">Timers</span><span className="tshort">Timers</span></button>
+        <button className={"bl-tab" + (tab === "orders" ? " on" : "")} onClick={() => goTab("orders")}><span className="num">1</span><span className="tlabel">Orders</span><span className="tshort">Orders</span></button>
+        <button className={"bl-tab" + (tab === "plan" ? " on" : "")} onClick={() => goTab("plan")}><span className="num">2</span><span className="tlabel">Plan</span><span className="tshort">Plan</span></button>
+        <button className={"bl-tab" + (tab === "prep" ? " on" : "")} onClick={() => goTab("prep")}><span className="num">3</span><span className="tlabel">Prep &amp; Shop</span><span className="tshort">Prep</span></button>
+        <button className={"bl-tab" + (tab === "levain" ? " on" : "")} onClick={() => goTab("levain")}><span className="num">4</span><span className="tlabel">Levain</span><span className="tshort">Levain</span></button>
+        <button className={"bl-tab" + (tab === "safety" ? " on" : "")} onClick={() => goTab("safety")}><span className="num">5</span><span className="tlabel">Food Safety</span><span className="tshort">Safety</span></button>
+        <button className={"bl-tab" + (tab === "build" ? " on" : "")} onClick={() => goTab("build")}><span className="num">6</span><span className="tlabel">Mix</span><span className="tshort">Mix</span></button>
+        <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => goTab("fold")}><span className="num">7</span><span className="tlabel">Bulk/Shape</span><span className="tshort">Bulk/Shape</span></button>
+        <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => goTab("bake")}><span className="num">8</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
+        <button className={"bl-tab" + (tab === "timers" ? " on" : "")} onClick={() => goTab("timers")}><span className="num">9</span><span className="tlabel">Timers</span><span className="tshort">Timers</span></button>
       </div>
 
       {/* ---------- TAB 1: PLANNING ---------- */}
+      {tab === "orders" && (<>
+        <div className="bl-panel">
+          <div className="bl-orders-toggle">
+            <label><input type="checkbox" checked={ordersActive} onChange={(e) => setOrdersActive(e.target.checked)} /><span>Orders drive production — loaf counts and bake dates below feed Plan automatically</span></label>
+          </div>
+          <div className="bl-note" style={{marginTop:0}}>Off: this run works exactly like before — set loaves and bake sessions by hand on Plan (test bakes, one-offs). On: every number below flows straight into Plan, Mix, Levain, Prep, and Bake — edit an order and the whole run recalculates.</div>
+        </div>
+
+        <div className="bl-panel">
+          <div className="ch" style={{margin:"-18px -18px 14px", borderRadius:"11px 11px 0 0"}}>Customers</div>
+          <div className="bl-cust-list">
+            {customers.map((c) => (
+              <div className="bl-cust-row" key={c.id}>
+                <BufferedInput className="bl-cust-name" value={c.name} onCommit={(v) => patchCustomer(c.id, { name: v })} placeholder="Customer name" />
+                <button className="ing-x" onClick={() => removeCustomer(c.id)}>×</button>
+              </div>
+            ))}
+          </div>
+          <button className="bl-add" onClick={() => addCustomer("New customer")}>+ Customer</button>
+        </div>
+
+        <div className="bl-panel">
+          <div className="ch" style={{margin:"-18px -18px 14px", borderRadius:"11px 11px 0 0"}}>Bake dates &amp; order counts</div>
+          <div className="bl-orderdate-chips">
+            {orderDates.map((d) => <span key={d} className="bl-orderdate-chip">{d}</span>)}
+            <input type="date" className="bl-orderdate-add" onChange={(e) => { const d = e.target.value; if (d) { setOrders((os) => os.some((o) => o.date === d) ? os : [...os, { id: uid(), date: d, customerId: null, items: {}, deliveryTime: "" }]); } e.target.value = ""; }} />
+          </div>
+          {orderDates.length === 0 && <div className="bl-timer-empty">Pick a date above to start entering orders.</div>}
+          {orderDates.map((date) => {
+            const rowsForDate = orders.filter((o) => o.date === date);
+            const customerRows = rowsForDate.filter((o) => o.customerId);
+            const extrasRow = rowsForDate.find((o) => !o.customerId);
+            const usedIds = customerRows.map((o) => o.customerId);
+            return (
+              <div className="bl-orderdate-block" key={date}>
+                <div className="bl-orderdate-hd">
+                  <span className="od-date">{date}</span>
+                  <button className="ing-x" title="Remove this date's orders" onClick={() => setOrders((os) => os.filter((o) => o.date !== date))}>×</button>
+                </div>
+                <div className="bl-order-grid" style={{ gridTemplateColumns: "1fr 90px " + types.map(() => "70px").join(" ") + " 30px" }}>
+                  <div className="og-hd">Customer</div><div className="og-hd">Delivery</div>
+                  {types.map((t, ti) => <div className="og-hd og-recipe" key={ti}>{t.name}</div>)}
+                  <div />
+                  {customerRows.map((o) => {
+                    const cust = customers.find((c) => c.id === o.customerId);
+                    return (
+                      <React.Fragment key={o.id}>
+                        <div className="og-cell og-nm">{cust ? cust.name : "(deleted customer)"}</div>
+                        <div className="og-cell"><input type="time" value={o.deliveryTime || ""} onChange={(e) => setOrderDelivery(date, o.customerId, e.target.value)} /></div>
+                        {types.map((t, ti) => <div className="og-cell" key={ti}><input type="number" min="0" value={(o.items || {})[ti] || 0} onChange={(e) => setOrderQty(date, o.customerId, ti, e.target.value)} /></div>)}
+                        <button className="ing-x" onClick={() => removeOrderRow(date, o.customerId)}>×</button>
+                      </React.Fragment>
+                    );
+                  })}
+                  <div className="og-cell og-nm">
+                    <select value="" onChange={(e) => { if (e.target.value) setOrderDelivery(date, e.target.value, "08:00"); }}>
+                      <option value="">+ Add customer…</option>
+                      {customers.filter((c) => usedIds.indexOf(c.id) === -1).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                    </select>
+                  </div>
+                  <div className="og-cell" />
+                  {types.map((_, ti) => <div className="og-cell" key={ti} />)}
+                  <div />
+                  <div className="og-cell og-nm og-extras">Extras <span>(no delivery)</span></div>
+                  <div className="og-cell" />
+                  {types.map((t, ti) => <div className="og-cell" key={ti}><input type="number" min="0" value={extrasRow ? (extrasRow.items || {})[ti] || 0 : 0} onChange={(e) => setOrderQty(date, null, ti, e.target.value)} /></div>)}
+                  <div />
+                </div>
+              </div>
+            );
+          })}
+          {types.length === 0 && <div className="bl-timer-empty">Add recipes on the Plan tab first — they become the columns here.</div>}
+        </div>
+      </>)}
+
       {tab === "plan" && (<>
       <div className="bl-panel">
         <h3>Run timing</h3>
@@ -2510,7 +2795,7 @@ export default function App() {
                   );
                 })()}
                 <div className="bl-rec-top">
-                  <div><label>Loaves</label><input className="n" type="number" min="0" value={t.loaves} onChange={(e) => setLoaves(ti, e.target.value)} /></div>
+                  <div><label>Loaves{ordersActive ? " (from orders)" : ""}</label>{ordersActive ? <span className="n ss-lv-auto" style={{display:"inline-block"}}>{t.loaves}</span> : <input className="n" type="number" min="0" value={t.loaves} onChange={(e) => setLoaves(ti, e.target.value)} />}</div>
                   <div><label>Loaf g</label><input className="n" type="number" min="0" value={t.loafWeight} onChange={(e) => setDraft(ti, { loafWeight: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div><label>Autolyse min</label><input className="n" type="number" min="0" value={t.autolyse ?? 45} onChange={(e) => setDraft(ti, { autolyse: Math.max(0, Number(e.target.value) || 0) })} /></div>
                 </div>
@@ -2522,28 +2807,40 @@ export default function App() {
                   return (
                     <div className="bl-optimize">
                       <div className="opt-stat"><span>⚡ {mx}/mix</span><span>{bc} mix{bc > 1 ? "es" : ""} · {fillPct}% full{maxed ? " ✓" : ""}</span></div>
-                      {!maxed && <button className="opt-chip up" onClick={() => setLoaves(ti, full)}>↑ {full} fills {bc} mix{bc > 1 ? "es" : ""} <em>+{full - N}</em></button>}
-                      {bc >= 2 && <button className="opt-chip down" onClick={() => setLoaves(ti, trimTo)}>↓ {trimTo} drops a mix <em>−{N - trimTo}</em></button>}
+                      {!ordersActive && !maxed && <button className="opt-chip up" onClick={() => setLoaves(ti, full)}>↑ {full} fills {bc} mix{bc > 1 ? "es" : ""} <em>+{full - N}</em></button>}
+                      {!ordersActive && bc >= 2 && <button className="opt-chip down" onClick={() => setLoaves(ti, trimTo)}>↓ {trimTo} drops a mix <em>−{N - trimTo}</em></button>}
                     </div>
                   );
                 })()}
                 <div className="bl-rec-sessions">
-                  {(slots[ti].sessions || []).map((sess, si) => {
-                    const lv = sessionLoaves(slots[ti], si);
-                    const isMain = si === 0;
-                    const over = (slots[ti].sessions || []).slice(1).reduce((a, s) => a + Math.max(0, +(s.loaves) || 0), 0) > t.loaves;
-                    return (
-                      <div className={"bl-sess-row" + (isMain && over ? " over" : "")} key={sess.id}>
-                        <span className="ss-no">Bake {si + 1}{isMain ? " ←" : ""}</span>
-                        <input type="date" value={sess.date || todayISO()} onChange={(e) => setSlotSessionDate(ti, si, e.target.value)} />
-                        {isMain
-                          ? <span className="ss-lv-auto">{lv} loaves</span>
-                          : <><input className="n ss-lv" type="number" min="0" value={sess.loaves || 0} onChange={(e) => setSlotSessionLoaves(ti, si, e.target.value)} /><span className="ss-lvu">loaves</span><button className="ing-x" onClick={() => removeSlotSession(ti, si)}>×</button></>
-                        }
-                      </div>
-                    );
-                  })}
-                  <button className="bl-addrow" onClick={() => addSlotSession(ti)}>+ Bake session</button>
+                  {ordersActive ? (
+                    <>
+                      {effSessions(ti).length === 0 ? <div className="bl-sess-fromorders empty">No orders yet for this recipe — add them on the Orders tab.</div> : effSessions(ti).map((sess) => (
+                        <div className="bl-sess-row from-orders" key={sess.date}>
+                          <span className="ss-no">{sess.date}</span>
+                          <span className="ss-lv-auto">{sess.loaves} loaves</span>
+                          <span className="ss-badge">from orders</span>
+                        </div>
+                      ))}
+                    </>
+                  ) : (<>
+                    {(slots[ti].sessions || []).map((sess, si) => {
+                      const lv = sessionLoaves(slots[ti], si);
+                      const isMain = si === 0;
+                      const over = (slots[ti].sessions || []).slice(1).reduce((a, s) => a + Math.max(0, +(s.loaves) || 0), 0) > t.loaves;
+                      return (
+                        <div className={"bl-sess-row" + (isMain && over ? " over" : "")} key={sess.id}>
+                          <span className="ss-no">Bake {si + 1}{isMain ? " ←" : ""}</span>
+                          <input type="date" value={sess.date || todayISO()} onChange={(e) => setSlotSessionDate(ti, si, e.target.value)} />
+                          {isMain
+                            ? <span className="ss-lv-auto">{lv} loaves</span>
+                            : <><input className="n ss-lv" type="number" min="0" value={sess.loaves || 0} onChange={(e) => setSlotSessionLoaves(ti, si, e.target.value)} /><span className="ss-lvu">loaves</span><button className="ing-x" onClick={() => removeSlotSession(ti, si)}>×</button></>
+                          }
+                        </div>
+                      );
+                    })}
+                    <button className="bl-addrow" onClick={() => addSlotSession(ti)}>+ Bake session</button>
+                  </>)}
                 </div>
                 {types.length > 1 && (
                   <div className="bl-orders">
@@ -2721,6 +3018,27 @@ export default function App() {
             <div className="bl-rep-stat"><div className="v">{fmtClock(startMin + lastEnd)}</div><div className="l">Shaping done</div></div>
             <div className="bl-rep-stat"><div className="v">{fmtDur(totalActiveMin)}</div><div className="l">Hands-on</div></div>
           </div>
+          <div className="bl-ovenprof">
+            <label>Oven</label>
+            <select value={ovenProfileId} onChange={(e) => setOvenProfileId(e.target.value)}>
+              {ovenProfiles.map((p) => <option key={p.id} value={p.id}>{p.name} — {p.cap}/load</option>)}
+            </select>
+            <button className="bl-add" onClick={() => setShowOvenEditor((v) => !v)}>{showOvenEditor ? "Done" : "Edit ovens"}</button>
+          </div>
+          {showOvenEditor && (
+            <div className="bl-ovenprof-editor">
+              {ovenProfiles.map((p) => (
+                <div className="bl-ovenprof-row" key={p.id}>
+                  <BufferedInput className="bl-ovenprof-name" value={p.name} onCommit={(v) => patchOvenProfile(p.id, { name: v })} placeholder="Oven name" />
+                  <label>cap <input type="number" min="1" value={p.cap} onChange={(e) => patchOvenProfile(p.id, { cap: Math.max(1, Number(e.target.value) || 1) })} /></label>
+                  <label>preheat <input type="number" min="0" value={p.preheatMin} onChange={(e) => patchOvenProfile(p.id, { preheatMin: Math.max(0, Number(e.target.value) || 0) })} /> min</label>
+                  <label>recover <input type="number" min="0" value={p.recoverMin} onChange={(e) => patchOvenProfile(p.id, { recoverMin: Math.max(0, Number(e.target.value) || 0) })} /> min</label>
+                  {ovenProfiles.length > 1 && <button className="ing-x" onClick={() => removeOvenProfile(p.id)}>×</button>}
+                </div>
+              ))}
+              <button className="bl-add" onClick={addOvenProfile}>+ Oven</button>
+            </div>
+          )}
           <div className="bl-dbuf">
             <label className="bl-dbuf-tog"><input type="checkbox" checked={doughBuffer} onChange={(e) => setDoughBuffer(e.target.checked)} /><span>Dough buffer — mix extra to cover bowl / bench loss</span></label>
             {doughBuffer && <span className="bl-dbuf-pct"><input type="number" min="0" max="25" step="0.5" value={doughBufferPct} onChange={(e) => setDoughBufferPct(Math.max(0, Math.min(25, Number(e.target.value) || 0)))} /><em>%</em></span>}
@@ -2769,6 +3087,7 @@ export default function App() {
             ))}
           </div>
           <div className="bl-note">Vessel size assumes ~{BULK_HEADROOM}× dough volume for bulk expansion plus hand-mixing room, at ~{DOUGH_DENSITY} g/mL dough density — both adjustable. Levain total is what you’ll need to build ahead. Banneton counts assume one per loaf with no reuse across staggered proofs.</div>
+          <div className="bl-note">Aliquot after shaping: the jar ferments undisturbed while the loaves were degassed and re-tensioned, so it reads slightly ahead of the loaves. Don't correct for it — the conservative bias is intentional for open-deck spring.</div>
         </div>
       )}
 
@@ -3061,6 +3380,16 @@ export default function App() {
               </div>
             </div>
             <div className="bl-note">Live view — the red line is now, held about a third in from the left. Full screen fits all batches at once; scroll to look around; “Jump to now” re-centers. Read-only.</div>
+            <div className="bl-retard">
+              <div className="bl-retard-hd"><span>Retard windows — crash → first load</span><label>min <input type="number" min="0" step="0.5" value={minRetardH} onChange={(e) => setMinRetardH(Math.max(0, Number(e.target.value) || 0))} /> h</label></div>
+              {retardInfo.rows.length === 0 ? <div className="bl-retard-empty">Set bake dates on the Plan tab to see retard windows.</div> : (
+                <div className="bl-retard-rows">{retardInfo.rows.map((r) => (
+                  <span key={r.gi} className={"bl-retard-chip" + (r.retardMin < retardInfo.minMin ? " warn" : "")}>B{r.gi + 1} {r.retardMin >= 0 ? fmtDur(Math.round(r.retardMin)) : "−" + fmtDur(Math.round(-r.retardMin))}{r.actual ? " ✓" : ""}</span>
+                ))}</div>
+              )}
+              {retardInfo.warn.length > 0 && <div className="bl-retard-warn">Retard compressed below {minRetardH}h for {retardInfo.warn.map((r) => "B" + (r.gi + 1)).join(" · ")} — bake window or crash time needs to move.</div>}
+              <div className="bl-retard-note">Estimated from schedule end + each recipe's bench rest; ✓ = actual crash recorded from the Timers tab.</div>
+            </div>
           </div>
         );
       })()}
@@ -3101,15 +3430,28 @@ export default function App() {
           ) : (
             <div className="bl-date-schedules">
               {bakePlan.dateSchedules.map((ds) => {
-                const bs = parseTime(bakeDateTimes[ds.date] || "08:00");
+                const manualSet = bakeDateTimes[ds.date] != null;
+                const useComputed = ordersActive && ds.computedOvenOnAbs !== null && !manualSet;
+                const bsAbs = useComputed ? ds.computedOvenOnAbs : parseTime(bakeDateTimes[ds.date] || "08:00");
+                const bs = ((bsAbs % 1440) + 1440) % 1440;
+                const spansMidnight = bsAbs < 0 || bsAbs >= 1440;
+                const veryEarly = useComputed && (bs < 180 || bsAbs < 0); // before 3am, or previous day — worth a second look
                 return (
                   <div className="bl-datesect" key={ds.date}>
                     <div className="bl-datesect-hd">
                       <span className="ds-date">{ds.date}</span>
-                      <div className="ss-start"><label>Oven on</label><input type="time" value={bakeDateTimes[ds.date] || "08:00"} onChange={(e) => setOvenTime(ds.date, e.target.value)} /></div>
+                      <div className="ss-start">
+                        <label>Oven on{useComputed ? " (computed)" : ""}</label>
+                        <input type="time" value={String(Math.floor(bs / 60)).padStart(2, "0") + ":" + String(bs % 60).padStart(2, "0")} onChange={(e) => setOvenTime(ds.date, e.target.value)} />
+                        {useComputed && <button className="ss-revert" onClick={() => setOvenTime(ds.date, String(Math.floor(bs / 60)).padStart(2, "0") + ":" + String(bs % 60).padStart(2, "0"))}>lock this time</button>}
+                        {manualSet && ordersActive && ds.computedOvenOnAbs !== null && <button className="ss-revert" onClick={() => setBakeDateTimes((m) => { const n = { ...m }; delete n[ds.date]; return n; })}>use computed</button>}
+                      </div>
                     </div>
+                    {useComputed && spansMidnight && <div className="bl-oven-warn">Computed start falls the day before — double-check this is workable.</div>}
+                    {useComputed && veryEarly && !spansMidnight && <div className="bl-oven-warn">Computed oven-on is {fmtClock(bs)} — a lot of loads for this delivery window. Consider a later first delivery or splitting the bake.</div>}
                     {ds.loadCount === 0 ? <div className="bl-sessempty">No loaves for this date.</div> : (<>
                       <div className="bl-preheat">Oven on <b>{fmtClock(bs)}</b> · preheat {bakePlan.preheat} min → first load <b>{fmtClock(bs + ds.firstIn)}</b> · last out <b>{fmtClock(bs + ds.lastOut)}</b> · {fmtDur(ds.lastOut)} running · {ds.loadCount} {ds.loadCount === 1 ? "load" : "loads"} / {ds.totalLoaves} loaves</div>
+                      {ordersActive && ds.earliestDelivery !== null && <div className="bl-preheat" style={{marginTop:-6}}>First delivery <b>{fmtClock(ds.earliestDelivery)}</b> · last load out is {fmtDur(Math.max(0, ds.earliestDelivery - (bs + ds.lastOut)))} ahead of it</div>}
                       {ds.items && ds.items.length > 0 && (
                         <div className="bl-profiles">
                           <span className="bl-prof-lbl">bake profiles:</span>
@@ -3205,7 +3547,7 @@ export default function App() {
       )}
 
       {/* ---------- TAB 7: FOOD SAFETY ---------- */}
-      {tab === "timers" && <TimerTab batches={plan.list} types={types} params={params} dayId={currentDayId} />}
+      {tab === "timers" && <TimerTab batches={plan.list} types={types} params={params} dayId={currentDayId} onGateDone={onGateDone} />}
       {tab === "safety" && (<>
         <div className="bl-panel">
           <h3>Refrigerator temperature log</h3>
