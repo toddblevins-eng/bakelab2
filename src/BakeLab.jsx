@@ -194,6 +194,35 @@ const DEFAULT_STARTER = {
   wholeCal: [ { whole: 0, hrs: 5 }, { whole: 25, hrs: 3.5 } ],
 };
 const DAYS_KEY = "bakelab-days-v1";
+const LASTLOC_KEY = "bakelab-lastloc-v1"; // per-DEVICE (localStorage): where this device was last, so a home-screen launch reopens there
+const TAB_KEYS = ["plan", "prep", "levain", "safety", "build", "fold", "bake", "timers"];
+const HOME_TAB_KEYS = ["bakedays", "recipes", "starter"];
+
+// ---- stay awake -----------------------------------------------------------
+// Keep-awake video adapted from NoSleep.js (MIT, © Rich Tibbett). Used only where the Screen Wake Lock API can't be trusted.
+const NOSLEEP_MP4 = "data:video/mp4;base64,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";
+const makeNoSleepVideo = () => {
+  const v = document.createElement("video");
+  v.setAttribute("title", "No Sleep"); v.setAttribute("playsinline", ""); v.muted = true;
+  const src = document.createElement("source"); src.src = NOSLEEP_MP4; src.type = "video/mp4"; v.appendChild(src);
+  v.addEventListener("loadedmetadata", () => {
+    if (v.duration <= 1) v.setAttribute("loop", "");
+    else v.addEventListener("timeupdate", () => { if (v.currentTime > 0.5) v.currentTime = Math.random(); });
+  });
+  return v;
+};
+// iOS home-screen web apps before iOS 18.4: navigator.wakeLock exists and even resolves, but doesn't actually hold the screen.
+// (Can't detect that from the result, so detect the situation and go straight to the video.) Unknown version => assume legacy.
+const iosStandaloneLegacy = () => {
+  try {
+    const ua = navigator.userAgent || "";
+    const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    if (!isIOS || !navigator.standalone) return false;
+    const m = ua.match(/OS (\d+)[_.](\d+)/);
+    if (!m) return true;
+    return +m[1] < 18 || (+m[1] === 18 && +m[2] < 4);
+  } catch (e) { return false; }
+};
 // Avery 6468 — 2" × 4" ID labels, 10 per sheet (US Letter, portrait). Exact published geometry.
 const AVERY_6468 = { pageW: 8.5, pageH: 11, cols: 2, rows: 5, labelW: 4, labelH: 2, top: 0.5, left: 0.15625, hGut: 0.1875, vGut: 0 };
 const normalizeSlots = (sl) => (Array.isArray(sl) && sl.length && sl.every((s) => s && s.draft && Array.isArray(s.draft.flours)))
@@ -279,6 +308,35 @@ const trueHydration = (t) => {
   const totalWater = (+t.water || 0) + liq + levWater;
   return totalFlour > 0 ? (totalWater / totalFlour) * 100 : 0;
 };
+// Exact inverse of trueHydration: the water % (of flour) that makes the dough land on `target` true hydration,
+// given this recipe's levain % / levain hydration / liquids. Rounded to 0.1. Negative = target unreachable
+// (levain + liquids alone already exceed it).
+const waterForTargetHydration = (t, target) => {
+  const liq = (t.liquids || []).reduce((a, l) => a + (+l.pct || 0) * ((+l.factor || 100) / 100), 0);
+  const lev = +t.levain || 0, lh = +t.levHyd || 80, den = 100 + lh;
+  const levFlour = den > 0 ? lev * 100 / den : 0;
+  const levWater = den > 0 ? lev * lh / den : 0;
+  return Math.round((target * (100 + levFlour) / 100 - liq - levWater) * 10) / 10;
+};
+// Readout + "solve water for a target" control. Used in the recipe editor and on each Plan card.
+function HydrationLine({ t, onSetWater }) {
+  const [target, setTarget] = useState("");
+  const hyd = Math.round(trueHydration(t) * 10) / 10;
+  const tg = parseFloat(target);
+  const need = isFinite(tg) && tg > 0 ? waterForTargetHydration(t, tg) : null;
+  const unreachable = need !== null && need < 0;
+  const same = need !== null && Math.abs(need - (+t.water || 0)) < 0.05;
+  return (
+    <div className="bl-hyd-readout">
+      <span>True hydration <b>{hyd}%</b><span className="bl-hyd-note">incl. levain @ {+t.levHyd || 80}%</span></span>
+      <span className="bl-hyd-solve">
+        <input type="number" min="0" step="0.5" value={target} placeholder="target %" onChange={(e) => setTarget(e.target.value)} />
+        {need !== null && (unreachable ? <span className="bl-hyd-need bad">unreachable — levain alone is over</span> : <span className="bl-hyd-need">→ water {need}%</span>)}
+        <button disabled={need === null || unreachable || same} onClick={() => { onSetWater(need); setTarget(""); }}>Set water</button>
+      </span>
+    </div>
+  );
+}
 const RECIPE_FORMULA_KEYS = ["name","loafWeight","shape","water","salt","levain","levHyd","levInoc","levRefInoc","levBuildHrs","levRefTemp","levWhole","levExpNote","ddt","bakeTemp","bakeMin","steamMin","autolyse","calNote","bassinage","bassinagePct"];
 const sameIngList = (x, y, skipFirstPct) => {
   const xs = x || [], ys = y || [];
@@ -673,7 +731,7 @@ export default function App() {
     setMixWaterTemp(typeof d.mixWaterTemp === "number" ? d.mixWaterTemp : null);
     setCalcInputs(d.calcInputs && typeof d.calcInputs === "object" ? d.calcInputs : null);
   };
-  const openDay = (id) => { const e = days.find((x) => x.id === id); if (!e) return; loadDayVars(e.day || {}); setDayName(e.name || "Untitled"); setDayDate(e.date || todayISO()); setCurrentDayId(id); setTab("plan"); setActiveBatch(null); setDoneBatches([]); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
+  const openDay = (id) => { const e = days.find((x) => x.id === id); if (!e) return; loadDayVars(e.day || {}); setDayName(e.name || "Untitled"); setDayDate(e.date || todayISO()); setCurrentDayId(id); setTab("plan"); setActiveBatch(null); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
   const newDay = () => { const e = newDayEntry("New run", defaultDay()); setDays((ds) => { const nd = [e, ...ds]; persist(DAYS_KEY, nd); return nd; }); loadDayVars(e.day); setDayName(e.name); setDayDate(e.date); setCurrentDayId(e.id); setTab("plan"); setActiveBatch(null); setDoneBatches([]); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
   const dupDay = (id) => setDays((ds) => { const src = ds.find((d) => d.id === id); if (!src) return ds; const copy = { ...src, id: uid(), name: (src.name || "Run") + " (copy)", updatedAt: Date.now(), complete: false, day: JSON.parse(JSON.stringify(src.day || defaultDay())) }; const nd = [copy, ...ds]; persist(DAYS_KEY, nd); return nd; });
   const delDay = (id) => { setDays((ds) => { const nd = ds.filter((d) => d.id !== id); persist(DAYS_KEY, nd); return nd; }); if (currentDayId === id) { setCurrentDayId(null); setView("home"); } };
@@ -797,6 +855,20 @@ export default function App() {
             persist(DAYS_KEY, loadedDays);
           }
           setDays(loadedDays);
+          // reopen where THIS device left off (a home-screen launch is a cold start). Load the run's data first, flip the view last.
+          try {
+            const raw = localStorage.getItem(LASTLOC_KEY);
+            const loc = raw ? JSON.parse(raw) : null;
+            if (loc) {
+              if (HOME_TAB_KEYS.indexOf(loc.homeTab) !== -1) setHomeTab(loc.homeTab);
+              const ent = (loc.view === "editor" && loc.dayId) ? loadedDays.find((x) => x.id === loc.dayId) : null;
+              if (ent) {
+                loadDayVars(ent.day || {}); setDayName(ent.name || "Untitled"); setDayDate(ent.date || todayISO());
+                setCurrentDayId(ent.id); setTab(TAB_KEYS.indexOf(loc.tab) !== -1 ? loc.tab : "plan"); setActiveBatch(null);
+                setView("editor");
+              }
+            }
+          } catch (e) {}
         } else {
           setDays([newDayEntry("My first run", defaultDay())]);
         }
@@ -812,6 +884,52 @@ export default function App() {
     const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs };
     setDays((ds) => { const nd = ds.map((d) => (d.id === currentDayId ? { ...d, name: dayName, date: dayDate, updatedAt: Date.now(), day: snap } : d)); persist(DAYS_KEY, nd); return nd; });
   }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
+
+  // remember where this device is (only after boot has restored, so we never overwrite the saved spot with defaults)
+  useEffect(() => {
+    if (!loaded) return;
+    try { localStorage.setItem(LASTLOC_KEY, JSON.stringify({ view, dayId: currentDayId, tab, homeTab })); } catch (e) {}
+  }, [loaded, view, currentDayId, tab, homeTab]);
+
+  // stay awake: held only while the toggle is on AND you're on a run's Mix tab; releases when you leave or hide the app
+  const [stayAwake, setStayAwake] = useState(false);
+  const [wakeMode, setWakeMode] = useState(""); // "" | "lock" | "video" | "none"
+  const wakeSentinel = useRef(null), wakeVideo = useRef(null);
+  const wantAwake = stayAwake && view === "editor" && tab === "build";
+  useEffect(() => {
+    if (!wantAwake) return;
+    let cancelled = false;
+    const startVideo = async () => {
+      try {
+        if (!wakeVideo.current) wakeVideo.current = makeNoSleepVideo();
+        await wakeVideo.current.play();
+        if (!cancelled) setWakeMode("video");
+        return true;
+      } catch (e) { return false; }
+    };
+    const acquire = async () => {
+      if (cancelled || document.visibilityState !== "visible") return;
+      if (wakeSentinel.current && !wakeSentinel.current.released) return; // already holding
+      if (!iosStandaloneLegacy() && "wakeLock" in navigator) {
+        try {
+          const sent = await navigator.wakeLock.request("screen");
+          if (cancelled) { try { sent.release(); } catch (e) {} return; }
+          wakeSentinel.current = sent; setWakeMode("lock"); return;
+        } catch (e) { /* fall through to the video */ }
+      }
+      if (!(await startVideo()) && !cancelled) setWakeMode("none");
+    };
+    acquire();
+    const onVis = () => { if (document.visibilityState === "visible") acquire(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      cancelled = true; document.removeEventListener("visibilitychange", onVis);
+      try { if (wakeSentinel.current) wakeSentinel.current.release(); } catch (e) {}
+      wakeSentinel.current = null;
+      try { if (wakeVideo.current) wakeVideo.current.pause(); } catch (e) {}
+      setWakeMode("");
+    };
+  }, [wantAwake]);
 
   const distribute = (s) => { setStagger(s); setOffsets(Array.from({ length: totalBatches }, (_, b) => b * s)); };
 
@@ -1586,7 +1704,18 @@ export default function App() {
         .liq-cell{display:flex;align-items:center;gap:3px;}
         .liq-cell input{width:54px;font-family:'JetBrains Mono';font-size:13px;padding:5px 6px;border:1px solid var(--line);border-radius:6px;text-align:right;background:#fff;color:var(--ink);}
         .liq-cell em{font-size:10px;color:var(--ink2);font-style:normal;white-space:nowrap;}
-        .bl-hyd-readout{margin:8px 0 4px;padding:8px 12px;background:#eef4f6;border:1px solid #cfe0e6;border-radius:8px;font-family:'JetBrains Mono';font-size:13px;color:#1f6f86;}
+        .bl-hyd-readout{margin:8px 0 4px;padding:8px 12px;background:#eef4f6;border:1px solid #cfe0e6;border-radius:8px;font-family:'JetBrains Mono';font-size:13px;color:#1f6f86;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 14px;}
+        .bl-hyd-solve{display:flex;align-items:center;gap:7px;flex-wrap:wrap;}
+        .bl-hyd-solve input{width:76px;font-family:'JetBrains Mono';font-size:12px;padding:4px 7px;border:1.5px solid #cfe0e6;border-radius:6px;background:#fff;color:var(--ink);text-align:right;}
+        .bl-hyd-need{font-size:12px;color:#155;}
+        .bl-hyd-need.bad{color:var(--alert);font-family:'DM Sans';font-size:11px;}
+        .bl-hyd-solve button{font-family:'DM Sans';font-size:12px;font-weight:600;padding:5px 11px;border-radius:7px;border:1.5px solid #1f6f86;background:#1f6f86;color:#fff;cursor:pointer;}
+        .bl-hyd-solve button:disabled{opacity:.4;cursor:default;}
+        .bl-mixwater-btn.awake{background:transparent;color:var(--ink);border:1.5px solid var(--line);}
+        .bl-mixwater-btn.awake:hover{background:var(--paper);}
+        .bl-mixwater-btn.awake.on{background:var(--crust);color:#fff;border-color:var(--crust2);}
+        .bl-awake-note{margin:-6px 0 12px;font-size:12px;color:var(--ink2);line-height:1.4;}
+        .bl-awake-note.bad{color:var(--alert);}
         .bl-hyd-readout b{font-size:15px;color:#155;}
         .bl-hyd-note{font-family:'DM Sans';font-size:10.5px;color:var(--ink2);margin-left:6px;}
         .brc-ai{margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);}
@@ -2226,7 +2355,7 @@ export default function App() {
                   </div>
                 ))}
                 <button className="bl-add" onClick={addEditLiq}>+ Liquid</button>
-                <div className="bl-hyd-readout">Total hydration <b>{Math.round(trueHydration(editingDraft) * 10) / 10}%</b> <span className="bl-hyd-note">true water · incl. levain</span></div>
+                <HydrationLine t={editingDraft} onSetWater={(w) => patchEdit({ water: w })} />
                 <div className="bl-subhead">Inclusions</div>
                 {(editingDraft.inclusions || []).map((f, idx) => (
                   <div className="ing-row" key={f.id}>
@@ -2272,7 +2401,7 @@ export default function App() {
                     </div>
                     <div className="brc-body">
                       <div className="brc-meta">{r.flours && r.flours.map((f, i) => (i === 0 ? `${Math.max(0, 100 - (r.flours.slice(1).reduce((a, x) => a + (+x.pct || 0), 0)))}% ${f.name}` : `${f.pct}% ${f.name}`)).join(" · ")}</div>
-                      <div className="brc-meta">{r.loafWeight}g · {r.water}% water · {r.levain}% levain</div>
+                      <div className="brc-meta">{r.loafWeight}g · {r.water}% water · {r.levain}% levain @ {r.levHyd ?? 80}% · <b>{Math.round(trueHydration(r) * 10) / 10}% true hyd</b></div>
                       <div className="brc-ai" onClick={(e) => e.stopPropagation()}>
                         <div className="brc-ai-row">
                           <label>loaves <input type="number" min="1" value={aiLoaves[r.id] ?? 24} onChange={(e) => setAiLoaves((st) => ({ ...st, [r.id]: Math.max(1, Number(e.target.value) || 1) }))} /></label>
@@ -2305,7 +2434,7 @@ export default function App() {
                       <button className="brc-del" onClick={(e) => { e.stopPropagation(); setDelTarget({ id: r.id, name: r.name, kind: "remix" }); }}>×</button>
                     </div>
                     <div className="brc-body">
-                      <div className="brc-meta">{r.loafWeight}g · {r.water}% water · {r.levain}% levain</div>
+                      <div className="brc-meta">{r.loafWeight}g · {r.water}% water · {r.levain}% levain @ {r.levHyd ?? 80}% · <b>{Math.round(trueHydration(r) * 10) / 10}% true hyd</b></div>
                       <div className="brc-acts">
                         <button className="brc-promote" onClick={(e) => { e.stopPropagation(); promoteRemixToCore(r.id); }}>↑ Core</button>
                       </div>
@@ -2593,6 +2722,7 @@ export default function App() {
                   <div className="bl-lev-exp"><label>Levain flour / experiment note</label><BufferedInput className="bl-lev-expnote" value={t.levExpNote || ""} onCommit={(v) => setDraft(ti, { levExpNote: v })} placeholder="e.g. straight bread flour · or 5% rye pre-ferment" /></div>
                   <div className="bl-lev-hint">Timing, water temp and the build recipe are computed on the <b>Levain</b> tab from {starter.name}'s calibration.</div>
                 </div>
+                <HydrationLine t={t} onSetWater={(w) => setFixed(ti, "water", w)} />
 
                 <div className="bl-subhead">Inclusions</div>
                 {t.inclusions.length === 0 && <div className="ing-empty">No inclusions</div>}
@@ -2935,10 +3065,22 @@ export default function App() {
               <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8" rx="1"/></svg>
               Print labels
             </button>
+            <button className={"bl-mixwater-btn awake" + (stayAwake ? " on" : "")} aria-pressed={stayAwake} onClick={() => setStayAwake((v) => !v)}>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+              Stay awake{stayAwake ? ": on" : ""}
+            </button>
             {mixWaterTemp != null && (
               <span className="bl-mixwater-cur">Mix water <b>{showTemp(mixWaterTemp)}</b><button onClick={() => setMixWaterTemp(null)} title="Clear" aria-label="Clear mix water">×</button></span>
             )}
           </div>
+          {stayAwake && (
+            <div className={"bl-awake-note" + (wakeMode === "none" ? " bad" : "")}>
+              {wakeMode === "lock" && "Screen stays on while this page is open."}
+              {wakeMode === "video" && "Screen stays on while this page is open (compatibility mode)."}
+              {wakeMode === "" && "Starting…"}
+              {wakeMode === "none" && "Couldn’t keep the screen on from here. On iPhone: Settings › Display & Brightness › Auto-Lock › Never, while you mix."}
+            </div>
+          )}
           <h3>Batch builds · Autolyse — tap a batch to focus</h3>
           {baseDoughGroups.length > 0 && (
             <div className="bl-basedough">
@@ -2991,7 +3133,7 @@ export default function App() {
               })}
             </div>
           </>)}
-          <div className="bl-note">Tap a batch to scale it up and focus; “Done” greys it and jumps to the next. Weights in grams (raw); times follow the Planning schedule. Levain counts by weight, so true hydration sits a touch above the water %.</div>
+          <div className="bl-note">Tap a batch to scale it up and focus; “Done” greys it and jumps to the next. Weights in grams (raw); times follow the Planning schedule. The water % is the water line only. Levain adds its own flour and water, so true hydration moves the other way from a stiff levain: wetter than your water line raises it, stiffer lowers it. Each recipe’s true hydration is on its Plan card and in the editor.</div>
           {calcOpen && <DoughTempCalc tempUnit={tempUnit} uToC={uToC} cToU={cToU} initial={calcInputs} current={mixWaterTemp} onApply={(c, inputs) => { setMixWaterTemp(c); setCalcInputs(inputs); }} onClose={() => setCalcOpen(false)} />}
         </div>
       )}
