@@ -28,11 +28,12 @@ const cloneRecipe = (r) => ({
   bassinage: !!r.bassinage,
   bassinagePct: r.bassinagePct ?? 8,
   notes: r.notes || "",
+  price: r.price ?? 0,
   flours: r.flours.map((f) => mk(f.name, f.pct)),
   inclusions: r.inclusions.map((f) => mk(f.name, f.pct)),
   liquids: (r.liquids || []).map((l) => mkL(l.name, l.pct, l.factor ?? 100)),
 });
-const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", inclusions: [], liquids: [] });
+const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", price: 0, inclusions: [], liquids: [] });
 
 // date helpers — defined early because DEFAULT_SLOTS uses them at module-eval time
 const todayISO = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
@@ -50,6 +51,266 @@ const buildRunName = (mixISO, nBakeDays) => {
 };
 const sessionLoaves = (slot, si) => { const ss = slot.sessions || []; if (si === 0) return Math.max(0, (slot.loaves || 0) - ss.slice(1).reduce((a, s) => a + Math.max(0, +(s.loaves) || 0), 0)); return Math.max(0, +(ss[si] && ss[si].loaves) || 0); };
 const remixName = (base, iso) => { const [y, m, d] = (iso || todayISO()).split("-"); return `${(base || "Recipe").replace(/\s+/g, "_")}_remix_${d}${m}${y.slice(2)}`; };
+// ===========================================================================
+// Pantry: ingredient prices + stock  ->  cost per loaf, shortage flags, run profit
+// ===========================================================================
+// Everything is converted to a BASE unit: grams (mass and volume, volume via density) or "each".
+// Stock and reorder points are stored in base units and shown in the item's own pack unit.
+const MASS_G = { g: 1, kg: 1000, lb: 453.592, oz: 28.3495 };
+const VOL_ML = { mL: 1, L: 1000 };
+const PACK_UNITS = ["kg", "g", "lb", "oz", "L", "mL", "each"];
+const normName = (s) => String(s == null ? "" : s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+const blankPantryItem = (name) => ({ id: uid(), name: name || "New item", aliases: "", packSize: 0, packUnit: "kg", packPrice: 0, density: 1, onHandBase: 0, reorderBase: 0, leadDays: 0, supplier: "", usage: "recipe", perLoafQty: 0, perRunQty: 0 });
+const unitBase = (it) => (it.packUnit === "each" ? 1 : MASS_G[it.packUnit] ? MASS_G[it.packUnit] : VOL_ML[it.packUnit] ? VOL_ML[it.packUnit] * (+it.density || 1) : 0);
+const packBase = (it) => (+it.packSize || 0) * unitBase(it);
+const costPerBase = (it) => { const pb = packBase(it); return pb > 0 && +it.packPrice > 0 ? (+it.packPrice) / pb : 0; };
+const pantryFind = (pantry, name) => {
+  const n = normName(name); if (!n) return null;
+  return pantry.find((it) => normName(it.name) === n || String(it.aliases || "").split(/[,;]/).some((a) => normName(a) === n)) || null;
+};
+const money = (x) => { const v = Math.round((+x || 0) * 100) / 100; return (v < 0 ? "−" : "") + "$" + Math.abs(v).toFixed(2); };
+// Show a quantity in the item's pack unit, but drop to the finer unit under one pack unit (0.05 kg of salt is "52 g").
+const qtyText = (base, it) => {
+  if (it.packUnit === "each") return (Math.round(base * 10) / 10) + " ea";
+  const u = unitBase(it) || 1, v = base / u;
+  if (v >= 1 || !(base > 0)) return (v >= 100 ? Math.round(v) : Math.round(v * 100) / 100) + " " + it.packUnit;
+  if (it.packUnit === "kg") return Math.round(base) + " g";
+  if (it.packUnit === "L") return Math.round(v * 1000) + " mL";
+  if (it.packUnit === "lb") return (Math.round(v * 16 * 10) / 10) + " oz";
+  return (Math.round(v * 100) / 100) + " " + it.packUnit;
+};
+
+// Cost + demand for the open run. Pure: everything it needs is an argument.
+//  - dough lines (flours, liquids, salt, inclusions) come from the batch weigh-outs (buffers included, so waste is costed)
+//  - the "Levain" line is NOT an ingredient: the flour in the levain BUILD (plus the starter seed's flour) is, and it is
+//    assigned to the pantry items chosen in settings (white / whole-grain), split across recipes by their levain share
+//  - water is free; packaging is per-loaf or per-run; kitchen rental is spread per loaf
+//  - anything not in the pantry, or without a price, is reported as missing and lowers the coverage figure
+const computeRunCosts = ({ plan, types, builds, pantry, settings, refHyd, rentalHours, rentalRate, sold }) => {
+  const per = types.map(() => ({ use: {}, unmatched: {} }));
+  const loavesOf = (ti) => (plan.summaries[ti] ? plan.summaries[ti].loaves : 0);
+  const byId = {}; pantry.forEach((it) => { byId[it.id] = it; });
+  const addUse = (ti, name, g) => {
+    if (!(g > 0) || normName(name) === "water") return;
+    const it = pantryFind(pantry, name);
+    if (it) per[ti].use[it.id] = (per[ti].use[it.id] || 0) + g;
+    else per[ti].unmatched[name] = (per[ti].unmatched[name] || 0) + g;
+  };
+  plan.list.forEach((b) => {
+    const t = types[b.ti]; if (!t) return;
+    ingLines(t).forEach((l) => {
+      const g = b.weights[l.key] || 0;
+      if (l.key.indexOf("fl_") === 0 || l.key.indexOf("in_") === 0 || l.key.indexOf("lq_") === 0 || l.key === "salt") addUse(b.ti, l.name, g);
+    });
+  });
+  (builds || []).forEach((bd) => {
+    const sumLev = bd.items.reduce((a, x) => a + x.levW, 0);
+    if (!(sumLev > 0)) return;
+    const flour = bd.flourL + bd.seedL * 100 / (100 + (+refHyd || 80));
+    const w = Math.max(0, Math.min(100, +bd.whole || 0)) / 100;
+    bd.items.forEach((x) => {
+      const b = plan.list[x.gi]; if (!b) return;
+      const share = x.levW / sumLev;
+      [[flour * (1 - w) * share, settings.levainWhiteId, "Levain flour"], [flour * w * share, settings.levainWholeId, "Levain flour (whole grain)"]].forEach(([g, id, label]) => {
+        if (!(g > 0)) return;
+        const it = id ? byId[id] : null;
+        if (it) per[b.ti].use[it.id] = (per[b.ti].use[it.id] || 0) + g;
+        else per[b.ti].unmatched[label] = (per[b.ti].unmatched[label] || 0) + g;
+      });
+    });
+  });
+  const totalLoaves = types.reduce((a, _, ti) => a + loavesOf(ti), 0);
+  pantry.forEach((it) => {
+    if (it.usage === "perLoaf" && +it.perLoafQty > 0) types.forEach((_, ti) => { const lv = loavesOf(ti); if (lv > 0) per[ti].use[it.id] = (per[ti].use[it.id] || 0) + it.perLoafQty * lv; });
+    else if (it.usage === "perRun" && +it.perRunQty > 0 && totalLoaves > 0) types.forEach((_, ti) => { const lv = loavesOf(ti); if (lv > 0) per[ti].use[it.id] = (per[ti].use[it.id] || 0) + it.perRunQty * lv / totalLoaves; });
+  });
+  const rate = +rentalRate || 0, hours = +rentalHours || 0, rentalTotal = rate * hours;
+  const items = {}, missing = {}; let totalG = 0, pricedG = 0;
+  const noteMissing = (name, g, reason) => { const m = missing[name] || (missing[name] = { name, grams: 0, reason }); m.grams += g; };
+  const recipes = types.map((t, ti) => {
+    const loaves = loavesOf(ti);
+    let ing = 0, pkg = 0;
+    Object.keys(per[ti].use).forEach((id) => {
+      const it = byId[id], q = per[ti].use[id], cpb = costPerBase(it), c = q * cpb;
+      if (it.usage === "recipe") { ing += c; totalG += q; if (cpb > 0) pricedG += q; else noteMissing(it.name, q, "no price"); }
+      else { pkg += c; if (!(cpb > 0)) noteMissing(it.name, q, "no price"); }
+      const a = items[id] || (items[id] = { id, name: it.name, base: it.packUnit === "each" ? "each" : "g", qty: 0, cost: 0 });
+      a.qty += q; a.cost += c;
+    });
+    Object.keys(per[ti].unmatched).forEach((name) => { const g = per[ti].unmatched[name]; totalG += g; noteMissing(name, g, "not in Pantry"); });
+    const rental = totalLoaves > 0 ? rentalTotal * loaves / totalLoaves : 0;
+    const cost = ing + pkg + rental;
+    const hasSold = sold && sold[ti] !== undefined && sold[ti] !== null && sold[ti] !== "";
+    const soldN = hasSold ? Math.max(0, +sold[ti] || 0) : loaves;
+    const price = +(t && t.price) || 0;
+    const revenue = soldN * price;
+    const pl = loaves > 0 ? loaves : 1;
+    return { ti, name: t.name, loaves, sold: soldN, price, ing, pkg, rental, cost, perLoaf: cost / pl, ingPerLoaf: ing / pl, pkgPerLoaf: pkg / pl, rentalPerLoaf: rental / pl, revenue, margin: revenue - cost };
+  }).filter((r) => r.loaves > 0);
+  const sum = (k) => recipes.reduce((a, r) => a + r[k], 0);
+  const totals = { ing: sum("ing"), pkg: sum("pkg"), rental: sum("rental"), cost: sum("cost"), revenue: sum("revenue"), margin: sum("margin"), loaves: sum("loaves"), sold: sum("sold") };
+  const demand = {}; Object.keys(items).forEach((id) => { demand[id] = items[id].qty; });
+  return { recipes, items: Object.keys(items).map((id) => items[id]), missing: Object.keys(missing).map((k) => missing[k]), coverage: totalG > 0 ? pricedG / totalG : 1, totals, demand, inputs: { rentalHours: hours, rate }, rentalTotal };
+};
+
+// Shortage flags: need (run demand) vs have (counted stock). short = can't cover the run; low = covers it but ends below the
+// reorder point. buy = enough packs to cover the run AND restore the reorder point. orderBy = mix day minus supplier lead time.
+const stockCheck = (demand, pantry, mixISO, nowISO) => {
+  const rows = [];
+  pantry.forEach((it) => {
+    const need = demand[it.id] || 0; if (!(need > 0)) return;
+    const have = +it.onHandBase || 0, reorder = +it.reorderBase || 0, after = have - need;
+    const status = need > have + 1e-9 ? "short" : (after < reorder - 1e-9 ? "low" : "ok");
+    const buyBase = status === "ok" ? 0 : need + reorder - have;
+    const pb = packBase(it);
+    const packs = buyBase > 0 && pb > 0 ? Math.ceil(buyBase / pb - 1e-9) : 0;
+    const orderBy = (status === "ok" || !mixISO) ? "" : addDaysISO(mixISO, -(+it.leadDays || 0));
+    rows.push({ id: it.id, item: it, need, have, after, status, buyBase, packs, orderBy, overdue: !!orderBy && orderBy < nowISO });
+  });
+  const rank = { short: 0, low: 1, ok: 2 };
+  return rows.sort((a, b) => (rank[a.status] - rank[b.status]) || String(a.item.name).localeCompare(String(b.item.name)));
+};
+
+function PantryTab({ pantry, setPantry, costSettings, setCostSettings, coreRecipes }) {
+  const patch = (id, p) => setPantry((ps) => ps.map((it) => (it.id === id ? { ...it, ...p } : it)));
+  const remove = (id) => setPantry((ps) => ps.filter((it) => it.id !== id));
+  const num = (v) => Math.max(0, Number(v) || 0);
+  const sel = (e) => e.target.select();
+  const disp = (base, it) => { const u = unitBase(it) || 1; return Math.round((base / u) * 1000) / 1000; };
+  const recipeItems = pantry.filter((it) => it.usage === "recipe");
+  const fromRecipes = useMemo(() => {
+    const names = {}; const add = (n) => { const k = normName(n); if (k && k !== "water" && !names[k]) names[k] = String(n).trim(); };
+    add("Salt");
+    (coreRecipes || []).forEach((r) => { (r.flours || []).forEach((x) => add(x.name)); (r.inclusions || []).forEach((x) => add(x.name)); (r.liquids || []).forEach((x) => add(x.name)); });
+    return Object.keys(names).filter((k) => !pantryFind(pantry, names[k])).map((k) => names[k]);
+  }, [coreRecipes, pantry]);
+  const setSetting = (p) => setCostSettings((cs) => ({ ...cs, ...p }));
+  return (
+    <div className="bl-panel">
+      <h3>Pantry — ingredient prices &amp; stock</h3>
+      <div className="pt-card">
+        <div className="pt-h">Kitchen &amp; levain</div>
+        <div className="pt-row">
+          <label className="pt-f"><span>Kitchen rental ($ / hour)</span><input data-f="rentalRate" type="number" min="0" step="0.5" value={costSettings.rentalRate ?? 0} onFocus={sel} onChange={(e) => setSetting({ rentalRate: num(e.target.value) })} /></label>
+          <label className="pt-f"><span>Levain fed with (white)</span>
+            <select data-f="levainWhite" value={costSettings.levainWhiteId || ""} onChange={(e) => setSetting({ levainWhiteId: e.target.value })}>
+              <option value="">— not set —</option>{recipeItems.map((it) => <option key={it.id} value={it.id}>{it.name}</option>)}
+            </select></label>
+          <label className="pt-f"><span>Levain fed with (whole grain)</span>
+            <select data-f="levainWhole" value={costSettings.levainWholeId || ""} onChange={(e) => setSetting({ levainWholeId: e.target.value })}>
+              <option value="">— not set —</option>{recipeItems.map((it) => <option key={it.id} value={it.id}>{it.name}</option>)}
+            </select></label>
+        </div>
+        <div className="pt-hint">The levain you build is real flour. Pick what it is fed with so costs and stock include it. Water is treated as free.</div>
+      </div>
+      <div className="pt-bar">
+        <button className="bl-add" data-f="addItem" onClick={() => setPantry((ps) => [...ps, blankPantryItem("New item")])}>+ Item</button>
+        {fromRecipes.length > 0 && <button className="bl-add" data-f="addFromRecipes" onClick={() => setPantry((ps) => [...ps, ...fromRecipes.map((n) => blankPantryItem(n))])}>Add {fromRecipes.length} from my recipes</button>}
+      </div>
+      {pantry.length === 0 && <div className="pt-empty">Nothing here yet. “Add from my recipes” creates an item for every flour, liquid and inclusion you already use. Then fill in pack size and price.</div>}
+      {pantry.map((it) => {
+        const cpb = costPerBase(it);
+        const perTxt = cpb > 0 ? money(cpb * (it.packUnit === "each" ? 1 : 1000)) + (it.packUnit === "each" ? " each" : " / kg") : "no price yet";
+        const isVol = !!VOL_ML[it.packUnit];
+        const bl = it.packUnit === "each" ? "ea" : "g";
+        return (
+          <div className={"pt-card item" + (cpb > 0 || it.usage !== "recipe" ? "" : " nopr")} key={it.id} data-item={it.name}>
+            <div className="pt-top">
+              <BufferedInput className="pt-name" value={it.name} onCommit={(v) => patch(it.id, { name: v })} placeholder="Ingredient name" />
+              <span className={"pt-per" + (cpb > 0 ? "" : " bad")}>{perTxt}</span>
+              <button className="ing-x" title="Remove" onClick={() => remove(it.id)}>×</button>
+            </div>
+            <div className="pt-row">
+              <label className="pt-f sm"><span>Pack size</span><input data-f="packSize" type="number" min="0" step="any" value={it.packSize} onFocus={sel} onChange={(e) => patch(it.id, { packSize: num(e.target.value) })} /></label>
+              <label className="pt-f sm"><span>Unit</span><select data-f="packUnit" value={it.packUnit} onChange={(e) => patch(it.id, { packUnit: e.target.value })}>{PACK_UNITS.map((u) => <option key={u} value={u}>{u}</option>)}</select></label>
+              <label className="pt-f sm"><span>Pack price ($)</span><input data-f="packPrice" type="number" min="0" step="any" value={it.packPrice} onFocus={sel} onChange={(e) => patch(it.id, { packPrice: num(e.target.value) })} /></label>
+              {isVol && <label className="pt-f sm"><span>Density g/mL</span><input data-f="density" type="number" min="0" step="0.01" value={it.density} onFocus={sel} onChange={(e) => patch(it.id, { density: num(e.target.value) })} /></label>}
+            </div>
+            <div className="pt-row">
+              <label className="pt-f sm"><span>On hand ({it.packUnit})</span><input data-f="onHand" type="number" min="0" step="any" value={disp(it.onHandBase, it)} onFocus={sel} onChange={(e) => patch(it.id, { onHandBase: num(e.target.value) * (unitBase(it) || 1) })} /></label>
+              <label className="pt-f sm"><span>Reorder at ({it.packUnit})</span><input data-f="reorder" type="number" min="0" step="any" value={disp(it.reorderBase, it)} onFocus={sel} onChange={(e) => patch(it.id, { reorderBase: num(e.target.value) * (unitBase(it) || 1) })} /></label>
+              <label className="pt-f sm"><span>Lead time (days)</span><input data-f="lead" type="number" min="0" step="1" value={it.leadDays} onFocus={sel} onChange={(e) => patch(it.id, { leadDays: num(e.target.value) })} /></label>
+              <label className="pt-f"><span>Supplier</span><input data-f="supplier" type="text" value={it.supplier || ""} onChange={(e) => patch(it.id, { supplier: e.target.value })} /></label>
+            </div>
+            <div className="pt-row">
+              <label className="pt-f sm"><span>Used as</span>
+                <select data-f="usage" value={it.usage} onChange={(e) => patch(it.id, { usage: e.target.value })}>
+                  <option value="recipe">Recipe ingredient</option><option value="perLoaf">Per loaf (packaging)</option><option value="perRun">Per run (consumable)</option>
+                </select></label>
+              {it.usage === "perLoaf" && <label className="pt-f sm"><span>Per loaf ({bl})</span><input data-f="perLoaf" type="number" min="0" step="any" value={it.perLoafQty} onFocus={sel} onChange={(e) => patch(it.id, { perLoafQty: num(e.target.value) })} /></label>}
+              {it.usage === "perRun" && <label className="pt-f sm"><span>Per run ({bl})</span><input data-f="perRun" type="number" min="0" step="any" value={it.perRunQty} onFocus={sel} onChange={(e) => patch(it.id, { perRunQty: num(e.target.value) })} /></label>}
+              <label className="pt-f"><span>Also matches (recipe names)</span><input data-f="aliases" type="text" value={it.aliases || ""} placeholder="e.g. AP flour, unbleached" onChange={(e) => patch(it.id, { aliases: e.target.value })} /></label>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function CostsTab({ res, locked, lockedAt, hours, setHours, rate, setRate, defaultRate, setSold, setPrice, onLock, onUnlock, deduction, onDeduct, onUndo, onOpenPantry, pantryCount }) {
+  const [confirm, setConfirm] = useState(false);
+  const T = res.totals, cov = Math.round(res.coverage * 100);
+  const marginPct = T.revenue > 0 ? (T.margin / T.revenue) * 100 : null;
+  const qty = (a) => a.base === "each" ? (Math.round(a.qty * 10) / 10) + " ea" : (a.qty >= 1000 ? (a.qty / 1000).toFixed(2) + " kg" : Math.round(a.qty) + " g");
+  return (
+    <div className="bl-panel">
+      <h3>Run costs &amp; profit</h3>
+      {locked && <div className="cs-lock">Locked {new Date(lockedAt).toLocaleDateString()} — prices and numbers are frozen for this run. <button data-f="unlock" onClick={onUnlock}>Unlock</button></div>}
+      {res.recipes.length === 0 ? <div className="cs-empty">No loaves in this run yet.</div> : (<>
+        <div className="cs-stats">
+          <div className="cs-stat"><div className="v" data-k="revenue">{money(T.revenue)}</div><div className="l">Revenue</div></div>
+          <div className="cs-stat"><div className="v" data-k="cost">{money(T.cost)}</div><div className="l">Total cost</div></div>
+          <div className={"cs-stat" + (T.margin < 0 ? " neg" : "")}><div className="v" data-k="margin">{money(T.margin)}</div><div className="l">Margin</div></div>
+          <div className="cs-stat"><div className="v" data-k="marginPct">{marginPct === null ? "—" : Math.round(marginPct * 10) / 10 + "%"}</div><div className="l">Margin %</div></div>
+        </div>
+        <div className="cs-note">Margin is after kitchen rental, before your own time. Cost per loaf is across all {T.loaves} loaves in the run ({money(T.cost / Math.max(1, T.loaves))} blended).</div>
+        {(res.missing.length > 0 || cov < 100) && (
+          <div className="cs-warn" data-k="coverage">
+            Costs cover {cov}% of ingredient weight. Not counted: {res.missing.map((m) => m.name + " (" + m.reason + ")").join(", ")}.
+            <button onClick={onOpenPantry}>Open Pantry</button>
+          </div>
+        )}
+        <div className="cs-inputs">
+          <label className="pt-f sm"><span>Kitchen hours</span><input data-f="hours" type="number" min="0" step="0.25" value={hours} disabled={locked} onFocus={(e) => e.target.select()} onChange={(e) => setHours(Math.max(0, Number(e.target.value) || 0))} /></label>
+          <label className="pt-f sm"><span>Rate ($/h)</span><input data-f="rate" type="number" min="0" step="0.5" value={rate == null ? "" : rate} placeholder={String(defaultRate || 0)} disabled={locked} onFocus={(e) => e.target.select()} onChange={(e) => setRate(e.target.value === "" ? null : Math.max(0, Number(e.target.value) || 0))} /></label>
+          <div className="cs-rental">Rental {money(res.rentalTotal)}</div>
+        </div>
+        {res.recipes.map((r) => (
+          <div className="cs-recipe" key={r.ti} data-recipe={r.name}>
+            <div className="cs-rhead"><span className="cs-rname">{r.name}</span><span className="cs-rloaves">{r.loaves} loaves</span></div>
+            <div className="cs-rin">
+              <label className="pt-f sm"><span>Sold</span><input data-f="sold" type="number" min="0" value={r.sold} disabled={locked} onFocus={(e) => e.target.select()} onChange={(e) => setSold(r.ti, Math.max(0, Number(e.target.value) || 0))} /></label>
+              <label className="pt-f sm"><span>Wholesale $ / loaf</span><input data-f="price" type="number" min="0" step="0.25" value={r.price} disabled={locked} onFocus={(e) => e.target.select()} onChange={(e) => setPrice(r.ti, Math.max(0, Number(e.target.value) || 0))} /></label>
+            </div>
+            <div className="cs-lines">
+              <div><span>Ingredients</span><b data-k="ingPerLoaf">{money(r.ingPerLoaf)}</b></div>
+              {r.pkg > 0 && <div><span>Packaging</span><b>{money(r.pkgPerLoaf)}</b></div>}
+              {r.rental > 0 && <div><span>Kitchen rental</span><b>{money(r.rentalPerLoaf)}</b></div>}
+              <div className="tot"><span>Cost / loaf</span><b data-k="perLoaf">{money(r.perLoaf)}</b></div>
+              <div className="m"><span>Margin / loaf at this price</span><b>{money(r.price - r.perLoaf)}</b></div>
+            </div>
+            <div className="cs-rfoot">Revenue {money(r.revenue)} · cost {money(r.cost)} · margin <b data-k="rmargin">{money(r.margin)}</b></div>
+          </div>
+        ))}
+        {res.items.length > 0 && (
+          <details className="cs-items"><summary>Where the cost goes</summary>
+            {res.items.slice().sort((a, b) => b.cost - a.cost).map((a) => <div className="cs-item" key={a.id}><span>{a.name}</span><span>{qty(a)}</span><b>{money(a.cost)}</b></div>)}
+          </details>
+        )}
+      </>)}
+      <div className="cs-actions">
+        {!locked ? <button className="cs-btn" data-f="lock" onClick={onLock}>Lock this analysis</button> : null}
+        {!deduction ? (
+          confirm
+            ? <><span className="cs-confirm">Subtract this run’s ingredients from your counts?</span><button className="cs-btn" data-f="deductYes" onClick={() => { onDeduct(); setConfirm(false); }}>Yes, deduct</button><button className="cs-btn ghost" onClick={() => setConfirm(false)}>Cancel</button></>
+            : <button className="cs-btn alt" data-f="deduct" disabled={pantryCount === 0 || res.recipes.length === 0} onClick={() => setConfirm(true)}>Deduct this run from stock</button>
+        ) : <span className="cs-deducted" data-k="deducted">Deducted from stock {new Date(deduction.at).toLocaleDateString()} <button data-f="undo" onClick={onUndo}>Undo</button></span>}
+      </div>
+    </div>
+  );
+}
+
 function HapLogo({ className }) {
   return (
     <svg className={className} viewBox="0 0 632.42 166.2" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="House au Pain" fill="currentColor">
@@ -195,8 +456,8 @@ const DEFAULT_STARTER = {
 };
 const DAYS_KEY = "bakelab-days-v1";
 const LASTLOC_KEY = "bakelab-lastloc-v1"; // per-DEVICE (localStorage): where this device was last, so a home-screen launch reopens there
-const TAB_KEYS = ["plan", "prep", "levain", "safety", "build", "fold", "bake", "timers"];
-const HOME_TAB_KEYS = ["bakedays", "recipes", "starter"];
+const TAB_KEYS = ["plan", "prep", "levain", "safety", "build", "fold", "bake", "timers", "costs"];
+const HOME_TAB_KEYS = ["bakedays", "recipes", "pantry", "starter"];
 
 // ---- stay awake -----------------------------------------------------------
 // Keep-awake video adapted from NoSleep.js (MIT, © Rich Tibbett). Used only where the Screen Wake Lock API can't be trusted.
@@ -250,7 +511,7 @@ const normalizeFoodSafety = (fs) => {
     })),
   };
 };
-const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
+const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, rentalHours: 0, rentalRate: null, soldLoaves: {}, costLock: null, deduction: null, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
 const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), complete: false, day: day || defaultDay() });
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
@@ -609,6 +870,13 @@ export default function App() {
   const [levBufferPct, setLevBufferPct] = useState({});
   const [doughBuffer, setDoughBuffer] = useState(false);
   const [doughBufferPct, setDoughBufferPct] = useState(4);
+  const [pantry, setPantry] = useState([]);
+  const [costSettings, setCostSettings] = useState({ rentalRate: 0, levainWhiteId: "", levainWholeId: "" });
+  const [rentalHours, setRentalHours] = useState(0);
+  const [rentalRate, setRentalRate] = useState(null); // null = use the Pantry default rate
+  const [soldLoaves, setSoldLoaves] = useState({});
+  const [costLock, setCostLock] = useState(null);     // { at, result } — frozen analysis for this run
+  const [deduction, setDeduction] = useState(null);   // { at, lines:[{id, qty}] } — what this run took out of stock
   const [foodSafety, setFoodSafety] = useState(defaultFoodSafety());
   const addFridge = () => setFoodSafety((fs) => ({ ...fs, fridges: [...fs.fridges, newFridge("Fridge " + (fs.fridges.length + 1))] }));
   const removeFridge = (fi) => setFoodSafety((fs) => ({ ...fs, fridges: fs.fridges.filter((_, i) => i !== fi) }));
@@ -726,6 +994,11 @@ export default function App() {
     setLevBufferPct(d.levBufferPct && typeof d.levBufferPct === "object" ? d.levBufferPct : {});
     setDoughBuffer(!!d.doughBuffer);
     setDoughBufferPct(typeof d.doughBufferPct === "number" ? d.doughBufferPct : 4);
+    setRentalHours(typeof d.rentalHours === "number" ? d.rentalHours : 0);
+    setRentalRate(typeof d.rentalRate === "number" ? d.rentalRate : null);
+    setSoldLoaves(d.soldLoaves && typeof d.soldLoaves === "object" ? d.soldLoaves : {});
+    setCostLock(d.costLock && typeof d.costLock === "object" ? d.costLock : null);
+    setDeduction(d.deduction && typeof d.deduction === "object" ? d.deduction : null);
     setDoneBatches(Array.isArray(d.doneBatches) ? d.doneBatches : []);
     setFoodSafety(normalizeFoodSafety(d.foodSafety));
     setMixWaterTemp(typeof d.mixWaterTemp === "number" ? d.mixWaterTemp : null);
@@ -733,7 +1006,7 @@ export default function App() {
   };
   const openDay = (id) => { const e = days.find((x) => x.id === id); if (!e) return; loadDayVars(e.day || {}); setDayName(e.name || "Untitled"); setDayDate(e.date || todayISO()); setCurrentDayId(id); setTab("plan"); setActiveBatch(null); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
   const newDay = () => { const e = newDayEntry("New run", defaultDay()); setDays((ds) => { const nd = [e, ...ds]; persist(DAYS_KEY, nd); return nd; }); loadDayVars(e.day); setDayName(e.name); setDayDate(e.date); setCurrentDayId(e.id); setTab("plan"); setActiveBatch(null); setDoneBatches([]); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
-  const dupDay = (id) => setDays((ds) => { const src = ds.find((d) => d.id === id); if (!src) return ds; const copy = { ...src, id: uid(), name: (src.name || "Run") + " (copy)", updatedAt: Date.now(), complete: false, day: JSON.parse(JSON.stringify(src.day || defaultDay())) }; const nd = [copy, ...ds]; persist(DAYS_KEY, nd); return nd; });
+  const dupDay = (id) => setDays((ds) => { const src = ds.find((d) => d.id === id); if (!src) return ds; const copy = { ...src, id: uid(), name: (src.name || "Run") + " (copy)", updatedAt: Date.now(), complete: false, day: (() => { const dd = JSON.parse(JSON.stringify(src.day || defaultDay())); dd.costLock = null; dd.deduction = null; dd.soldLoaves = {}; return dd; })() }; const nd = [copy, ...ds]; persist(DAYS_KEY, nd); return nd; });
   const delDay = (id) => { setDays((ds) => { const nd = ds.filter((d) => d.id !== id); persist(DAYS_KEY, nd); return nd; }); if (currentDayId === id) { setCurrentDayId(null); setView("home"); } };
   const toggleComplete = (id) => setDays((ds) => { const nd = ds.map((d) => d.id === id ? { ...d, complete: !d.complete, updatedAt: Date.now() } : d); persist(DAYS_KEY, nd); return nd; });
   const backHome = () => { setView("home"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
@@ -834,6 +1107,8 @@ export default function App() {
             if (Array.isArray(gc.inocCal) && gc.inocCal.length === 2) setInocCal(gc.inocCal);
             else if (typeof gc.inocDoubleHrs === "number") setInocCal([{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + gc.inocDoubleHrs }]);
             if (gc.tempUnit === "C" || gc.tempUnit === "F") setTempUnit(gc.tempUnit);
+            if (Array.isArray(gc.pantry)) setPantry(gc.pantry.filter((x) => x && typeof x === "object" && x.id));
+            if (gc.costSettings && typeof gc.costSettings === "object") setCostSettings((cs) => ({ ...cs, ...gc.costSettings }));
           }
           let loadedDays = null;
           const dRec = await window.storage.get(DAYS_KEY);
@@ -877,13 +1152,13 @@ export default function App() {
     })();
   }, []);
   // persist shared globals
-  useEffect(() => { if (!loaded) return; persist(GLOBALS_KEY, { coreRecipes, remixes, ingredients, starter, inocCal, tempUnit }); }, [coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, loaded]);
+  useEffect(() => { if (!loaded) return; persist(GLOBALS_KEY, { coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, pantry, costSettings }); }, [coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, pantry, costSettings, loaded]);
   // autosave the open day's snapshot
   useEffect(() => {
     if (!loaded || view !== "editor" || !currentDayId) return;
-    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs };
+    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, rentalHours, rentalRate, soldLoaves, costLock, deduction, doneBatches, foodSafety, mixWaterTemp, calcInputs };
     setDays((ds) => { const nd = ds.map((d) => (d.id === currentDayId ? { ...d, name: dayName, date: dayDate, updatedAt: Date.now(), day: snap } : d)); persist(DAYS_KEY, nd); return nd; });
-  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
+  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, rentalHours, rentalRate, soldLoaves, costLock, deduction, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
 
   // remember where this device is (only after boot has restored, so we never overwrite the saved spot with defaults)
   useEffect(() => {
@@ -1084,6 +1359,13 @@ export default function App() {
     return { feedOff, autoFeed, builds: out };
   }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard, levBuffer, levBufferPct, levCombine]);
 
+  // ---- costs + stock (Pantry) ----
+  const effRate = rentalRate != null ? rentalRate : (costSettings.rentalRate || 0);
+  const runCosts = useMemo(() => computeRunCosts({ plan, types, builds: levainPlan.builds, pantry, settings: costSettings, refHyd: starter.refHyd, rentalHours, rentalRate: effRate, sold: soldLoaves }), [plan, types, levainPlan, pantry, costSettings, starter.refHyd, rentalHours, effRate, soldLoaves]);
+  // once a run has been deducted, the counts already net it out; show the check as it stood BEFORE the deduction
+  const pantryForCheck = useMemo(() => deduction ? pantry.map((it) => { const ln = deduction.lines.find((l) => l.id === it.id); return ln ? { ...it, onHandBase: (it.onHandBase || 0) + ln.qty } : it; }) : pantry, [pantry, deduction]);
+  const stockRows = useMemo(() => stockCheck(costLock ? costLock.result.demand : runCosts.demand, pantryForCheck, dayDate, todayISO()), [runCosts, costLock, pantryForCheck, dayDate]);
+
   // ---- bake schedule: groups per-recipe sessions by date, one oven sequential ----
   const bakePlan = useMemo(() => {
     const cap = Math.max(1, Math.floor(+params.ovenCap || 1));
@@ -1257,6 +1539,23 @@ export default function App() {
     if (oldCore) setSlots((ss) => ss.map((sl) => (sl.coreRecipeId === r.id && sameFormula(sl.draft, oldCore)) ? { ...sl, draft: cloneRecipe(r) } : sl));
   };
   const saveSlotAsRemix = (ti) => { remixRecipe(ti); patchSlot(ti, (sl) => ({ ...sl, coreRecipeId: "" })); };
+  const goPantry = () => { setHomeTab("pantry"); setView("home"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
+  const lockCosts = () => setCostLock({ at: Date.now(), result: runCosts });
+  const unlockCosts = () => setCostLock(null);
+  const deductRun = () => {
+    if (deduction) return;
+    const demand = costLock ? costLock.result.demand : runCosts.demand;
+    const lines = [];
+    pantry.forEach((it) => { const q = demand[it.id] || 0; if (q > 0) lines.push({ id: it.id, qty: Math.min(q, it.onHandBase || 0) }); });
+    setPantry((ps) => ps.map((it) => { const ln = lines.find((l) => l.id === it.id); return ln ? { ...it, onHandBase: Math.max(0, (it.onHandBase || 0) - ln.qty) } : it; }));
+    setDeduction({ at: Date.now(), lines });
+  };
+  const undoDeduction = () => {
+    if (!deduction) return;
+    setPantry((ps) => ps.map((it) => { const ln = deduction.lines.find((l) => l.id === it.id); return ln ? { ...it, onHandBase: (it.onHandBase || 0) + ln.qty } : it; }));
+    setDeduction(null);
+  };
+  const addMissingToPantry = (names) => setPantry((ps) => [...ps, ...names.filter((n) => !pantryFind(ps, n)).map((n) => blankPantryItem(n))]);
   const setRecipeNotes = (ti, v) => {
     patchDraft(ti, (d) => ({ ...d, notes: v }));
     const cid = slots[ti] && slots[ti].coreRecipeId;
@@ -1716,6 +2015,65 @@ export default function App() {
         .bl-mixwater-btn.awake.on{background:var(--crust);color:#fff;border-color:var(--crust2);}
         .bl-awake-note{margin:-6px 0 12px;font-size:12px;color:var(--ink2);line-height:1.4;}
         .bl-awake-note.bad{color:var(--alert);}
+        .pt-card{border:1.5px solid var(--line);border-radius:10px;background:var(--cream);padding:11px 13px;margin-bottom:11px;}
+        .pt-card.item.nopr{border-color:#e9c47e;background:#fff9ec;}
+        .pt-h{font-family:'Fraunces',serif;font-weight:600;font-size:14px;color:var(--crust2);margin-bottom:8px;}
+        .pt-top{display:flex;align-items:center;gap:9px;margin-bottom:8px;}
+        .pt-name{flex:1;min-width:0;font-family:'DM Sans';font-size:14.5px;font-weight:600;padding:6px 9px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);}
+        .pt-per{font-family:'JetBrains Mono';font-size:11.5px;color:var(--crust2);white-space:nowrap;}
+        .pt-per.bad{color:var(--alert);}
+        .pt-row{display:flex;flex-wrap:wrap;gap:8px 10px;margin-bottom:8px;align-items:flex-end;}
+        .pt-f{display:flex;flex-direction:column;gap:3px;font-size:10.5px;color:var(--ink2);flex:1 1 150px;min-width:0;}
+        .pt-f.sm{flex:0 1 112px;}
+        .pt-f input,.pt-f select{font-family:'JetBrains Mono';font-size:13px;padding:6px 8px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);min-width:0;width:100%;box-sizing:border-box;}
+        .pt-f select{font-family:'DM Sans';}
+        .pt-f input[type=text]{font-family:'DM Sans';}
+        .pt-f input:disabled{background:var(--paper);color:var(--ink2);}
+        .pt-hint,.pt-empty{font-size:12px;color:var(--ink2);line-height:1.4;}
+        .pt-empty{padding:10px 2px 14px;}
+        .pt-bar{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px;}
+        .pt-link{background:none;border:none;color:var(--crust2);text-decoration:underline;cursor:pointer;font:inherit;padding:0;}
+        .sc-card{margin-bottom:16px;}
+        .sc-card .ch-sub{font-family:'DM Sans';font-weight:400;font-size:11px;color:var(--ink2);margin-left:6px;}
+        .sc-row{display:flex;flex-wrap:wrap;align-items:baseline;gap:3px 12px;padding:8px 13px;border-bottom:1px solid var(--paper2);font-size:13px;}
+        .sc-row:last-of-type{border-bottom:none;}
+        .sc-name{font-weight:600;color:var(--ink);min-width:120px;}
+        .sc-nums{font-family:'JetBrains Mono';font-size:12px;color:var(--ink2);}
+        .sc-flag{font-size:12.5px;margin-left:auto;color:var(--ink2);}
+        .sc-row.short{background:#fdf0ef;} .sc-row.short .sc-flag{color:var(--alert);font-weight:700;}
+        .sc-row.low{background:#fff6e3;} .sc-row.low .sc-flag{color:var(--crust2);font-weight:700;}
+        .sc-flag em{font-style:normal;font-weight:400;color:var(--ink2);} .sc-flag em.late{color:var(--alert);font-weight:700;}
+        .sc-empty,.sc-note,.sc-missing{padding:10px 13px;font-size:12.5px;color:var(--ink2);line-height:1.4;}
+        .sc-missing{border-top:1px solid var(--paper2);color:var(--crust2);}
+        .cs-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px;}
+        @media (max-width:640px){.cs-stats{grid-template-columns:repeat(2,1fr);}}
+        .cs-stat{border:1.5px solid var(--line);border-radius:10px;background:var(--cream);padding:10px 12px;}
+        .cs-stat .v{font-family:'JetBrains Mono';font-weight:700;font-size:19px;color:var(--ink);}
+        .cs-stat .l{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink2);margin-top:2px;}
+        .cs-stat.neg .v{color:var(--alert);}
+        .cs-note{font-size:12px;color:var(--ink2);line-height:1.4;margin-bottom:12px;}
+        .cs-warn{margin-bottom:12px;padding:9px 12px;border:1.5px solid #e9c47e;background:#fff6e3;border-radius:9px;font-size:12.5px;color:var(--crust2);line-height:1.4;}
+        .cs-warn button,.cs-lock button,.cs-deducted button{margin-left:8px;font-family:'DM Sans';font-size:11.5px;font-weight:600;padding:3px 9px;border-radius:6px;border:1px solid var(--crust);background:#fff;color:var(--crust2);cursor:pointer;}
+        .cs-lock{margin-bottom:12px;padding:9px 12px;border:1.5px solid var(--line);background:var(--paper);border-radius:9px;font-size:12.5px;color:var(--ink);}
+        .cs-inputs{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:flex-end;margin-bottom:14px;}
+        .cs-rental{font-family:'JetBrains Mono';font-size:13px;color:var(--ink2);padding-bottom:7px;}
+        .cs-recipe{border:1.5px solid var(--line);border-radius:10px;background:var(--cream);padding:12px 14px;margin-bottom:11px;}
+        .cs-rhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;}
+        .cs-rname{font-family:'Fraunces',serif;font-weight:600;font-size:16px;color:var(--ink);}
+        .cs-rloaves{font-family:'JetBrains Mono';font-size:12px;color:var(--ink2);}
+        .cs-rin{display:flex;flex-wrap:wrap;gap:8px 12px;margin-bottom:9px;}
+        .cs-lines{display:flex;flex-direction:column;gap:3px;font-size:13px;}
+        .cs-lines>div{display:flex;justify-content:space-between;color:var(--ink2);}
+        .cs-lines b{font-family:'JetBrains Mono';font-weight:600;color:var(--ink);}
+        .cs-lines .tot{border-top:1px solid var(--line);padding-top:4px;margin-top:3px;} .cs-lines .tot b{font-size:15px;}
+        .cs-lines .m b{color:var(--crust2);}
+        .cs-rfoot{margin-top:8px;font-size:12px;color:var(--ink2);} .cs-rfoot b{font-family:'JetBrains Mono';color:var(--ink);}
+        .cs-items{margin:4px 0 14px;font-size:13px;} .cs-items summary{cursor:pointer;color:var(--crust2);font-weight:600;padding:6px 0;}
+        .cs-item{display:flex;gap:12px;padding:4px 0;border-bottom:1px solid var(--paper2);} .cs-item span:first-child{flex:1;} .cs-item span:nth-child(2){font-family:'JetBrains Mono';font-size:12px;color:var(--ink2);} .cs-item b{font-family:'JetBrains Mono';min-width:62px;text-align:right;}
+        .cs-actions{display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin-top:14px;padding-top:14px;border-top:1px solid var(--line);}
+        .cs-btn{font-family:'DM Sans';font-size:13.5px;font-weight:600;padding:10px 16px;border-radius:9px;border:1.5px solid var(--crust2);background:var(--crust);color:#fff;cursor:pointer;min-height:44px;}
+        .cs-btn.alt{background:#fff;color:var(--crust2);} .cs-btn.ghost{background:transparent;color:var(--ink2);border-color:var(--line);} .cs-btn:disabled{opacity:.45;cursor:not-allowed;}
+        .cs-confirm{font-size:12.5px;color:var(--ink);} .cs-deducted{font-size:12.5px;color:var(--ink2);} .cs-empty{font-size:13px;color:var(--ink2);padding:6px 0 12px;}
         .bl-hyd-readout b{font-size:15px;color:#155;}
         .bl-hyd-note{font-family:'DM Sans';font-size:10.5px;color:var(--ink2);margin-left:6px;}
         .brc-ai{margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);}
@@ -2257,6 +2615,7 @@ export default function App() {
             <div className="bl-home-tabs">
               <button className={homeTab === "bakedays" ? "on" : ""} onClick={() => setHomeTab("bakedays")}>Runs</button>
               <button className={homeTab === "recipes" ? "on" : ""} onClick={() => { setHomeTab("recipes"); setBuilderView("list"); }}>Recipes</button>
+              <button className={homeTab === "pantry" ? "on" : ""} onClick={() => setHomeTab("pantry")}>Pantry</button>
               <button className={homeTab === "starter" ? "on" : ""} onClick={() => setHomeTab("starter")}>{(starter.name && starter.name.trim()) || "Starter"}</button>
             </div>
           </div>
@@ -2317,6 +2676,9 @@ export default function App() {
                   <div className="bl-field2"><label>Loaf weight (g)</label><input type="number" min="0" value={editingDraft.loafWeight || 850} onChange={(e) => patchEdit({ loafWeight: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div className="bl-field2"><label>Autolyse (min)</label><input type="number" min="0" value={editingDraft.autolyse ?? 45} onChange={(e) => patchEdit({ autolyse: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div className="bl-field2"><label>Shape</label><select value={editingDraft.shape || "round"} onChange={(e) => patchEdit({ shape: e.target.value })}><option value="round">Round</option><option value="oval">Oval</option></select></div>
+                </div>
+                <div className="bl-re-row">
+                  <div className="bl-field2"><label>Wholesale price / loaf ($)</label><input type="number" min="0" step="0.25" value={editingDraft.price ?? 0} onChange={(e) => patchEdit({ price: Math.max(0, Number(e.target.value) || 0) })} /></div>
                 </div>
                 <div className="bl-subhead">Flours · main balances to 100%</div>
                 {(editingDraft.flours || []).map((f, idx) => (
@@ -2462,6 +2824,7 @@ export default function App() {
           )}
           </>)}
 
+          {homeTab === "pantry" && <PantryTab pantry={pantry} setPantry={setPantry} costSettings={costSettings} setCostSettings={setCostSettings} coreRecipes={coreRecipes} />}
           {homeTab === "starter" && (() => {
             const S = Math.max(0, +starter.mSeed || 0);
             const ratio = Math.max(0, +starter.mFlourRatio || 10);
@@ -2592,6 +2955,7 @@ export default function App() {
         <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => goTab("fold")}><span className="num">6</span><span className="tlabel">Bulk/Shape</span><span className="tshort">Bulk/Shape</span></button>
         <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => goTab("bake")}><span className="num">7</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
         <button className={"bl-tab" + (tab === "timers" ? " on" : "")} onClick={() => goTab("timers")}><span className="num">8</span><span className="tlabel">Timers</span><span className="tshort">Timers</span></button>
+        <button className={"bl-tab" + (tab === "costs" ? " on" : "")} onClick={() => goTab("costs")}><span className="num">9</span><span className="tlabel">Costs</span><span className="tshort">Costs</span></button>
       </div>
 
       {/* ---------- TAB 1: PLANNING ---------- */}
@@ -2858,6 +3222,34 @@ export default function App() {
               const over = plan.list.map((b, i) => (maxBatch > 0 && b.dough > maxBatch) ? ("B" + (i + 1)) : null).filter(Boolean);
               return over.length > 0 ? <div className="bl-dbuf-warn">Over the {fmtKg(maxBatch)} mixer at this buffer: {over.join(" · ")} — trim the buffer or split the batch.</div> : null;
             })()}
+          </div>
+          <div className="bl-card sc-card" data-k="stock">
+            <div className="ch">Stock check <span className="ch-sub">this run vs your Pantry counts</span></div>
+            {pantry.length === 0 ? (
+              <div className="sc-empty">Nothing in the Pantry yet, so there’s nothing to check. <button className="pt-link" onClick={goPantry}>Open Pantry</button></div>
+            ) : (<>
+              {deduction && <div className="sc-note">This run is already deducted from stock, so this shows your counts as they were before it.</div>}
+              {stockRows.length === 0 ? <div className="sc-empty">No Pantry items are used by this run yet.</div> : stockRows.map((r) => (
+                <div className={"sc-row " + r.status} key={r.id} data-row={r.item.name} data-status={r.status}>
+                  <span className="sc-name">{r.item.name}</span>
+                  <span className="sc-nums">need {qtyText(r.need, r.item)} · have {qtyText(r.have, r.item)}</span>
+                  <span className="sc-flag">
+                    {r.status === "short" && <>short — buy {r.packs > 0 ? r.packs + " × " + r.item.packSize + " " + r.item.packUnit : qtyText(r.buyBase, r.item)}</>}
+                    {r.status === "low" && <>low after run — buy {r.packs > 0 ? r.packs + " × " + r.item.packSize + " " + r.item.packUnit : qtyText(r.buyBase, r.item)}</>}
+                    {r.status === "ok" && "ok"}
+                    {r.orderBy && <em className={r.overdue ? "late" : ""}> · order by {r.orderBy}{r.overdue ? " (past)" : ""}</em>}
+                  </span>
+                </div>
+              ))}
+              {(() => {
+                const un = runCosts.missing.filter((m) => m.reason === "not in Pantry" && m.name.indexOf("Levain flour") !== 0);
+                const lv = runCosts.missing.some((m) => m.name.indexOf("Levain flour") === 0);
+                return (<>
+                  {un.length > 0 && <div className="sc-missing" data-k="unmatched">Not in Pantry (not checked or costed): {un.map((m) => m.name + " " + fmtG(m.grams) + " g").join(", ")}. <button className="pt-link" onClick={() => addMissingToPantry(un.map((m) => m.name))}>Add to Pantry</button></div>}
+                  {lv && <div className="sc-missing">The levain build’s flour isn’t counted yet — choose what your levain is fed with in <button className="pt-link" onClick={goPantry}>Pantry</button>.</div>}
+                </>);
+              })()}
+            </>)}
           </div>
           <div className="bl-rep-grid">
             <div className="bl-card">
@@ -3348,6 +3740,14 @@ export default function App() {
 
       {/* ---------- TAB 7: FOOD SAFETY ---------- */}
       {tab === "timers" && <TimerTab batches={plan.list} types={types} params={params} dayId={currentDayId} />}
+      {tab === "costs" && (
+        <CostsTab res={costLock ? costLock.result : runCosts} locked={!!costLock} lockedAt={costLock ? costLock.at : 0}
+          hours={costLock ? costLock.result.inputs.rentalHours : rentalHours} setHours={setRentalHours}
+          rate={costLock ? costLock.result.inputs.rate : rentalRate} setRate={setRentalRate} defaultRate={costSettings.rentalRate}
+          setSold={(ti, v) => setSoldLoaves((m) => ({ ...m, [ti]: v }))} setPrice={(ti, v) => setDraft(ti, { price: v })}
+          onLock={lockCosts} onUnlock={unlockCosts} deduction={deduction} onDeduct={deductRun} onUndo={undoDeduction}
+          onOpenPantry={goPantry} pantryCount={pantry.length} />
+      )}
       {tab === "safety" && (<>
         <div className="bl-panel">
           <h3>Refrigerator temperature log</h3>
