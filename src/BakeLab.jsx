@@ -29,11 +29,12 @@ const cloneRecipe = (r) => ({
   bassinagePct: r.bassinagePct ?? 8,
   notes: r.notes || "",
   price: r.price ?? 0,
+  scald: !!r.scald, scaldFlour: r.scaldFlour || "", scaldPct: r.scaldPct ?? 10, scaldHyd: r.scaldHyd ?? 500, scaldLiquid: r.scaldLiquid || "", scaldMethod: r.scaldMethod === "poured" ? "poured" : "cooked",
   flours: r.flours.map((f) => mk(f.name, f.pct)),
   inclusions: r.inclusions.map((f) => mk(f.name, f.pct)),
   liquids: (r.liquids || []).map((l) => mkL(l.name, l.pct, l.factor ?? 100)),
 });
-const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", price: 0, inclusions: [], liquids: [] });
+const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", price: 0, scald: false, scaldFlour: "", scaldPct: 10, scaldHyd: 500, scaldLiquid: "", scaldMethod: "cooked", inclusions: [], liquids: [] });
 
 // date helpers — defined early because DEFAULT_SLOTS uses them at module-eval time
 const todayISO = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
@@ -100,7 +101,7 @@ const computeRunCosts = ({ plan, types, builds, pantry, settings, refHyd, rental
     const t = types[b.ti]; if (!t) return;
     ingLines(t).forEach((l) => {
       const g = b.weights[l.key] || 0;
-      if (l.key.indexOf("fl_") === 0 || l.key.indexOf("in_") === 0 || l.key.indexOf("lq_") === 0 || l.key === "salt") addUse(b.ti, l.name, g);
+      if (l.key.indexOf("fl_") === 0 || l.key.indexOf("in_") === 0 || l.key.indexOf("lq_") === 0 || l.key === "salt" || l.key === "scf" || l.key === "scl") addUse(b.ti, l.matchName || l.name, g);
     });
   });
   (builds || []).forEach((bd) => {
@@ -307,6 +308,51 @@ function CostsTab({ res, locked, lockedAt, hours, setHours, rate, setRate, defau
             : <button className="cs-btn alt" data-f="deduct" disabled={pantryCount === 0 || res.recipes.length === 0} onClick={() => setConfirm(true)}>Deduct this run from stock</button>
         ) : <span className="cs-deducted" data-k="deducted">Deducted from stock {new Date(deduction.at).toLocaleDateString()} <button data-f="undo" onClick={onUndo}>Undo</button></span>}
       </div>
+    </div>
+  );
+}
+
+// Scald editor, shared by the recipe editor and each Plan card. `onPatch(partial)` writes recipe fields.
+function ScaldEditor({ t, onPatch }) {
+  const sc = scaldInfo(t);
+  const on = !!t.scald;
+  const flours = t.flours || [], liquids = t.liquids || [];
+  const num = (v) => Math.max(0, Number(v) || 0);
+  const rd = (x) => Math.round(x * 10) / 10;
+  const flourVal = t.scaldFlour || (flours[0] ? flours[0].name : "");
+  const flourKnown = flours.some((f) => normName(f.name) === normName(flourVal));
+  const liquidVal = t.scaldLiquid || "water";
+  const liquidKnown = normName(liquidVal) === "water" || liquids.some((l) => normName(l.name) === normName(liquidVal));
+  return (
+    <div className="sd-box" data-k="scaldbox">
+      <label className="sd-tog"><input data-f="scaldOn" type="checkbox" checked={on} onChange={(e) => onPatch({ scald: e.target.checked })} /><span>Scald / tangzhong — cook part of the flour first</span></label>
+      {on && (<>
+        <div className="sd-presets">
+          <button data-f="presetTz" onClick={() => onPatch({ scaldHyd: 500, scaldMethod: "cooked" })}>Tangzhong 1:5</button>
+          <button data-f="presetYu" onClick={() => onPatch({ scaldHyd: 200, scaldMethod: "poured" })}>Yudane 1:2</button>
+        </div>
+        <div className="sd-row">
+          <label className="sd-f"><span>Scald flour (% of total flour)</span><input data-f="scaldPct" type="number" min="0" step="0.5" value={t.scaldPct ?? 10} onFocus={(e) => e.target.select()} onChange={(e) => onPatch({ scaldPct: num(e.target.value) })} /></label>
+          <label className="sd-f"><span>Taken from</span>
+            <select data-f="scaldFlour" value={flourVal} onChange={(e) => onPatch({ scaldFlour: e.target.value })}>
+              {flours.map((f) => <option key={f.id} value={f.name}>{f.name}</option>)}
+              {!flourKnown && <option value={flourVal}>{flourVal} (missing)</option>}
+            </select></label>
+          <label className="sd-f"><span>Liquid per 100 flour (%)</span><input data-f="scaldHyd" type="number" min="0" step="10" value={t.scaldHyd ?? 500} onFocus={(e) => e.target.select()} onChange={(e) => onPatch({ scaldHyd: num(e.target.value) })} /></label>
+          <label className="sd-f"><span>Liquid</span>
+            <select data-f="scaldLiquid" value={liquidVal} onChange={(e) => onPatch({ scaldLiquid: e.target.value === "water" ? "" : e.target.value })}>
+              <option value="water">Water</option>
+              {liquids.map((l) => <option key={l.id} value={l.name}>{l.name}</option>)}
+              {!liquidKnown && <option value={liquidVal}>{liquidVal} (missing)</option>}
+            </select></label>
+          <label className="sd-f"><span>Method</span>
+            <select data-f="scaldMethod" value={t.scaldMethod === "poured" ? "poured" : "cooked"} onChange={(e) => onPatch({ scaldMethod: e.target.value })}>
+              <option value="cooked">Cooked paste (tangzhong)</option><option value="poured">Poured boiling (yudane)</option>
+            </select></label>
+        </div>
+        {sc.on && <div className="sd-read" data-k="scaldRead">Scald = {rd(sc.sf)}% flour + {rd(sc.S)}% {sc.liquidName.toLowerCase()}. Main mix keeps {rd(sc.flourPct - sc.sf)}% {sc.flourName} and {rd(sc.avail - sc.S)}% {sc.liquidName.toLowerCase()}. Total flour and hydration are unchanged.</div>}
+        {sc.warns.map((w, i) => <div className="sd-warn" key={i}>{w}</div>)}
+      </>)}
     </div>
   );
 }
@@ -611,14 +657,49 @@ const sameIngList = (x, y, skipFirstPct) => {
 const sameFormula = (a, b) => {
   if (!a || !b) return false;
   for (const k of RECIPE_FORMULA_KEYS) { if (String(a[k] ?? "") !== String(b[k] ?? "")) return false; }
-  return sameIngList(a.flours, b.flours, true) && sameIngList(a.inclusions, b.inclusions, false);
+  return sameIngList(a.flours, b.flours, true) && sameIngList(a.inclusions, b.inclusions, false) && JSON.stringify(scaldKeyPart(a)) === JSON.stringify(scaldKeyPart(b));
 };
 const flourPctOf = (t, idx) => (idx === 0 ? mainPct(t) : (+t.flours[idx].pct || 0));
 
+// ---- scald / tangzhong / yudane ------------------------------------------
+// A scald is CARVED OUT of the recipe's existing flour and water (like bassinage): total flour and total hydration are
+// exactly what the recipe says, only how it is mixed changes. Scald flour comes from one flour line; scald liquid from
+// the water (or one liquid line). Values are clamped to what the recipe actually has, with a warning.
+const scaldKeyPart = (r) => (r && r.scald) ? [normName(r.scaldFlour), +r.scaldPct || 0, +r.scaldHyd || 0, normName(r.scaldLiquid) || "water", r.scaldMethod === "poured" ? "poured" : "cooked"] : null;
+const scaldInfo = (t) => {
+  const none = { enabled: false, on: false, warns: [] };
+  if (!t || !t.scald || !(t.flours && t.flours.length)) return none;
+  const rd = (x) => Math.round(x * 10) / 10;
+  const flours = t.flours, liquids = t.liquids || [], warns = [];
+  let flourIdx = 0;
+  if (t.scaldFlour) {
+    const k = flours.findIndex((f) => normName(f.name) === normName(t.scaldFlour));
+    if (k >= 0) flourIdx = k; else warns.push("“" + t.scaldFlour + "” isn’t a flour in this recipe, so " + flours[0].name + " is used.");
+  }
+  const flourName = flours[flourIdx].name, flourPct = flourPctOf(t, flourIdx);
+  const wantSf = Math.max(0, +t.scaldPct || 0), sf = Math.min(wantSf, flourPct);
+  if (wantSf > flourPct + 1e-9) warns.push("Only " + rd(flourPct) + "% " + flourName + " in the recipe — scald flour limited to that.");
+  const hyd = Math.max(0, +t.scaldHyd || 0), wantS = sf * hyd / 100;
+  let liqIdx = -1;
+  if (t.scaldLiquid && normName(t.scaldLiquid) !== "water") {
+    liqIdx = liquids.findIndex((l) => normName(l.name) === normName(t.scaldLiquid));
+    if (liqIdx < 0) warns.push("“" + t.scaldLiquid + "” isn’t a liquid in this recipe, so water is used.");
+  }
+  const isWater = liqIdx < 0, liquidName = isWater ? "Water" : liquids[liqIdx].name;
+  const avail = isWater ? (+t.water || 0) : (+liquids[liqIdx].pct || 0);
+  const S = Math.min(wantS, avail);
+  if (wantS > avail + 1e-9) warns.push("The scald needs " + rd(wantS) + "% " + liquidName.toLowerCase() + " but the recipe only has " + rd(avail) + "% — limited to that. Lower the scald % or its water ratio.");
+  const on = sf > 0 && S > 0;
+  if (!on && !warns.length) warns.push("Set the scald flour % and the water ratio above 0.");
+  return { enabled: true, on, flourIdx, flourName, flourPct, sf, hyd, wantS, avail, S, liqIdx, isWater, liquidName, method: t.scaldMethod === "poured" ? "poured" : "cooked", warns };
+};
+
 const ingLines = (t) => {
+  const sc = scaldInfo(t);
   const L = [];
-  t.flours.forEach((f, i) => L.push({ key: "fl_" + f.id, name: f.name, pct: flourPctOf(t, i) }));
-  const wTot = +t.water || 0;
+  t.flours.forEach((f, i) => L.push({ key: "fl_" + f.id, name: f.name, pct: Math.max(0, flourPctOf(t, i) - (sc.on && i === sc.flourIdx ? sc.sf : 0)) }));
+  if (sc.on) L.push({ key: "scf", name: "Scald flour (" + sc.flourName + ")", matchName: sc.flourName, pct: sc.sf });
+  const wTot = Math.max(0, (+t.water || 0) - (sc.on && sc.isWater ? sc.S : 0)); // water that goes into the MAIN mix
   const bPct = t.bassinage ? Math.max(0, Math.min(50, +t.bassinagePct || 0)) : 0;
   if (bPct > 0) {
     const bW = wTot * bPct / 100;
@@ -627,7 +708,9 @@ const ingLines = (t) => {
   } else {
     L.push({ key: "water", name: "Water", pct: wTot });
   }
-  (t.liquids || []).forEach((l) => L.push({ key: "lq_" + l.id, name: l.name, pct: +l.pct || 0 }));
+  if (sc.on && sc.isWater) L.push({ key: "scw", name: "Scald water", pct: sc.S });
+  (t.liquids || []).forEach((l, i) => L.push({ key: "lq_" + l.id, name: l.name, pct: Math.max(0, (+l.pct || 0) - (sc.on && !sc.isWater && i === sc.liqIdx ? sc.S : 0)) }));
+  if (sc.on && !sc.isWater) L.push({ key: "scl", name: "Scald " + sc.liquidName, matchName: sc.liquidName, pct: sc.S });
   L.push({ key: "salt", name: "Salt", pct: +t.salt || 0 });
   L.push({ key: "levain", name: "Levain", pct: +t.levain || 0 });
   t.inclusions.forEach((f) => L.push({ key: "in_" + f.id, name: f.name, pct: +f.pct || 0 }));
@@ -641,7 +724,7 @@ const formulaKey = (r) => JSON.stringify({
   fl: r.flours.map((f, i) => [f.name, i === 0 ? mainPct(r) : +f.pct || 0]),
   inc: r.inclusions.map((f) => [f.name, +f.pct || 0]),
   lq: (r.liquids || []).map((l) => [l.name, +l.pct || 0, +l.factor || 100]),
-  bs: !!r.bassinage, bp: +r.bassinagePct || 0,
+  bs: !!r.bassinage, bp: +r.bassinagePct || 0, sd: scaldKeyPart(r),
 });
 
 // signature of the base dough only (flours + hydration + salt + levain build + autolyse + DDT); inclusions / loaf weight / shape / bake ignored
@@ -651,7 +734,7 @@ const baseDoughKey = (r) => JSON.stringify({
   au: +r.autolyse || 45, dt: Math.round((+r.ddt || DDT_DEFAULT_C) * 10) / 10,
   fl: r.flours.map((f, i) => [f.name, i === 0 ? mainPct(r) : +f.pct || 0]),
   lq: (r.liquids || []).map((l) => [l.name, +l.pct || 0, +l.factor || 100]),
-  bs: !!r.bassinage, bp: +r.bassinagePct || 0,
+  bs: !!r.bassinage, bp: +r.bassinagePct || 0, sd: scaldKeyPart(r),
 });
 
 const buildStages = (p) => {
@@ -1040,8 +1123,8 @@ export default function App() {
         let tf = 0, tw = 0;
         lines.forEach((l) => {
           const g = weights[l.key] || 0;
-          if (l.key.indexOf("fl_") === 0) tf += g;
-          else if (l.key === "water" || l.key === "bassinage") tw += g;
+          if (l.key.indexOf("fl_") === 0 || l.key === "scf") tf += g;
+          else if (l.key === "water" || l.key === "bassinage" || l.key === "scw") tw += g;
         });
         return { ti, name: t.name, size: sz, dough: sz * W * dbF, weights, totalFlour: tf, totalWater: tw };
       });
@@ -1256,9 +1339,10 @@ export default function App() {
       ingLines(t).forEach((l) => {
         if (l.pct <= 0) return;
         const g = b.weights[l.key] || 0; if (!g) return;
-        const cat = l.key.startsWith("fl_") ? "flour" : l.key.startsWith("in_") ? "inc" : "liquid";
-        const key = (l.name || "").trim().toLowerCase() + "|" + cat;
-        if (!tot[key]) tot[key] = { name: l.name, cat, g: 0 };
+        const cat = (l.key.startsWith("fl_") || l.key === "scf") ? "flour" : l.key.startsWith("in_") ? "inc" : "liquid";
+        const nm = l.matchName || l.name;
+        const key = (nm || "").trim().toLowerCase() + "|" + cat;
+        if (!tot[key]) tot[key] = { name: nm, cat, g: 0 };
         tot[key].g += g;
       });
     });
@@ -1358,6 +1442,18 @@ export default function App() {
     });
     return { feedOff, autoFeed, builds: out };
   }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard, levBuffer, levBufferPct, levCombine]);
+
+  // scalds to make ahead, totalled across every batch of the run
+  const scaldPrep = useMemo(() => {
+    const out = [];
+    types.forEach((t, ti) => {
+      const sc = scaldInfo(t); if (!sc.on) return;
+      let fl = 0, lq = 0;
+      plan.list.forEach((b) => { if (b.ti === ti) { fl += b.weights.scf || 0; lq += (sc.isWater ? b.weights.scw : b.weights.scl) || 0; } });
+      if (fl > 0) out.push({ ti, name: t.name, flourName: sc.flourName, fl, liquidName: sc.liquidName, lq, method: sc.method });
+    });
+    return out;
+  }, [plan, types]);
 
   // ---- costs + stock (Pantry) ----
   const effRate = rentalRate != null ? rentalRate : (costSettings.rentalRate || 0);
@@ -1570,6 +1666,7 @@ export default function App() {
           name: r.name, loafWeightG: r.loafWeight, shape: r.shape,
           flours: r.flours.map((fl, i) => ({ name: fl.name, pct: i === 0 ? mainPct(r) : (+fl.pct || 0) })),
           waterPct: +r.water || 0,
+          scald: (() => { const sc = scaldInfo(r); return sc.on ? { flour: sc.flourName, pctOfTotalFlour: Math.round(sc.sf * 10) / 10, liquid: sc.liquidName, liquidPctOfFlour: Math.round(sc.S * 10) / 10, method: sc.method } : null; })(),
           liquids: (r.liquids || []).map((l) => ({ name: l.name, pct: +l.pct || 0, waterFactorPct: +l.factor || 100 })),
           saltPct: +r.salt || 0, levainPct: +r.levain || 0, levainHydrationPct: +r.levHyd || 80, inoculationPct: +r.levInoc || 10,
           levainBuildHrs: +r.levBuildHrs || 5, levainRefTempC: +r.levRefTemp || 24, levainWholeGrainPct: +r.levWhole || 0,
@@ -2073,6 +2170,19 @@ export default function App() {
         .cs-actions{display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin-top:14px;padding-top:14px;border-top:1px solid var(--line);}
         .cs-btn{font-family:'DM Sans';font-size:13.5px;font-weight:600;padding:10px 16px;border-radius:9px;border:1.5px solid var(--crust2);background:var(--crust);color:#fff;cursor:pointer;min-height:44px;}
         .cs-btn.alt{background:#fff;color:var(--crust2);} .cs-btn.ghost{background:transparent;color:var(--ink2);border-color:var(--line);} .cs-btn:disabled{opacity:.45;cursor:not-allowed;}
+        .sd-box{margin:8px 0 4px;padding:10px 12px;border:1.5px solid var(--line);border-radius:9px;background:var(--cream);}
+        .sd-tog{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--ink);cursor:pointer;}
+        .sd-tog input{width:16px;height:16px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .sd-presets{display:flex;gap:7px;margin:9px 0 8px;flex-wrap:wrap;}
+        .sd-presets button{font-family:'DM Sans';font-size:11.5px;font-weight:600;padding:5px 10px;border-radius:7px;border:1.5px solid var(--crust);background:#fff;color:var(--crust2);cursor:pointer;}
+        .sd-row{display:flex;flex-wrap:wrap;gap:8px 10px;}
+        .sd-f{display:flex;flex-direction:column;gap:3px;font-size:10.5px;color:var(--ink2);flex:1 1 140px;min-width:0;}
+        .sd-f input,.sd-f select{font-family:'JetBrains Mono';font-size:13px;padding:6px 8px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);min-width:0;width:100%;box-sizing:border-box;}
+        .sd-f select{font-family:'DM Sans';}
+        .sd-read{margin-top:9px;font-family:'JetBrains Mono';font-size:11.5px;color:var(--crust2);line-height:1.45;}
+        .sd-warn{margin-top:6px;font-size:12px;color:var(--alert);line-height:1.35;}
+        .bl-scald-call{margin:8px 13px 4px;padding:8px 10px;border:1.5px solid #e9c47e;background:#fff6e3;border-radius:8px;font-size:12.5px;color:var(--crust2);line-height:1.4;}
+        .bl-scald-call b{color:var(--ink);}
         .cs-confirm{font-size:12.5px;color:var(--ink);} .cs-deducted{font-size:12.5px;color:var(--ink2);} .cs-empty{font-size:13px;color:var(--ink2);padding:6px 0 12px;}
         .bl-hyd-readout b{font-size:15px;color:#155;}
         .bl-hyd-note{font-family:'DM Sans';font-size:10.5px;color:var(--ink2);margin-left:6px;}
@@ -2703,8 +2813,8 @@ export default function App() {
                     <span className="bl-bass-pct"><input type="number" min="0" max="50" step="0.5" value={editingDraft.bassinagePct ?? 8} onChange={(e) => patchEdit({ bassinagePct: Math.max(0, Math.min(50, Number(e.target.value) || 0)) })} /><em>% of water held back</em></span>
                   )}
                   {editingDraft.bassinage && (() => {
-                    const w = +editingDraft.water || 0, bp = Math.max(0, Math.min(50, +(editingDraft.bassinagePct ?? 8) || 0)), bw = w * bp / 100;
-                    return <div className="bl-bass-read">main {Math.round((w - bw) * 10) / 10}% · bassinage {Math.round(bw * 10) / 10}% · total still {Math.round(w * 10) / 10}%</div>;
+                    const wAll = +editingDraft.water || 0, scx = scaldInfo(editingDraft), sw = (scx.on && scx.isWater) ? scx.S : 0, w = Math.max(0, wAll - sw), bp = Math.max(0, Math.min(50, +(editingDraft.bassinagePct ?? 8) || 0)), bw = w * bp / 100;
+                    return <div className="bl-bass-read">main {Math.round((w - bw) * 10) / 10}% · bassinage {Math.round(bw * 10) / 10}%{sw > 0 ? " · scald " + Math.round(sw * 10) / 10 + "%" : ""} · total still {Math.round(wAll * 10) / 10}%</div>;
                   })()}
                 </div>
                 <div className="bl-subhead">Liquids <span className="bl-sub-note">milk 88% · egg 75% · cream 60% · tangzhong liquid counts too</span></div>
@@ -2718,6 +2828,7 @@ export default function App() {
                 ))}
                 <button className="bl-add" onClick={addEditLiq}>+ Liquid</button>
                 <HydrationLine t={editingDraft} onSetWater={(w) => patchEdit({ water: w })} />
+                <ScaldEditor t={editingDraft} onPatch={patchEdit} />
                 <div className="bl-subhead">Inclusions</div>
                 {(editingDraft.inclusions || []).map((f, idx) => (
                   <div className="ing-row" key={f.id}>
@@ -3087,6 +3198,7 @@ export default function App() {
                   <div className="bl-lev-hint">Timing, water temp and the build recipe are computed on the <b>Levain</b> tab from {starter.name}'s calibration.</div>
                 </div>
                 <HydrationLine t={t} onSetWater={(w) => setFixed(ti, "water", w)} />
+                <ScaldEditor t={t} onPatch={(p) => setDraft(ti, p)} />
 
                 <div className="bl-subhead">Inclusions</div>
                 {t.inclusions.length === 0 && <div className="ing-empty">No inclusions</div>}
@@ -3251,6 +3363,18 @@ export default function App() {
               })()}
             </>)}
           </div>
+          {scaldPrep.length > 0 && (
+            <div className="bl-card sc-card" data-k="scaldprep">
+              <div className="ch">Make ahead — scalds <span className="ch-sub">cook, cool, then fold into the mix</span></div>
+              {scaldPrep.map((p) => (
+                <div className="sc-row ok" key={p.ti}>
+                  <span className="sc-name">{p.name}</span>
+                  <span className="sc-nums">{fmtG(p.fl)} g {p.flourName} + {fmtG(p.lq)} g {p.liquidName.toLowerCase()}</span>
+                  <span className="sc-flag">{p.method === "poured" ? "pour boiling liquid over, mix" : "cook to " + showTemp(65) + ", stirring"}</span>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="bl-rep-grid">
             <div className="bl-card">
               <div className="ch">Ingredients to have on hand</div>
@@ -3516,6 +3640,16 @@ export default function App() {
                     <div className="meta"><span>Autolyse <b>{fmtClock(startMin + base)}</b></span><span>Mix <b>{fmtClock(startMin + mixStart)}</b></span></div>
                     <div className="meta"><span><b>{b.size}</b> loaves</span><span><b>{fmtG(b.dough)}</b> g dough</span><span>{(t.shape || "round") === "oval" ? "Oval" : "Round"}</span></div>
                     <div className="bl-build-ddt">Target dough temp<b>{showTemp(t.ddt ?? DDT_DEFAULT_C)}</b></div>
+                    {(() => {
+                      const sc = scaldInfo(t); if (!sc.on) return null;
+                      const wg = sc.isWater ? (b.weights.scw || 0) : (b.weights.scl || 0);
+                      return (
+                        <div className="bl-scald-call" data-k="scaldcall">
+                          <b>Cook first — scald.</b> {fmtG(b.weights.scf || 0)} g {sc.flourName} + {fmtG(wg)} g {sc.liquidName.toLowerCase()}.{" "}
+                          {sc.method === "poured" ? "Pour the just-boiled liquid over the flour and mix to a paste." : "Whisk over medium heat to " + showTemp(65) + " until it thickens like pudding."} Cool fully before mixing (make it ahead; the fridge is fine).
+                        </div>
+                      );
+                    })()}
                     {cols.map((l) => <div className="ing" key={l.key}><span className="nm">{l.name}</span><span className="g">{fmtG(b.weights[l.key])} g{l.key === "water" && mixWaterTemp != null ? <em className="bl-watertemp"> · {showTemp(mixWaterTemp)}</em> : null}</span></div>)}
                     <div className="ing tot"><span className="nm">Total flour</span><span className="g">{fmtG(b.totalFlour)} g</span></div>
                     <div className="ing tot"><span className="nm">Total water</span><span className="g">{fmtG(b.totalWater)} g</span></div>
