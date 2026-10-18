@@ -15,6 +15,8 @@ Give every temperature in °F and every weight in grams or kilograms in your tex
 }
 Keep every string tight. Return an empty optimizations array if nothing genuinely needs changing — do not invent problems.`;
 
+export const config = { maxDuration: 60 };
+
 export default async function handler(req, res) {
   if (req.method !== "POST") { res.status(405).json({ error: "POST only" }); return; }
   const key = process.env.ANTHROPIC_API_KEY;
@@ -32,7 +34,7 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: 4096,
+        max_tokens: 16000,
         system: SYSTEM,
         messages: [{ role: "user", content: userMsg }],
       }),
@@ -46,6 +48,10 @@ export default async function handler(req, res) {
 
     const data = await r.json();
     const text = (data.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n").trim();
+    if (data.stop_reason === "max_tokens") {
+      res.status(502).json({ error: "Claude's reply was cut off before it finished. Try again, or raise max_tokens in " + "api/" + "analyze.js." });
+      return;
+    }
     if (!text) {
       const types = (data.content || []).map((c) => c.type).join(", ") || "none";
       res.status(502).json({ error: "Claude returned no text (stop_reason: " + data.stop_reason + ", blocks: " + types + ")." });
