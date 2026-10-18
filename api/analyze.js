@@ -32,7 +32,7 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: 1024,
+        max_tokens: 4096,
         system: SYSTEM,
         messages: [{ role: "user", content: userMsg }],
       }),
@@ -46,6 +46,11 @@ export default async function handler(req, res) {
 
     const data = await r.json();
     const text = (data.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n").trim();
+    if (!text) {
+      const types = (data.content || []).map((c) => c.type).join(", ") || "none";
+      res.status(502).json({ error: "Claude returned no text (stop_reason: " + data.stop_reason + ", blocks: " + types + ")." });
+      return;
+    }
     let parsed = null;
     try { parsed = JSON.parse(text.replace(/^```json\s*/i, "").replace(/^```\s*/, "").replace(/\s*```$/, "").trim()); } catch (e) { parsed = null; }
     if (parsed && typeof parsed === "object") res.status(200).json(parsed);
