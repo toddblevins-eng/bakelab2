@@ -57,6 +57,14 @@ const remixName = (base, iso) => { const [y, m, d] = (iso || todayISO()).split("
 // ===========================================================================
 // Everything is converted to a BASE unit: grams (mass and volume, volume via density) or "each".
 // Stock and reorder points are stored in base units and shown in the item's own pack unit.
+// Proofing containers. Stored on the recipe as `shape`; "round" and "oval" keep their old keys so existing recipes are untouched.
+const PROOF_CONTAINERS = [
+  { key: "round", label: "Round", count: "Round bannetons" },
+  { key: "oval", label: "Oval", count: "Oval bannetons" },
+  { key: "pullman1", label: "1 lb Pullman", count: "1 lb Pullman pans" },
+  { key: "pullman2", label: "2 lb Pullman", count: "2 lb Pullman pans" },
+];
+const proofInfo = (k) => PROOF_CONTAINERS.find((c) => c.key === k) || PROOF_CONTAINERS[0];
 const MASS_G = { g: 1, kg: 1000, lb: 453.592, oz: 28.3495 };
 const VOL_ML = { mL: 1, L: 1000 };
 const PACK_UNITS = ["kg", "g", "lb", "oz", "L", "mL", "each"];
@@ -562,6 +570,118 @@ const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: 
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
 // big parent re-render that each keystroke triggers; still commits upward live.
+function RecipeAssistPanel({ draft, hasExisting, onApplyFull, onApplyPatch }) {
+  const [instruction, setInstruction] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState(null); // { mode, recipe?, changes?, rationale }
+  const [open, setOpen] = useState(false);
+
+  const run = async () => {
+    const text = instruction.trim();
+    if (!text || busy) return;
+    setBusy(true); setError(""); setResult(null);
+    try {
+      const mode = hasExisting ? "edit" : "create";
+      const body = mode === "edit" ? { mode, instruction: text, recipe: draft } : { mode, instruction: text };
+      const resp = await fetch("/api/recipe-assist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await resp.json();
+      if (!resp.ok || data.error) { setError(data.error || ("Request failed (" + resp.status + ")")); setBusy(false); return; }
+      setResult(data);
+    } catch (e) {
+      setError(e && e.message ? e.message : "Something went wrong talking to Claude.");
+    }
+    setBusy(false);
+  };
+
+  const apply = () => {
+    if (!result) return;
+    if (result.mode === "create" && result.recipe) onApplyFull(result.recipe);
+    else if (result.mode === "edit" && result.changes) onApplyPatch(result.changes);
+    setResult(null); setInstruction("");
+  };
+  const discard = () => { setResult(null); };
+
+  // readable diff rows for edit mode: field -> before / after
+  const diffRows = (result && result.mode === "edit" && result.changes)
+    ? Object.keys(result.changes).map((k) => ({
+        key: k,
+        before: JSON.stringify(draft ? draft[k] : undefined),
+        after: JSON.stringify(result.changes[k]),
+      }))
+    : null;
+
+  return (
+    <div className="bl-ai-recipe">
+      <button className="bl-ai-recipe-toggle" onClick={() => setOpen((o) => !o)} type="button">
+        <span className="bl-ai-dot" aria-hidden="true" />
+        {open ? "Hide Claude" : (hasExisting ? "Ask Claude to change this recipe" : "Ask Claude to draft this recipe")}
+      </button>
+      {open && (
+        <div className="bl-ai-recipe-body">
+          <textarea
+            className="bl-ai-recipe-input"
+            rows={2}
+            placeholder={hasExisting
+              ? "e.g. raise hydration to 80% and add 5% rye to the levain"
+              : "e.g. 850g country sourdough, 78% hydration, 20% levain, bakes at 475°F for 40 min with steam"}
+            value={instruction}
+            onChange={(e) => setInstruction(e.target.value)}
+            disabled={busy}
+          />
+          <div className="bl-ai-recipe-actions">
+            <button className="bl-newday" disabled={busy || !instruction.trim()} onClick={run}>
+              {busy ? "Thinking…" : (hasExisting ? "Suggest changes" : "Draft recipe")}
+            </button>
+            {error && <span className="bl-ai-recipe-error">{error}</span>}
+          </div>
+
+          {result && result.mode === "create" && result.recipe && (
+            <div className="bl-ai-recipe-preview">
+              <div className="bl-ai-recipe-rationale">{result.rationale}</div>
+              <div className="bl-ai-recipe-summary">
+                {result.recipe.name} · {result.recipe.loafWeight}g · {result.recipe.water}% water · {result.recipe.levain}% levain
+                {result.recipe.flours && result.recipe.flours.length > 1 ? (" · " + result.recipe.flours.length + " flours") : ""}
+                {result.recipe.scald ? " · scald" : ""}{result.recipe.bassinage ? " · bassinage" : ""}
+              </div>
+              <div className="bl-ai-recipe-note">This replaces every field below with Claude's draft. Review it after applying — nothing saves to your library until you hit Save.</div>
+              <div className="bl-ai-recipe-confirm">
+                <button className="bl-newday" onClick={apply}>Apply to form</button>
+                <button className="bl-back-txt" onClick={discard}>Discard</button>
+              </div>
+            </div>
+          )}
+
+          {result && result.mode === "edit" && diffRows && (
+            <div className="bl-ai-recipe-preview">
+              <div className="bl-ai-recipe-rationale">{result.rationale}</div>
+              <div className="bl-ai-recipe-diff">
+                {diffRows.map((row) => (
+                  <div className="bl-ai-diff-row" key={row.key}>
+                    <span className="bl-ai-diff-field">{row.key}</span>
+                    <span className="bl-ai-diff-before">{row.before}</span>
+                    <span className="bl-ai-diff-arrow">→</span>
+                    <span className="bl-ai-diff-after">{row.after}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="bl-ai-recipe-note">Only the fields above change. Nothing saves to your library until you hit Save.</div>
+              <div className="bl-ai-recipe-confirm">
+                <button className="bl-newday" onClick={apply}>Apply changes</button>
+                <button className="bl-back-txt" onClick={discard}>Discard</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BufferedInput({ value, onCommit, className, placeholder, rows }) {
   const [v, setV] = useState(value == null ? "" : value);
   const last = useRef(value == null ? "" : value);
@@ -1348,7 +1468,7 @@ export default function App() {
     });
     const ingList = Object.values(tot).sort((a, b) => (CAT_ORDER[a.cat] - CAT_ORDER[b.cat]) || b.g - a.g);
     const bann = {};
-    types.forEach((t, ti) => { const lv = plan.summaries[ti].loaves; if (lv > 0) { const sh = t.shape || "round"; bann[sh] = (bann[sh] || 0) + lv; } });
+    types.forEach((t, ti) => { const lv = plan.summaries[ti].loaves; if (lv > 0) { const sh = proofInfo(t.shape).key; bann[sh] = (bann[sh] || 0) + lv; } });
     const vessels = plan.list.map((b, i) => ({ i, name: b.name, dough: b.dough, size: b.size, liters: vesselLiters(b.dough) }));
     return { ingList, bann, vessels, totalLoaves: plan.list.reduce((a, b) => a + b.size, 0), totalDough: plan.list.reduce((a, b) => a + b.dough, 0) };
   }, [plan, types]);
@@ -1663,7 +1783,7 @@ export default function App() {
     try {
       const payload = {
         recipe: {
-          name: r.name, loafWeightG: r.loafWeight, shape: r.shape,
+          name: r.name, loafWeightG: r.loafWeight, proofingContainer: proofInfo(r.shape).label,
           flours: r.flours.map((fl, i) => ({ name: fl.name, pct: i === 0 ? mainPct(r) : (+fl.pct || 0) })),
           waterPct: +r.water || 0,
           scald: (() => { const sc = scaldInfo(r); return sc.on ? { flour: sc.flourName, pctOfTotalFlour: Math.round(sc.sf * 10) / 10, liquid: sc.liquidName, liquidPctOfFlour: Math.round(sc.S * 10) / 10, method: sc.method } : null; })(),
@@ -1943,6 +2063,24 @@ export default function App() {
         .bl-recipe-card .brc-promote{font-family:'DM Sans';font-size:12px;font-weight:600;color:#5a3fa0;background:#ede8f8;border:none;border-radius:7px;padding:5px 10px;cursor:pointer;}
         .bl-re-hd{display:flex;align-items:center;gap:12px;margin-bottom:18px;padding-bottom:14px;border-bottom:1.5px solid var(--line);}
         .bl-re-title{font-family:'Fraunces',serif;font-weight:600;font-size:20px;color:var(--ink);}
+        .bl-ai-recipe{margin-bottom:18px;border:1.5px solid var(--line);border-radius:10px;background:#faf7f0;overflow:hidden;}
+        .bl-ai-recipe-toggle{width:100%;display:flex;align-items:center;gap:8px;padding:11px 14px;font-family:'DM Sans';font-size:13.5px;font-weight:600;color:var(--crust2);background:transparent;border:none;cursor:pointer;text-align:left;}
+        .bl-ai-dot{width:7px;height:7px;border-radius:50%;background:var(--crust);flex:none;}
+        .bl-ai-recipe-body{padding:0 14px 14px;display:flex;flex-direction:column;gap:9px;}
+        .bl-ai-recipe-input{width:100%;font-family:'DM Sans';font-size:13.5px;padding:9px 11px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);resize:vertical;box-sizing:border-box;}
+        .bl-ai-recipe-actions{display:flex;align-items:center;gap:10px;}
+        .bl-ai-recipe-error{font-size:12.5px;color:#b3261e;}
+        .bl-ai-recipe-preview{display:flex;flex-direction:column;gap:9px;padding-top:9px;border-top:1px dashed var(--line);}
+        .bl-ai-recipe-rationale{font-size:13px;color:var(--ink);line-height:1.5;}
+        .bl-ai-recipe-summary{font-family:'Fraunces',serif;font-size:14px;font-weight:600;color:var(--crust2);}
+        .bl-ai-recipe-note{font-size:11.5px;color:var(--ink2);}
+        .bl-ai-recipe-confirm{display:flex;gap:10px;align-items:center;}
+        .bl-ai-recipe-diff{display:flex;flex-direction:column;gap:5px;}
+        .bl-ai-diff-row{display:flex;align-items:baseline;gap:8px;font-family:'JetBrains Mono',monospace;font-size:12px;flex-wrap:wrap;}
+        .bl-ai-diff-field{font-weight:700;color:var(--ink);min-width:90px;}
+        .bl-ai-diff-before{color:var(--ink2);text-decoration:line-through;}
+        .bl-ai-diff-arrow{color:var(--ink2);}
+        .bl-ai-diff-after{color:var(--crust2);font-weight:600;}
         .bl-re-form{display:flex;flex-direction:column;gap:10px;}
         .bl-re-row{display:flex;gap:10px;flex-wrap:wrap;}
         .bl-re-row .bl-field2{width:120px;flex:1;}
@@ -2251,8 +2389,8 @@ export default function App() {
         .bl-build .ing.tot{background:var(--paper);font-weight:600;border-top:1.5px solid var(--ink);}
         .bl-build .ing.tot .nm{color:var(--crust2);}
         .bl-emptytab{text-align:center;padding:48px 20px;color:var(--ink2);font-size:13px;}
-        .bl-shape{display:flex;gap:6px;}
-        .shp{flex:1;font-family:'DM Sans';font-weight:600;font-size:13px;padding:8px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink2);cursor:pointer;}
+        .bl-shape{display:flex;gap:6px;flex-wrap:wrap;}
+        .shp{flex:1 1 calc(50% - 6px);font-family:'DM Sans';font-weight:600;font-size:13px;padding:8px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink2);cursor:pointer;}
         .shp.on{background:var(--crust2);border-color:var(--crust2);color:var(--paper);}
         .bl-build{cursor:pointer;transition:box-shadow .12s,border-color .12s,opacity .12s;min-width:0;}
         .bl-build:hover{border-color:var(--crust);}
@@ -2780,12 +2918,18 @@ export default function App() {
                 <span className="bl-re-title">{editingIsRemix ? "Remix" : (editingRecipeId ? "Edit core recipe" : "New core recipe")}</span>
                 <button className="bl-newday" style={{marginLeft:"auto"}} onClick={saveEdit}>Save</button>
               </div>
+              <RecipeAssistPanel
+                draft={editingDraft}
+                hasExisting={!!editingRecipeId}
+                onApplyFull={(r) => setEditingDraft((d) => ({ ...blankRecipe(), ...r, id: (d && d.id) || uid() }))}
+                onApplyPatch={(changes) => setEditingDraft((d) => (d ? { ...d, ...changes } : d))}
+              />
               <div className="bl-re-form">
                 <div className="bl-field"><label>Recipe name</label><BufferedInput className="bl-re-name-input" value={editingDraft.name || ""} onCommit={(v) => patchEdit({ name: v })} placeholder="Name this recipe" /></div>
                 <div className="bl-re-row">
                   <div className="bl-field2"><label>Loaf weight (g)</label><input type="number" min="0" value={editingDraft.loafWeight || 850} onChange={(e) => patchEdit({ loafWeight: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div className="bl-field2"><label>Autolyse (min)</label><input type="number" min="0" value={editingDraft.autolyse ?? 45} onChange={(e) => patchEdit({ autolyse: Math.max(0, Number(e.target.value) || 0) })} /></div>
-                  <div className="bl-field2"><label>Shape</label><select value={editingDraft.shape || "round"} onChange={(e) => patchEdit({ shape: e.target.value })}><option value="round">Round</option><option value="oval">Oval</option></select></div>
+                  <div className="bl-field2"><label>Proofing container</label><select data-f="shape" value={proofInfo(editingDraft.shape).key} onChange={(e) => patchEdit({ shape: e.target.value })}>{PROOF_CONTAINERS.map((c) => <option key={c.key} value={c.key}>{c.label}</option>)}</select></div>
                 </div>
                 <div className="bl-re-row">
                   <div className="bl-field2"><label>Wholesale price / loaf ($)</label><input type="number" min="0" step="0.25" value={editingDraft.price ?? 0} onChange={(e) => patchEdit({ price: Math.max(0, Number(e.target.value) || 0) })} /></div>
@@ -3211,10 +3355,9 @@ export default function App() {
                 ))}
                 <button className="bl-add" onClick={() => addInc(ti)}>+ Inclusion</button>
 
-                <div className="bl-subhead">Banneton shape</div>
-                <div className="bl-shape">
-                  <button className={"shp" + ((t.shape || "round") !== "oval" ? " on" : "")} onClick={() => setDraft(ti, { shape: "round" })}>Round</button>
-                  <button className={"shp" + (t.shape === "oval" ? " on" : "")} onClick={() => setDraft(ti, { shape: "oval" })}>Oval</button>
+                <div className="bl-subhead">Proofing container</div>
+                <div className="bl-shape" data-k="container">
+                  {PROOF_CONTAINERS.map((c) => <button key={c.key} data-f={"container-" + c.key} className={"shp" + (proofInfo(t.shape).key === c.key ? " on" : "")} onClick={() => setDraft(ti, { shape: c.key })}>{c.label}</button>)}
                 </div>
 
                 <div className="bl-typesum">
@@ -3391,9 +3534,9 @@ export default function App() {
             </div>
             <div>
               <div className="bl-card" style={{ marginBottom: 16 }}>
-                <div className="ch">Bannetons (one per loaf)</div>
+                <div className="ch">Proofing containers (one per loaf)</div>
                 {Object.keys(report.bann).length === 0 ? <div className="bl-line"><span className="nm" style={{ opacity: .6 }}>—</span></div> :
-                  Object.entries(report.bann).map(([sh, n]) => <div className="bl-line" key={sh}><span className="nm">{sh === "oval" ? "Oval" : "Round"} bannetons</span><span className="v">{n}</span></div>)}
+                  Object.entries(report.bann).map(([sh, n]) => <div className="bl-line" key={sh}><span className="nm">{proofInfo(sh).count}</span><span className="v">{n}</span></div>)}
               </div>
               <div className="bl-card">
                 <div className="ch">Hand-mix / bulk vessels</div>
@@ -3638,7 +3781,7 @@ export default function App() {
                   <div className={"bl-build" + (isA ? " active" : "") + (isD ? " done" : "")} key={i} onClick={() => setActiveBatch(isA ? null : i)}>
                     <div className="bh"><span className="bn">B{i + 1}</span><span className="bt">{t.name}{isD ? " · ✓ built" : ""}</span></div>
                     <div className="meta"><span>Autolyse <b>{fmtClock(startMin + base)}</b></span><span>Mix <b>{fmtClock(startMin + mixStart)}</b></span></div>
-                    <div className="meta"><span><b>{b.size}</b> loaves</span><span><b>{fmtG(b.dough)}</b> g dough</span><span>{(t.shape || "round") === "oval" ? "Oval" : "Round"}</span></div>
+                    <div className="meta"><span><b>{b.size}</b> loaves</span><span><b>{fmtG(b.dough)}</b> g dough</span><span>{proofInfo(t.shape).label}</span></div>
                     <div className="bl-build-ddt">Target dough temp<b>{showTemp(t.ddt ?? DDT_DEFAULT_C)}</b></div>
                     {(() => {
                       const sc = scaldInfo(t); if (!sc.on) return null;
