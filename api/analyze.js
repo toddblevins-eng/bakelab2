@@ -7,7 +7,7 @@ const MODEL = "claude-sonnet-5-5"; // swap to "claude-opus-4-8" for a deeper (sl
 
 const SYSTEM = `You are a master sourdough baker and bakery production consultant reviewing a recipe from BakeLab, the app of a naturally-leavened micro-boulangerie. The baker is fully fluent in baker's percentages, levain math, and fermentation — never explain fundamentals and never pad with encouragement. Be specific to the numbers given, concise, and honest about tradeoffs and risks. Use the stated loaf count plus the baker's mixer and oven capacity to flag scaling issues: total levain to build, number of mixer batches, oven loads, and timing knock-ons.
 
-Reply with ONLY a JSON object — no prose, no code fences — in exactly this shape:
+Give every temperature in °F and every weight in grams or kilograms in your text (the input data is in °C; convert it).\n\nReply with ONLY a JSON object — no prose, no code fences — in exactly this shape:
 {
   "summary": "one sentence read on the recipe",
   "expected": ["2-5 short strings on crumb, dough handling, flavor, and fermentation behavior given the formula"],
@@ -51,12 +51,11 @@ export default async function handler(req, res) {
       res.status(502).json({ error: "Claude returned no text (stop_reason: " + data.stop_reason + ", blocks: " + types + ")." });
       return;
     }
-    let parsed = null;
-    try { parsed = JSON.parse(text.replace(/^```json\s*/i, "").replace(/^```\s*/, "").replace(/\s*```$/, "").trim()); } catch (e) { parsed = null; }
+    const tryParse = (t) => { const a = t.indexOf("{"), b = t.lastIndexOf("}"); if (a < 0 || b <= a) return null; try { return JSON.parse(t.slice(a, b + 1)); } catch (e) { return null; } };
+    let parsed = tryParse(text);
     if (parsed && typeof parsed === "object") res.status(200).json(parsed);
     else res.status(200).json({ raw: text });
   } catch (e) {
     res.status(500).json({ error: (e && e.message) || "Server error" });
   }
 }
- 
