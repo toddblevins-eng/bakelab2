@@ -876,6 +876,17 @@ const fmtG = (x) => { if (!x) return "—"; const v = Math.round(x * 10) / 10; r
 const fmtKg = (g) => (g / 1000).toFixed(2) + "kg";
 const fmtTemp = (c) => (Math.round(c * 10) / 10) + "°C";
 const fmtWt = (g) => (g >= 1000 ? (g / 1000).toFixed(2) + " kg" : Math.round(g) + " g");
+// Egg conversions: grams of shelled egg per unit (large whole egg 50 g, yolk 18 g, white 33 g). Shell colour does not change the weight.
+const EGG_G = { whole: 50, yolk: 18, white: 33 };
+const eggCount = (name, g) => {
+  const n = String(name || "").toLowerCase();
+  if (!(g > 0) || !/\beggs?\b|\byolks?\b/.test(n) || /eggplant|egg wash/.test(n)) return "";
+  const kind = /\byolks?\b/.test(n) ? "yolk" : /\bwhites?\b/.test(n) ? "white" : "whole";
+  const q = g / EGG_G[kind];
+  const txt = q >= 10 ? String(Math.round(q)) : (Math.round(q * 10) / 10).toString();
+  const one = Math.abs(q - 1) < 0.05;
+  return "\u2248 " + txt + " " + (kind === "whole" ? (one ? "large egg" : "large eggs") : kind === "yolk" ? (one ? "yolk" : "yolks") : (one ? "white" : "whites"));
+};
 const fmtDelta = (m) => (m <= 0 ? "now" : m < 60 ? m + " min" : fmtDur(m));
 const DOUGH_DENSITY = 1.1; // g/mL
 const BULK_HEADROOM = 2.2; // vessel volume vs dough volume
@@ -2063,6 +2074,7 @@ export default function App() {
         .bl-recipe-card .brc-promote{font-family:'DM Sans';font-size:12px;font-weight:600;color:#5a3fa0;background:#ede8f8;border:none;border-radius:7px;padding:5px 10px;cursor:pointer;}
         .bl-re-hd{display:flex;align-items:center;gap:12px;margin-bottom:18px;padding-bottom:14px;border-bottom:1.5px solid var(--line);}
         .bl-re-title{font-family:'Fraunces',serif;font-weight:600;font-size:20px;color:var(--ink);}
+        .bl-eggnote{font-style:normal;font-weight:400;color:var(--ink2);font-size:.88em;}
         .bl-ai-recipe{margin-bottom:18px;border:1.5px solid var(--line);border-radius:10px;background:#faf7f0;overflow:hidden;}
         .bl-ai-recipe-toggle{width:100%;display:flex;align-items:center;gap:8px;padding:11px 14px;font-family:'DM Sans';font-size:13.5px;font-weight:600;color:var(--crust2);background:transparent;border:none;cursor:pointer;text-align:left;}
         .bl-ai-dot{width:7px;height:7px;border-radius:50%;background:var(--crust);flex:none;}
@@ -3527,7 +3539,7 @@ export default function App() {
                   const head = x.cat !== lastCat; lastCat = x.cat;
                   return (<React.Fragment key={idx}>
                     {head && <div className="bl-line cat">{catName[x.cat]}</div>}
-                    <div className={"bl-line" + (x.name.toLowerCase() === "levain" ? " hi" : "")}><span className="nm">{x.name}</span><span className="v">{fmtWt(x.g)}</span></div>
+                    <div className={"bl-line" + (x.name.toLowerCase() === "levain" ? " hi" : "")}><span className="nm">{x.name}</span><span className="v">{fmtWt(x.g)}{eggCount(x.name, x.g) ? <em className="bl-eggnote"> · {eggCount(x.name, x.g)}</em> : null}</span></div>
                   </React.Fragment>);
                 });
               })()}
@@ -3747,7 +3759,7 @@ export default function App() {
               {baseDoughGroups.map((g, gi) => (
                 <div className="bl-bd-group" key={gi}>
                   <div className="bl-bd-total">{fmtG(g.totalBase)} g base · {g.nBatches} {g.nBatches === 1 ? "mix" : "mixes"}{g.nBatches > 1 ? " (÷ evenly · " + (g.cap / 1000) + " kg cap)" : ""}</div>
-                  <div className="bl-bd-weigh">{g.weighOut.map((w, wi) => <span className="bl-bd-ing" key={wi}>{w.name} <b>{fmtG(w.g)} g</b></span>)}</div>
+                  <div className="bl-bd-weigh">{g.weighOut.map((w, wi) => <span className="bl-bd-ing" key={wi}>{w.name} <b>{fmtG(w.g)} g</b>{eggCount(w.name, w.g) ? <em className="bl-eggnote"> · {eggCount(w.name, w.g)}</em> : null}</span>)}</div>
                   <div className="bl-bd-split">
                     {g.members.map((m, mi) => (
                       <div className="bl-bd-member" key={mi}>
@@ -3793,7 +3805,7 @@ export default function App() {
                         </div>
                       );
                     })()}
-                    {cols.map((l) => <div className="ing" key={l.key}><span className="nm">{l.name}</span><span className="g">{fmtG(b.weights[l.key])} g{l.key === "water" && mixWaterTemp != null ? <em className="bl-watertemp"> · {showTemp(mixWaterTemp)}</em> : null}</span></div>)}
+                    {cols.map((l) => <div className="ing" key={l.key}><span className="nm">{l.name}</span><span className="g">{fmtG(b.weights[l.key])} g{l.key === "water" && mixWaterTemp != null ? <em className="bl-watertemp"> · {showTemp(mixWaterTemp)}</em> : null}{eggCount(l.name, b.weights[l.key]) ? <em className="bl-eggnote"> · {eggCount(l.name, b.weights[l.key])}</em> : null}</span></div>)}
                     <div className="ing tot"><span className="nm">Total flour</span><span className="g">{fmtG(b.totalFlour)} g</span></div>
                     <div className="ing tot"><span className="nm">Total water</span><span className="g">{fmtG(b.totalWater)} g</span></div>
                     {isA && <button className="bl-donebtn" onClick={(e) => { e.stopPropagation(); completeAndNext(i); }}>Done — built ✓</button>}
