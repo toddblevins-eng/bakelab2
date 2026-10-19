@@ -774,10 +774,19 @@ const sameIngList = (x, y, skipFirstPct) => {
   }
   return true;
 };
+const sameLiqList = (xs, ys) => {
+  xs = xs || []; ys = ys || [];
+  if (xs.length !== ys.length) return false;
+  for (let i = 0; i < xs.length; i++) {
+    if ((xs[i].name || "") !== (ys[i].name || "")) return false;
+    if ((+xs[i].pct || 0) !== (+ys[i].pct || 0) || (+xs[i].factor || 0) !== (+ys[i].factor || 0)) return false;
+  }
+  return true;
+};
 const sameFormula = (a, b) => {
   if (!a || !b) return false;
   for (const k of RECIPE_FORMULA_KEYS) { if (String(a[k] ?? "") !== String(b[k] ?? "")) return false; }
-  return sameIngList(a.flours, b.flours, true) && sameIngList(a.inclusions, b.inclusions, false) && JSON.stringify(scaldKeyPart(a)) === JSON.stringify(scaldKeyPart(b));
+  return sameIngList(a.flours, b.flours, true) && sameIngList(a.inclusions, b.inclusions, false) && sameLiqList(a.liquids, b.liquids) && JSON.stringify(scaldKeyPart(a)) === JSON.stringify(scaldKeyPart(b));
 };
 const flourPctOf = (t, idx) => (idx === 0 ? mainPct(t) : (+t.flours[idx].pct || 0));
 
@@ -1754,6 +1763,9 @@ export default function App() {
   const setIncPct = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.map((f, j) => (j === idx ? { ...f, pct: Math.max(0, Number(v) || 0) } : f)) }));
   const addInc = (ti) => patchDraft(ti, (d) => ({ ...d, inclusions: [...d.inclusions, mk("Inclusion " + (d.inclusions.length + 1), 0)] }));
   const removeInc = (ti, idx) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.filter((_, j) => j !== idx) }));
+  const setLiq = (ti, idx, patch) => patchDraft(ti, (d) => ({ ...d, liquids: (d.liquids || []).map((l, j) => (j === idx ? { ...l, ...patch } : l)) }));
+  const addLiq = (ti) => patchDraft(ti, (d) => ({ ...d, liquids: [...(d.liquids || []), mkL("Milk", 0, 88)] }));
+  const removeLiq = (ti, idx) => patchDraft(ti, (d) => ({ ...d, liquids: (d.liquids || []).filter((_, j) => j !== idx) }));
 
   // ---- recipe library ------------------------------------------------------
   const loadCoreRecipe = (ti, id) => { const r = coreRecipes.find((x) => x.id === id); if (r) patchSlot(ti, (s) => ({ ...s, coreRecipeId: id, draft: cloneRecipe(r) })); };
@@ -3353,6 +3365,17 @@ export default function App() {
                   <div className="bl-lev-exp"><label>Levain flour / experiment note</label><BufferedInput className="bl-lev-expnote" value={t.levExpNote || ""} onCommit={(v) => setDraft(ti, { levExpNote: v })} placeholder="e.g. straight bread flour · or 5% rye pre-ferment" /></div>
                   <div className="bl-lev-hint">Timing, water temp and the build recipe are computed on the <b>Levain</b> tab from {starter.name}'s calibration.</div>
                 </div>
+                <div className="bl-subhead" data-k="liquids">Liquids <span className="bl-sub-note">milk 88% · egg 75% · cream 60% · tangzhong liquid counts too</span></div>
+                {(t.liquids || []).length === 0 && <div className="ing-empty">No liquids besides water</div>}
+                {(t.liquids || []).map((l, idx) => (
+                  <div className="liq-row" data-k="liq-row" key={l.id}>
+                    <IngredientInput className="ing-name" value={l.name} onCommit={(v) => setLiq(ti, idx, { name: v })} placeholder="Milk / egg / tangzhong liquid" ingredients={ingredients} kind="liquid" />
+                    <div className="liq-cell"><input type="number" min="0" data-f="liq-pct" value={l.pct} onChange={(e) => setLiq(ti, idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
+                    <div className="liq-cell"><input type="number" min="0" max="100" data-f="liq-factor" value={l.factor} onChange={(e) => setLiq(ti, idx, { factor: Math.max(0, Math.min(100, Number(e.target.value) || 0)) })} /><em>% water</em></div>
+                    <button className="ing-x" title="Remove liquid" onClick={() => removeLiq(ti, idx)}>×</button>
+                  </div>
+                ))}
+                <button className="bl-add" data-f="add-liq" onClick={() => addLiq(ti)}>+ Liquid</button>
                 <HydrationLine t={t} onSetWater={(w) => setFixed(ti, "water", w)} />
                 <ScaldEditor t={t} onPatch={(p) => setDraft(ti, p)} />
 
