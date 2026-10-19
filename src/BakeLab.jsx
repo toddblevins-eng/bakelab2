@@ -1233,6 +1233,7 @@ export default function App() {
   const delDay = (id) => { setDays((ds) => { const nd = ds.filter((d) => d.id !== id); persist(DAYS_KEY, nd); return nd; }); if (currentDayId === id) { setCurrentDayId(null); setView("home"); } };
   const toggleComplete = (id) => setDays((ds) => { const nd = ds.map((d) => d.id === id ? { ...d, complete: !d.complete, updatedAt: Date.now() } : d); persist(DAYS_KEY, nd); return nd; });
   const backHome = () => { setView("home"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
+  const goHomeTab = (key) => { setHomeTab(key); if (key === "recipes") setBuilderView("list"); setView("home"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
   const stages = useMemo(() => buildStages(params), [params]);
   const cycleMin = useMemo(() => stages.reduce((s, x) => s + x.min, 0), [stages]);
   const startMin = parseTime(startTime);
@@ -1889,6 +1890,10 @@ export default function App() {
         .bl-brandstrip{display:flex;align-items:center;gap:11px;padding-bottom:12px;border-bottom:1px solid rgba(245,239,227,.08);margin-bottom:12px;}
         .bl-hap-logo-sm{height:20px;width:auto;color:var(--chrome-t);display:block;}
         .bl-prodname-sm{font-family:'Fraunces',serif;font-weight:600;font-size:16px;color:var(--chrome-m);letter-spacing:-0.2px;}
+        .bl-runnav{margin-left:auto;display:inline-flex;border:1.5px solid rgba(245,239,227,.18);border-radius:8px;overflow:hidden;flex:none;}
+        .bl-runnav button{font-family:'DM Sans';font-size:12.5px;font-weight:600;padding:8px 14px;border:none;background:transparent;color:var(--chrome-m);cursor:pointer;}
+        .bl-runnav button + button{border-left:1px solid rgba(245,239,227,.12);}
+        .bl-runnav button:hover{background:rgba(245,239,227,.1);color:var(--chrome-t);}
         .bl-prodname-sm::before{content:'';display:inline-block;width:1px;height:14px;background:rgba(245,239,227,.2);margin-right:11px;vertical-align:-2px;}
         .bl-dayhd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding-bottom:12px;}
         .bl-title{font-family:'Fraunces',serif;font-weight:600;font-size:26px;line-height:1;letter-spacing:-0.5px;color:var(--ink);display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
@@ -2704,6 +2709,7 @@ export default function App() {
           .bl-root{padding:0 12px 34px;}
           .bl-head{margin:0 -12px;padding:12px 12px 0;}
           .bl-tabs{margin:0 -12px 20px;padding:11px 14px;}
+          .bl-brandstrip{flex-wrap:wrap;} .bl-runnav{width:100%;margin-left:0;margin-top:2px;} .bl-runnav button{flex:1;min-height:40px;}
           .bl-title{font-size:20px;} .bl-title small{font-size:9px;letter-spacing:1.8px;} .bl-hap-logo{height:33px;} .bl-prodname{font-size:21px;}
           .bl-hap-logo-sm{height:32px;} .bl-prodname-sm{font-size:20px;}
           .bl-panel{padding:13px;}
@@ -3213,7 +3219,14 @@ export default function App() {
 
       {view === "editor" && (<>
       <div className="bl-head">
-        <div className="bl-brandstrip"><HapLogo className="bl-hap-logo-sm" /><span className="bl-prodname-sm">BakeLab</span></div>
+        <div className="bl-brandstrip"><HapLogo className="bl-hap-logo-sm" /><span className="bl-prodname-sm">BakeLab</span>
+          <div className="bl-runnav" data-k="runnav">
+            <button data-f="nav-bakedays" onClick={() => goHomeTab("bakedays")}>Runs</button>
+            <button data-f="nav-recipes" onClick={() => goHomeTab("recipes")}>Recipes</button>
+            <button data-f="nav-pantry" onClick={() => goHomeTab("pantry")}>Pantry</button>
+            <button data-f="nav-starter" onClick={() => goHomeTab("starter")}>{(starter.name && starter.name.trim()) || "Starter"}</button>
+          </div>
+        </div>
         <div className="bl-dayhd">
           <button className="bl-back" onClick={backHome} title="Runs" aria-label="Home"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 11.5 12 4l9 7.5" /><path d="M5 10v9h5v-5h4v5h5v-9" /></svg></button>
           <BufferedInput className="bl-dayname" value={dayName} onCommit={(v) => setDayName(v)} placeholder="Run name" />
