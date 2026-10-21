@@ -69,7 +69,33 @@ const MASS_G = { g: 1, kg: 1000, lb: 453.592, oz: 28.3495 };
 const VOL_ML = { mL: 1, L: 1000 };
 const PACK_UNITS = ["kg", "g", "lb", "oz", "L", "mL", "each"];
 const normName = (s) => String(s == null ? "" : s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-const blankPantryItem = (name) => ({ id: uid(), name: name || "New item", aliases: "", packSize: 0, packUnit: "kg", packPrice: 0, density: 1, onHandBase: 0, reorderBase: 0, leadDays: 0, supplier: "", usage: "recipe", perLoafQty: 0, perRunQty: 0 });
+// Ingredient groups. Stored on each pantry item as `group` ("" = Ungrouped); the Plan / Recipe dropdowns read the Pantry by group.
+const ING_GROUPS = [
+  { key: "flour", label: "Flour" },
+  { key: "dry", label: "Dry ingredients" },
+  { key: "wet", label: "Wet ingredients" },
+  { key: "dryinc", label: "Dry inclusions" },
+  { key: "freshinc", label: "Fresh inclusions" },
+  { key: "cheese", label: "Cheeses" },
+];
+const groupLabel = (k) => (ING_GROUPS.find((g) => g.key === k) || { label: "Ungrouped" }).label;
+const validGroup = (k) => (ING_GROUPS.some((g) => g.key === k) ? k : "");
+// Which groups each kind of dropdown offers. Inclusions take everything that is not a flour (sugar, butter and cheese are all added post-mix).
+const KIND_GROUPS = { flour: ["flour"], liquid: ["wet"], inclusion: ["dry", "wet", "dryinc", "freshinc", "cheese", ""] };
+// Best-guess grouping by name, first match wins; anything unmatched stays Ungrouped for the baker to sort.
+const GROUP_RULES = [
+  ["cheese", /cheese|cheddar|gruy[eè]re|asiago|parmesan|parmigiano|mozzarella|\bfeta\b|gouda|havarti|\bbrie\b|manchego|pecorino|romano|provolone|monterey|emmental|comt[eé]|fontina|ricotta|mascarpone|gorgonzola|\bswiss\b/],
+  ["flour", /flour|semolina|durum|\bspelt\b|kamut|einkorn|emmer|farina|\batta\b/],
+  ["dry", /powder|powdered/],
+  ["dry", /(dried|dehydrated)\s+(rosemary|thyme|basil|oregano|sage|parsley|dill|chives?|mint|tarragon|marjoram|herbs?)/],
+  ["dryinc", /\bdried\b|dehydrated|freeze.?dried/],
+  ["freshinc", /\bfresh\b|zest|scallion|green onion|\bonions?\b|\bgarlic\b|jalape|bell pepper|tomato|zucchini|carrot|spinach|\bkale\b|mushroom|potato|shallot|\bleeks?\b|cucumber|beet|squash|\bchives?\b/],
+  ["wet", /\bmilk\b|buttermilk|\beggs?\b|molasses|honey|\boil\b|butter|\bcream\b|yogh?urt|kefir|syrup|\bwater\b|vanilla|juice|vinegar|\blard\b|shortening|ghee|brandy|\brum\b|\bbeer\b|\bwine\b|puree|purée|\bmaple\b|agave/],
+  ["dryinc", /raisin|currant|cranberr|cherr|apricot|\bfigs?\b|\bdates?\b|prune|walnut|pecan|almond|hazelnut|pistachio|cashew|peanut|\bnuts?\b|seeds?\b|sunflower|pepita|sesame|poppy|\bflax|\bchia\b|chocolate|\bchips?\b|coconut|\boats?\b|cacao/],
+  ["dry", /\bsalt\b|sugar|spice|pepper|cinnamon|nutmeg|ginger|cumin|paprika|cardamom|cloves?\b|allspice|coriander|turmeric|yeast|baking|\bmalt\b|cornstarch|starch|gluten|lecithin|fennel|caraway|\banise?\b|cayenne|chil[ie]|cocoa|za.?atar/],
+];
+const guessGroup = (name) => { const n = String(name || "").toLowerCase(); if (!n.trim()) return ""; for (const [g, re] of GROUP_RULES) if (re.test(n)) return g; return ""; };
+const blankPantryItem = (name, group) => ({ id: uid(), name: name || "New item", aliases: "", packSize: 0, packUnit: "kg", packPrice: 0, density: 1, onHandBase: 0, reorderBase: 0, leadDays: 0, supplier: "", usage: "recipe", perLoafQty: 0, perRunQty: 0, group: group === undefined ? guessGroup(name) : group });
 const unitBase = (it) => (it.packUnit === "each" ? 1 : MASS_G[it.packUnit] ? MASS_G[it.packUnit] : VOL_ML[it.packUnit] ? VOL_ML[it.packUnit] * (+it.density || 1) : 0);
 const packBase = (it) => (+it.packSize || 0) * unitBase(it);
 const costPerBase = (it) => { const pb = packBase(it); return pb > 0 && +it.packPrice > 0 ? (+it.packPrice) / pb : 0; };
@@ -187,6 +213,23 @@ function PantryTab({ pantry, setPantry, costSettings, setCostSettings, coreRecip
   const sel = (e) => e.target.select();
   const disp = (base, it) => { const u = unitBase(it) || 1; return Math.round((base / u) * 1000) / 1000; };
   const recipeItems = pantry.filter((it) => it.usage === "recipe");
+  const [filter, setFilter] = useState("all");
+  const [q, setQ] = useState("");
+  const [pinId, setPinId] = useState(null);
+  const isRecipe = (it) => (it.usage || "recipe") === "recipe";
+  const gOrder = (it) => { if (!isRecipe(it)) return 99; const i = ING_GROUPS.findIndex((g) => g.key === validGroup(it.group)); return i === -1 ? 98 : i; };
+  const counts = useMemo(() => { const c = { all: pantry.length, ungrouped: 0, packaging: 0 }; ING_GROUPS.forEach((g) => { c[g.key] = 0; }); pantry.forEach((it) => { if (!isRecipe(it)) c.packaging++; else if (!validGroup(it.group)) c.ungrouped++; else c[it.group]++; }); return c; }, [pantry]);
+  const matches = (it) => {
+    const t = q.trim().toLowerCase();
+    if (t && !(String(it.name).toLowerCase().includes(t) || String(it.aliases || "").toLowerCase().includes(t))) return false;
+    if (filter === "all") return true;
+    if (filter === "packaging") return !isRecipe(it);
+    if (filter === "ungrouped") return isRecipe(it) && !validGroup(it.group);
+    return isRecipe(it) && validGroup(it.group) === filter;
+  };
+  const shown = pantry.filter(matches).sort((a, b) => gOrder(a) - gOrder(b) || String(a.name).localeCompare(String(b.name), undefined, { sensitivity: "base" }));
+  const list = pinId && pantry.some((it) => it.id === pinId) ? [...pantry.filter((it) => it.id === pinId), ...shown.filter((it) => it.id !== pinId)] : shown;
+  const chips = [{ key: "all", label: "All" }, ...ING_GROUPS, ...(counts.ungrouped > 0 || filter === "ungrouped" ? [{ key: "ungrouped", label: "Ungrouped" }] : []), ...(counts.packaging > 0 || filter === "packaging" ? [{ key: "packaging", label: "Packaging" }] : [])];
   const fromRecipes = useMemo(() => {
     const names = {}; const add = (n) => { const k = normName(n); if (k && k !== "water" && !names[k]) names[k] = String(n).trim(); };
     add("Salt");
@@ -213,17 +256,28 @@ function PantryTab({ pantry, setPantry, costSettings, setCostSettings, coreRecip
         <div className="pt-hint">The levain you build is real flour. Pick what it is fed with so costs and stock include it. Water is treated as free.</div>
       </div>
       <div className="pt-bar">
-        <button className="bl-add" data-f="addItem" onClick={() => setPantry((ps) => [...ps, blankPantryItem("New item")])}>+ Item</button>
+        <button className="bl-add" data-f="addItem" onClick={() => { const ni = blankPantryItem("New item"); setPantry((ps) => [...ps, ni]); setFilter("all"); setQ(""); setPinId(ni.id); }}>+ Item</button>
         {fromRecipes.length > 0 && <button className="bl-add" data-f="addFromRecipes" onClick={() => setPantry((ps) => [...ps, ...fromRecipes.map((n) => blankPantryItem(n))])}>Add {fromRecipes.length} from my recipes</button>}
       </div>
+      {pantry.length > 0 && (<>
+        <div className="pt-groups" data-k="ptGroups">
+          {chips.map((c) => <button key={c.key} data-f={"grp-" + c.key} className={"pt-chip" + (filter === c.key ? " on" : "")} onClick={() => { setFilter(c.key); setPinId(null); }}>{c.label}<em>{counts[c.key]}</em></button>)}
+        </div>
+        <input className="pt-search" data-f="ptSearch" type="search" placeholder="Search ingredients" value={q} onChange={(e) => { setQ(e.target.value); setPinId(null); }} />
+        {list.length === 0 && <div className="pt-empty">Nothing matches{q.trim() ? " “" + q.trim() + "”" : ""}{filter !== "all" ? " in " + (filter === "ungrouped" ? "Ungrouped" : filter === "packaging" ? "Packaging" : groupLabel(filter)) : ""}.</div>}
+      </>)}
       {pantry.length === 0 && <div className="pt-empty">Nothing here yet. “Add from my recipes” creates an item for every flour, liquid and inclusion you already use. Then fill in pack size and price.</div>}
-      {pantry.map((it) => {
+      {list.map((it, li) => {
+        const showHd = filter === "all" && !pinId && (li === 0 || gOrder(list[li - 1]) !== gOrder(it));
+        const hdLabel = !isRecipe(it) ? "Packaging & consumables" : groupLabel(validGroup(it.group));
         const cpb = costPerBase(it);
         const perTxt = cpb > 0 ? money(cpb * (it.packUnit === "each" ? 1 : 1000)) + (it.packUnit === "each" ? " each" : " / kg") : "no price yet";
         const isVol = !!VOL_ML[it.packUnit];
         const bl = it.packUnit === "each" ? "ea" : "g";
         return (
-          <div className={"pt-card item" + (cpb > 0 || it.usage !== "recipe" ? "" : " nopr")} key={it.id} data-item={it.name}>
+          <React.Fragment key={it.id}>
+          {showHd && <div className="pt-grp" data-grp={isRecipe(it) ? (validGroup(it.group) || "ungrouped") : "packaging"}>{hdLabel}</div>}
+          <div className={"pt-card item" + (cpb > 0 || it.usage !== "recipe" ? "" : " nopr")} data-item={it.name}>
             <div className="pt-top">
               <BufferedInput className="pt-name" value={it.name} onCommit={(v) => patch(it.id, { name: v })} placeholder="Ingredient name" />
               <span className={"pt-per" + (cpb > 0 ? "" : " bad")}>{perTxt}</span>
@@ -242,6 +296,7 @@ function PantryTab({ pantry, setPantry, costSettings, setCostSettings, coreRecip
               <label className="pt-f"><span>Supplier</span><input data-f="supplier" type="text" value={it.supplier || ""} onChange={(e) => patch(it.id, { supplier: e.target.value })} /></label>
             </div>
             <div className="pt-row">
+              {isRecipe(it) && <label className="pt-f sm"><span>Group</span><select data-f="group" value={validGroup(it.group)} onChange={(e) => patch(it.id, { group: e.target.value })}><option value="">Ungrouped</option>{ING_GROUPS.map((g) => <option key={g.key} value={g.key}>{g.label}</option>)}</select></label>}
               <label className="pt-f sm"><span>Used as</span>
                 <select data-f="usage" value={it.usage} onChange={(e) => patch(it.id, { usage: e.target.value })}>
                   <option value="recipe">Recipe ingredient</option><option value="perLoaf">Per loaf (packaging)</option><option value="perRun">Per run (consumable)</option>
@@ -251,6 +306,7 @@ function PantryTab({ pantry, setPantry, costSettings, setCostSettings, coreRecip
               <label className="pt-f"><span>Also matches (recipe names)</span><input data-f="aliases" type="text" value={it.aliases || ""} placeholder="e.g. AP flour, unbleached" onChange={(e) => patch(it.id, { aliases: e.target.value })} /></label>
             </div>
           </div>
+          </React.Fragment>
         );
       })}
     </div>
@@ -469,22 +525,6 @@ function DoughTempCalc({ tempUnit, uToC, cToU, initial, current, onApply, onClos
   );
 }
 
-function IngAddRow({ onAdd }) {
-  const [v, setV] = useState("");
-  const [kind, setKind] = useState("flour");
-  const add = () => { const n = v.trim(); if (n) { onAdd(n, kind); setV(""); } };
-  return (
-    <div className="bl-ing-add">
-      <div className="bl-ing-kindtoggle">
-        <button className={kind === "flour" ? "on" : ""} onClick={() => setKind("flour")}>Flour</button>
-        <button className={kind === "inclusion" ? "on" : ""} onClick={() => setKind("inclusion")}>Inclusion</button>
-      </div>
-      <input className="bl-ing-input" value={v} placeholder={"Add " + (kind === "inclusion" ? "inclusion" : "flour") + "…"} onChange={(e) => setV(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
-      <button className="bl-newday" style={{ fontSize: 13, padding: "8px 14px" }} onClick={add}>Add</button>
-    </div>
-  );
-}
-
 const DEFAULT_LIBRARY = [
   { id: uid(), name: "Country", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 90), mk("Whole wheat", 10)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, inclusions: [] },
   { id: uid(), name: "Seeded", loafWeight: 850, shape: "oval", flours: [mk("Bread flour", 80), mk("Whole wheat", 15), mk("Rye", 5)], water: 78, salt: 2.2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 4.5, levRefTemp: 24, levWhole: 5, levExpNote: "5% rye pre-ferment — testing for flavour depth", bakeTemp: 235, bakeMin: 42, steamMin: 18, autolyse: 60, inclusions: [mk("Mixed seeds", 12)] },
@@ -692,12 +732,15 @@ function BufferedInput({ value, onCommit, className, placeholder, rows }) {
     : <input className={className} placeholder={placeholder} value={v} onChange={handle} />;
 }
 
-// IngredientInput: clears on focus for typing; dropdown arrow shows saved ingredients
-function IngredientInput({ value, onCommit, className, placeholder, ingredients, kind = "flour" }) {
+// IngredientInput: clears on focus for typing; the dropdown lists pantry ingredients for this kind of field, A to Z.
+// `ingredients` is a list of { id, name, group }. Inclusion fields show group headings. A name the baker actually typed
+// (not one picked, not a default like "Flour 2") is handed to onNewName when the field loses focus.
+function IngredientInput({ value, onCommit, className, placeholder, ingredients, kind = "flour", onNewName }) {
   const [v, setV] = useState(value == null ? "" : value);
   const [open, setOpen] = useState(false);
   const [browse, setBrowse] = useState(false);
   const last = useRef(value == null ? "" : value);
+  const dirty = useRef(false);
   const wrapRef = useRef(null);
   useEffect(() => { const nv = value == null ? "" : value; if (nv !== last.current) { last.current = nv; setV(nv); } }, [value]);
   useEffect(() => {
@@ -705,20 +748,30 @@ function IngredientInput({ value, onCommit, className, placeholder, ingredients,
     const close = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
     document.addEventListener("mousedown", close); return () => document.removeEventListener("mousedown", close);
   }, [open]);
-  const commit = (nv) => { last.current = nv; setV(nv); onCommit(nv); setOpen(false); };
-  const pool = (ingredients || []).filter((i) => i.name && (i.kind || "flour") === kind);
+  const commit = (nv) => { last.current = nv; dirty.current = false; setV(nv); onCommit(nv); setOpen(false); };
+  const groups = KIND_GROUPS[kind] || KIND_GROUPS.flour;
+  const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+  const pool = (ingredients || []).filter((i) => i.name && groups.indexOf(validGroup(i.group)) !== -1).sort(byName);
   const filtered = (browse || !v) ? pool : pool.filter((i) => i.name.toLowerCase().includes(v.toLowerCase()));
+  const noun = kind === "inclusion" ? "inclusions" : kind === "liquid" ? "liquids" : "flours";
+  const row = (i) => <div key={i.id} className="bl-ingdrop-item" onMouseDown={(e) => e.preventDefault()} onClick={() => commit(i.name)}>{i.name}</div>;
   return (
     <div className="bl-ingwrap" ref={wrapRef}>
       <input className={className} value={v} placeholder={placeholder}
         onFocus={(e) => { setBrowse(true); e.target.select(); }}
-        onBlur={() => { setTimeout(() => { if (document.activeElement !== wrapRef.current) setOpen(false); }, 150); if (!v.trim()) { setV(last.current); } }}
-        onChange={(e) => { setV(e.target.value); setBrowse(false); onCommit(e.target.value); }} />
+        onBlur={() => {
+          setTimeout(() => { if (document.activeElement !== wrapRef.current) setOpen(false); }, 150);
+          if (!v.trim()) { setV(last.current); return; }
+          if (dirty.current && onNewName && !/^(flour|inclusion|liquid)\s*\d*$/i.test(v.trim())) onNewName(v.trim(), kind);
+          dirty.current = false;
+        }}
+        onChange={(e) => { dirty.current = true; setV(e.target.value); setBrowse(false); onCommit(e.target.value); }} />
       <button className="bl-ingdrop-btn" type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => { setBrowse(true); setOpen((o) => !o); }}>▾</button>
       {open && (
         <div className="bl-ingdrop">
-          {filtered.length === 0 ? <div className="bl-ingdrop-empty">No saved {kind === "inclusion" ? "inclusions" : "flours"}{(v && !browse) ? " matching" : " yet"}</div>
-            : filtered.map((i) => <div key={i.id} className="bl-ingdrop-item" onMouseDown={(e) => e.preventDefault()} onClick={() => commit(i.name)}>{i.name}</div>)}
+          {filtered.length === 0 ? <div className="bl-ingdrop-empty">No saved {noun}{(v && !browse) ? " matching" : " yet"} — add them in the Pantry tab</div>
+            : groups.length === 1 ? filtered.map(row)
+            : groups.map((g) => { const items = filtered.filter((i) => validGroup(i.group) === g); return items.length === 0 ? null : <React.Fragment key={g || "none"}><div className="bl-ingdrop-grp">{groupLabel(g)}</div>{items.map(row)}</React.Fragment>; })}
         </div>
       )}
     </div>
@@ -1326,12 +1379,18 @@ export default function App() {
             if (Array.isArray(gc.coreRecipes) && gc.coreRecipes.every((x) => Array.isArray(x.flours))) setCoreRecipes(gc.coreRecipes);
             else if (Array.isArray(gc.library) && gc.library.every((x) => Array.isArray(x.flours))) setCoreRecipes(gc.library); // migrate
             if (Array.isArray(gc.remixes)) setRemixes(gc.remixes);
-            if (Array.isArray(gc.ingredients)) setIngredients(gc.ingredients.map((i) => ({ ...i, kind: i.kind === "inclusion" ? "inclusion" : "flour" })));
             if (gc.starter && typeof gc.starter === "object") setStarter({ ...DEFAULT_STARTER, ...gc.starter });
             if (Array.isArray(gc.inocCal) && gc.inocCal.length === 2) setInocCal(gc.inocCal);
             else if (typeof gc.inocDoubleHrs === "number") setInocCal([{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + gc.inocDoubleHrs }]);
             if (gc.tempUnit === "C" || gc.tempUnit === "F") setTempUnit(gc.tempUnit);
-            if (Array.isArray(gc.pantry)) setPantry(gc.pantry.filter((x) => x && typeof x === "object" && x.id));
+            {
+              // Existing items get a best-guess group once (a missing field means "never looked at"; "" is a deliberate Ungrouped).
+              const basePantry = Array.isArray(gc.pantry) ? gc.pantry.filter((x) => x && typeof x === "object" && x.id).map((it) => (it.group === undefined ? { ...it, group: (it.usage || "recipe") === "recipe" ? guessGroup(it.name) : "" } : it)) : [];
+              // The old "Saved ingredients" list is folded into the pantry once, then emptied on the next save.
+              const extra = [];
+              (Array.isArray(gc.ingredients) ? gc.ingredients : []).forEach((i) => { if (i && i.name && !pantryFind([...basePantry, ...extra], i.name)) extra.push(blankPantryItem(String(i.name).trim(), guessGroup(i.name) || (i.kind === "inclusion" ? "" : "flour"))); });
+              if (Array.isArray(gc.pantry) || extra.length) setPantry([...basePantry, ...extra]);
+            }
             if (gc.costSettings && typeof gc.costSettings === "object") setCostSettings((cs) => ({ ...cs, ...gc.costSettings }));
           }
           let loadedDays = null;
@@ -1860,9 +1919,12 @@ export default function App() {
   const promoteRemixToCore = (id) => { const r = remixes.find((x) => x.id === id); if (!r) return; setCoreRecipes((rs) => [{ ...r, id: uid() }, ...rs]); setRemixes((rs) => rs.filter((x) => x.id !== id)); };
   const deleteCoreRecipe = (id) => setCoreRecipes((rs) => rs.filter((x) => x.id !== id));
   const deleteRemix = (id) => setRemixes((rs) => rs.filter((x) => x.id !== id));
-  const addIngredient = (name, kind) => { const n = name.trim(); if (!n || ingredients.some((i) => i.name.toLowerCase() === n.toLowerCase())) return; setIngredients((is) => [{ id: uid(), name: n, price: null, kind: kind === "inclusion" ? "inclusion" : "flour" }, ...is]); };
-  const deleteIngredient = (id) => setIngredients((is) => is.filter((i) => i.id !== id));
-  const toggleIngredientKind = (id) => setIngredients((is) => is.map((i) => i.id === id ? { ...i, kind: (i.kind || "flour") === "inclusion" ? "flour" : "inclusion" } : i));
+  // Dropdown source: the pantry's recipe ingredients (packaging and consumables are not offered). Names the baker types into a recipe are remembered in the pantry.
+  const ingOptions = useMemo(() => pantry.filter((it) => (it.usage || "recipe") === "recipe").map((it) => ({ id: it.id, name: it.name, group: validGroup(it.group) })), [pantry]);
+  const ensurePantryIng = (name, kind) => {
+    const n = String(name || "").trim(); if (!n || normName(n) === "water") return;
+    setPantry((ps) => (pantryFind(ps, n) ? ps : [...ps, blankPantryItem(n, guessGroup(n) || (kind === "flour" ? "flour" : kind === "liquid" ? "wet" : ""))]));
+  };
   const patchEdit = (patch) => setEditingDraft((d) => d ? { ...d, ...patch } : d);
   const patchEditFlour = (idx, patch) => setEditingDraft((d) => { if (!d) return d; const f = [...d.flours]; f[idx] = { ...f[idx], ...patch }; return { ...d, flours: f }; });
   const addEditFlour = () => setEditingDraft((d) => d ? { ...d, flours: [...d.flours, mk("Flour " + (d.flours.length + 1), 0)] } : d);
@@ -2131,7 +2193,9 @@ export default function App() {
         .bl-ingwrap{position:relative;display:flex;align-items:center;flex:1;min-width:0;}
         .bl-ingwrap .ing-name{flex:1;min-width:0;width:100%;padding-right:30px;}
         .bl-ingdrop-btn{position:absolute;right:4px;width:24px;height:100%;border:none;background:transparent;color:var(--ink2);cursor:pointer;font-size:11px;display:flex;align-items:center;justify-content:center;}
-        .bl-ingdrop{position:absolute;top:100%;left:0;right:0;z-index:200;background:#fff;border:1.5px solid var(--crust);border-radius:8px;box-shadow:0 6px 18px rgba(42,29,18,.14);max-height:160px;overflow-y:auto;margin-top:3px;}
+        .bl-ingdrop{position:absolute;top:100%;left:0;right:0;z-index:200;background:#fff;border:1.5px solid var(--crust);border-radius:8px;box-shadow:0 6px 18px rgba(42,29,18,.14);max-height:280px;overflow-y:auto;margin-top:3px;}
+        .bl-ingdrop-grp{padding:6px 12px 3px;font-family:'JetBrains Mono';font-size:9.5px;letter-spacing:1.4px;text-transform:uppercase;color:var(--crust2);font-weight:700;background:var(--paper);border-top:1px solid var(--line);}
+        .bl-ingdrop-grp:first-child{border-top:none;}
         .bl-ingdrop-item{padding:9px 12px;font-family:'DM Sans';font-size:13px;color:var(--ink);cursor:pointer;}
         .bl-ingdrop-item:hover{background:var(--paper2);}
         .bl-ingdrop-empty{padding:9px 12px;font-size:12px;color:var(--ink2);font-style:italic;}
@@ -2296,6 +2360,12 @@ export default function App() {
         .pt-hint,.pt-empty{font-size:12px;color:var(--ink2);line-height:1.4;}
         .pt-empty{padding:10px 2px 14px;}
         .pt-bar{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px;}
+        .pt-groups{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px;}
+        .pt-chip{font-family:'DM Sans';font-size:12.5px;font-weight:600;padding:7px 12px;border:1.5px solid var(--line);background:var(--cream);color:var(--ink2);border-radius:999px;cursor:pointer;}
+        .pt-chip.on{background:var(--chrome2);border-color:var(--chrome2);color:var(--chrome-t);}
+        .pt-chip em{font-style:normal;font-family:'JetBrains Mono';font-size:10.5px;opacity:.7;margin-left:6px;}
+        .pt-search{width:100%;box-sizing:border-box;font-family:'DM Sans';font-size:14px;padding:9px 12px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);margin:0 0 6px;}
+        .pt-grp{font-family:'JetBrains Mono';font-size:10px;letter-spacing:1.6px;text-transform:uppercase;color:var(--crust2);font-weight:700;margin:18px 2px 8px;}
         .pt-link{background:none;border:none;color:var(--crust2);text-decoration:underline;cursor:pointer;font:inherit;padding:0;}
         .sc-card{margin-bottom:16px;}
         .sc-card .ch-sub{font-family:'DM Sans';font-weight:400;font-size:11px;color:var(--ink2);margin-left:6px;}
@@ -2967,7 +3037,7 @@ export default function App() {
                 <div className="bl-subhead">Flours · main balances to 100%</div>
                 {(editingDraft.flours || []).map((f, idx) => (
                   <div className="ing-row" key={f.id}>
-                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchEditFlour(idx, { name: v })} placeholder={"Flour " + (idx + 1)} ingredients={ingredients} />
+                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchEditFlour(idx, { name: v })} placeholder={"Flour " + (idx + 1)} ingredients={ingOptions} onNewName={ensurePantryIng} />
                     {idx === 0
                       ? <div className="ing-pct main"><b>main</b><span>{Math.max(0, 100 - (editingDraft.flours.slice(1).reduce((a, x) => a + (+x.pct || 0), 0)))}</span><em>%</em></div>
                       : <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => patchEditFlour(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>}
@@ -2994,7 +3064,7 @@ export default function App() {
                 <div className="bl-subhead">Liquids <span className="bl-sub-note">milk 88% · egg 75% · cream 60% · tangzhong liquid counts too</span></div>
                 {(editingDraft.liquids || []).map((l, idx) => (
                   <div className="liq-row" key={l.id}>
-                    <IngredientInput className="ing-name" value={l.name} onCommit={(v) => patchEditLiq(idx, { name: v })} placeholder="Milk / egg / tangzhong liquid" ingredients={ingredients} kind="liquid" />
+                    <IngredientInput className="ing-name" value={l.name} onCommit={(v) => patchEditLiq(idx, { name: v })} placeholder="Milk / egg / tangzhong liquid" ingredients={ingOptions} onNewName={ensurePantryIng} kind="liquid" />
                     <div className="liq-cell"><input type="number" min="0" value={l.pct} onChange={(e) => patchEditLiq(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
                     <div className="liq-cell"><input type="number" min="0" max="100" value={l.factor} onChange={(e) => patchEditLiq(idx, { factor: Math.max(0, Math.min(100, Number(e.target.value) || 0)) })} /><em>% water</em></div>
                     <button className="ing-x" onClick={() => removeEditLiq(idx)}>×</button>
@@ -3006,7 +3076,7 @@ export default function App() {
                 <div className="bl-subhead">Inclusions</div>
                 {(editingDraft.inclusions || []).map((f, idx) => (
                   <div className="ing-row" key={f.id}>
-                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchEditInc(idx, { name: v })} placeholder={"Inclusion " + (idx + 1)} ingredients={ingredients} kind="inclusion" />
+                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchEditInc(idx, { name: v })} placeholder={"Inclusion " + (idx + 1)} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" />
                     <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => patchEditInc(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
                     <button className="ing-x" onClick={() => removeEditInc(idx)}>×</button>
                   </div>
@@ -3091,19 +3161,8 @@ export default function App() {
               </div>
               <div className="bl-subhead bl-builder-sh">Ingredients</div>
               <div className="bl-ing-manager">
-                <div className="bl-ing-list">
-                  {ingredients.length === 0 && <div className="bl-emptytab">No saved ingredients yet.</div>}
-                  {ingredients.map((i) => (
-                    <div className="bl-ing-row" key={i.id}>
-                      <span className="ir-name">{i.name}</span>
-                      {i.price != null && <span className="ir-price">${i.price}</span>}
-                      <button className={"ir-kind " + ((i.kind || "flour") === "inclusion" ? "inc" : "flr")} title="Tap to switch flour / inclusion" onClick={() => toggleIngredientKind(i.id)}>{(i.kind || "flour") === "inclusion" ? "inclusion" : "flour"}</button>
-                      <button className="ing-x" onClick={() => deleteIngredient(i.id)}>×</button>
-                    </div>
-                  ))}
-                </div>
-                <IngAddRow onAdd={addIngredient} />
-                <div className="bl-note" style={{marginTop:8}}>Saved ingredients appear in the matching dropdown — flours on flour fields, inclusions on inclusion fields. Tap a tag to switch which. Price tracking will come later.</div>
+                <div className="bl-note">Ingredients now live in the Pantry tab, grouped and sorted A to Z. The flour, liquid and inclusion dropdowns in Plan and Recipes read from there.</div>
+                <button className="bl-add" data-f="openPantryFromRecipes" style={{ marginTop: 8 }} onClick={() => setHomeTab("pantry")}>Open Pantry</button>
               </div>
             </div>
           )}
@@ -3158,7 +3217,7 @@ export default function App() {
                 <div className="bl-st-subhead">Flour blend {mPctSum !== 100 ? <span className="bl-warn">· sums to {mPctSum}%, should be 100</span> : null}</div>
                 {mflours.map((f, idx) => (
                   <div className="ing-row" key={f.id}>
-                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchStarterMFlour(idx, { name: v })} placeholder="Flour" ingredients={ingredients} />
+                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchStarterMFlour(idx, { name: v })} placeholder="Flour" ingredients={ingOptions} onNewName={ensurePantryIng} />
                     <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => patchStarterMFlour(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
                     <button className="ing-x" onClick={() => removeStarterMFlour(idx)}>×</button>
                   </div>
@@ -3348,7 +3407,7 @@ export default function App() {
                 <div className="bl-subhead">Flours · main flour balances to 100%</div>
                 {t.flours.map((f, idx) => (
                   <div className="ing-row" key={f.id}>
-                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => setFlourName(ti, idx, v)} placeholder={"Flour " + (idx + 1)} ingredients={ingredients} />
+                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => setFlourName(ti, idx, v)} placeholder={"Flour " + (idx + 1)} ingredients={ingOptions} onNewName={ensurePantryIng} />
                     {idx === 0
                       ? <div className="ing-pct main"><b>main</b><span>{mainPct(t)}</span><em>%</em></div>
                       : <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => setFlourPct(ti, idx, e.target.value)} /><em>%</em></div>}
@@ -3382,7 +3441,7 @@ export default function App() {
                 {(t.liquids || []).length === 0 && <div className="ing-empty">No liquids besides water</div>}
                 {(t.liquids || []).map((l, idx) => (
                   <div className="liq-row" data-k="liq-row" key={l.id}>
-                    <IngredientInput className="ing-name" value={l.name} onCommit={(v) => setLiq(ti, idx, { name: v })} placeholder="Milk / egg / tangzhong liquid" ingredients={ingredients} kind="liquid" />
+                    <IngredientInput className="ing-name" value={l.name} onCommit={(v) => setLiq(ti, idx, { name: v })} placeholder="Milk / egg / tangzhong liquid" ingredients={ingOptions} onNewName={ensurePantryIng} kind="liquid" />
                     <div className="liq-cell"><input type="number" min="0" data-f="liq-pct" value={l.pct} onChange={(e) => setLiq(ti, idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
                     <div className="liq-cell"><input type="number" min="0" max="100" data-f="liq-factor" value={l.factor} onChange={(e) => setLiq(ti, idx, { factor: Math.max(0, Math.min(100, Number(e.target.value) || 0)) })} /><em>% water</em></div>
                     <button className="ing-x" title="Remove liquid" onClick={() => removeLiq(ti, idx)}>×</button>
@@ -3396,7 +3455,7 @@ export default function App() {
                 {t.inclusions.length === 0 && <div className="ing-empty">No inclusions</div>}
                 {t.inclusions.map((f, idx) => (
                   <div className="ing-row" key={f.id}>
-                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => setIncName(ti, idx, v)} placeholder={"Inclusion " + (idx + 1)} ingredients={ingredients} kind="inclusion" />
+                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => setIncName(ti, idx, v)} placeholder={"Inclusion " + (idx + 1)} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" />
                     <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => setIncPct(ti, idx, e.target.value)} /><em>%</em></div>
                     <button className="ing-x" title="Remove inclusion" onClick={() => removeInc(ti, idx)}>×</button>
                   </div>
