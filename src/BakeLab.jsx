@@ -14,6 +14,10 @@ const NEW = "__new__";
 const uid = () => Math.random().toString(36).slice(2, 9);
 const mk = (name, pct) => ({ id: uid(), name, pct });
 const mkL = (name, pct, factor) => ({ id: uid(), name, pct, factor });
+// "When added": stored as `when` on each liquid and inclusion ("" = automatic). A liquid that is in the scald is derived from the scald settings.
+const WHEN_VALUES = ["autolyse", "mix", "fold1", "fold2", "fold3"];
+const WHEN_LABEL = { autolyse: "Autolyse", mix: "Mix", fold1: "Fold 1", fold2: "Fold 2", fold3: "Fold 3", scald: "Scald", end: "End of mix" };
+const cleanWhen = (v) => (WHEN_VALUES.indexOf(v) !== -1 ? v : "");
 
 // deep-copy a recipe with fresh ingredient ids (so slots never share refs)
 const DDT_DEFAULT_C = (76 - 32) * 5 / 9; // 76°F target dough temp, stored internally in °C
@@ -31,8 +35,8 @@ const cloneRecipe = (r) => ({
   price: r.price ?? 0,
   scald: !!r.scald, scaldFlour: r.scaldFlour || "", scaldPct: r.scaldPct ?? 10, scaldHyd: r.scaldHyd ?? 500, scaldLiquid: r.scaldLiquid || "", scaldMethod: r.scaldMethod === "poured" ? "poured" : "cooked",
   flours: r.flours.map((f) => mk(f.name, f.pct)),
-  inclusions: r.inclusions.map((f) => mk(f.name, f.pct)),
-  liquids: (r.liquids || []).map((l) => mkL(l.name, l.pct, l.factor ?? 100)),
+  inclusions: r.inclusions.map((f) => ({ ...mk(f.name, f.pct), when: cleanWhen(f.when) })),
+  liquids: (r.liquids || []).map((l) => ({ ...mkL(l.name, l.pct, l.factor ?? 100), when: cleanWhen(l.when) })),
 });
 const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", price: 0, scald: false, scaldFlour: "", scaldPct: 10, scaldHyd: 500, scaldLiquid: "", scaldMethod: "cooked", inclusions: [], liquids: [] });
 
@@ -469,6 +473,44 @@ function HapLogo({ className }) {
     </svg>
   );
 }
+// Where an ingredient goes in the mix. Fixed rules first (flours and water in the autolyse, salt and levain in the mix, bassinage at the very end of the mix,
+// scald ingredients in the scald), then the ingredient's own "When added" setting, then the defaults: liquids with the autolyse, dry-group inclusions
+// (sugar, spices) in the mix, every other inclusion at fold 2. A fold the run does not have goes to the last fold (or the end of the mix when there are none).
+const isScaldLiquid = (t, l) => !!t && !!t.scald && !!t.scaldLiquid && normName(t.scaldLiquid) !== "water" && normName(t.scaldLiquid) === normName(l.name);
+const defaultWhen = (kind, name, groupOf) => (kind === "liquid" ? "autolyse" : (groupOf(name) === "dry" ? "mix" : "fold2"));
+const placeLine = (t, l, groupOf, nF) => {
+  const k = l.key;
+  if (k === "scf" || k === "scw" || k === "scl") return { w: "scald", asked: "scald" };
+  if (k === "bassinage") return { w: "end", asked: "end" };
+  if (k === "salt" || k === "levain") return { w: "mix", asked: "mix" };
+  if (k.indexOf("fl_") === 0 || k === "water") return { w: "autolyse", asked: "autolyse" };
+  let item = null, kind = "inclusion";
+  if (k.indexOf("lq_") === 0) { kind = "liquid"; item = (t.liquids || []).find((x) => "lq_" + x.id === k); }
+  else if (k.indexOf("in_") === 0) item = (t.inclusions || []).find((x) => "in_" + x.id === k);
+  const asked = cleanWhen(item && item.when) || defaultWhen(kind, l.name, groupOf);
+  const fm = /^fold(\d)$/.exec(asked);
+  const w = fm ? (nF <= 0 ? "mix" : "fold" + Math.min(+fm[1], nF)) : asked;
+  return { w, asked };
+};
+// Choosing "Scald" on a liquid makes it the scald's liquid (amounts stay in the scald editor); choosing anything else on that liquid hands the scald back to water.
+const applyLiqWhen = (d, idx, v) => {
+  const liq = (d.liquids || [])[idx]; if (!liq) return d;
+  const wasScald = isScaldLiquid(d, liq);
+  let next = { ...d, liquids: d.liquids.map((l, j) => (j === idx ? { ...l, when: v === "scald" ? "" : cleanWhen(v) } : l)) };
+  if (v === "scald") next = { ...next, scald: true, scaldLiquid: liq.name, scaldPct: +d.scaldPct > 0 ? d.scaldPct : 10, scaldHyd: +d.scaldHyd > 0 ? d.scaldHyd : 500 };
+  else if (wasScald) next = { ...next, scaldLiquid: "" };
+  return next;
+};
+function WhenSelect({ kind, value, def, folds, onChange }) {
+  return (
+    <select className="when-sel" data-f="when" title="When this goes in" value={value} onChange={(e) => onChange(e.target.value)}>
+      <option value="">Auto ({WHEN_LABEL[def]})</option>
+      {WHEN_VALUES.map((v) => { const n = /^fold(\d)$/.exec(v); const over = n && folds != null && +n[1] > folds; return <option key={v} value={v}>{WHEN_LABEL[v]}{over ? " (run has " + folds + ")" : ""}</option>; })}
+      {kind === "liquid" && <option value="scald">Scald</option>}
+    </select>
+  );
+}
+
 // ---- Mix sheets: 4" x 6.5" portrait bench sheet per batch, one per Letter page with crop marks ----
 const MS_FORM = { w: 4, h: 6.5 }, MS_PAGE = { w: 8.5, h: 11 };
 // Eight hairline ticks that sit just OUTSIDE the form's four corners, each extending an edge line, so cutting through matching ticks gives exactly 4" x 6.5".
@@ -481,9 +523,8 @@ const cropMarkRects = (x, y, w, h, gap = 0.07, len = 0.28, th = 0.011) => {
   return r;
 };
 const joinAnd = (xs) => (xs.length <= 1 ? (xs[0] || "") : xs.slice(0, -1).join(", ") + " and " + xs[xs.length - 1]);
-// What goes on a mix sheet for one batch. The app does not record WHEN each ingredient is added, so it is derived:
-// flours, water, liquids and scald are the main (autolyse) mix; salt, levain and dry-group inclusions (sugar, spices) are the final mix;
-// bassinage ALWAYS goes in at the end of the mix (never at the folds); every other inclusion (butter, nuts, fruit, cheese, fresh) goes in at the stretch and folds.
+// What goes on a mix sheet for one batch. Each line is placed by placeLine(): scald ingredients in a make-ahead scald band, flours and water in the autolyse,
+// salt and levain (plus anything set to Mix) in the final mix, bassinage last in the mix, and anything set to a fold in a band for that fold.
 function mixSheetData({ b, i, total, t, params, groupOf, showTemp, waterTemp }) {
   const sc = scaldInfo(t);
   const aMin = Math.max(0, Math.round((t && t.autolyse != null ? +t.autolyse : +params.autolyse) || 0));
@@ -491,35 +532,35 @@ function mixSheetData({ b, i, total, t, params, groupOf, showTemp, waterTemp }) 
   const rest = Math.round(+params.restBetween || 0);
   const lines = ingLines(t).filter((l) => l.pct > 0);
   const oneFlour = (t.flours || []).length === 1; // with a single flour, "Scald flour" is unambiguous
-  const main = [], fin = [], fold = [], bass = [];
+  const slots = { scald: [], autolyse: [], mix: [], fold1: [], fold2: [], fold3: [], end: [] };
+  const warns = [];
   lines.forEach((l) => {
     const row = { key: l.key, name: oneFlour && l.key === "scf" ? "Scald flour" : l.name, g: b.weights[l.key], note: l.key === "water" && waterTemp != null ? showTemp(waterTemp) : "" };
-    if (l.key === "bassinage") bass.push(row);
-    else if (l.key.indexOf("in_") === 0) (groupOf(l.name) === "dry" ? fin : fold).push(row);
-    else if (l.key === "salt" || l.key === "levain") fin.push(row);
-    else main.push(row);
+    const pl = placeLine(t, l, groupOf, nF);
+    slots[pl.w].push(row);
+    if (pl.asked !== pl.w && /^fold/.test(pl.asked)) warns.push(l.name + ": " + WHEN_LABEL[pl.asked] + " is more folds than this run has (" + nF + "), so it goes in " + (nF > 0 ? "at " + WHEN_LABEL[pl.w] : "at the end of the mix") + ".");
   });
-  if (nF === 0) fin.push(...fold); // no folds scheduled: those go in at the end of the mix
-  const atFolds = nF > 0 ? fold : [];
-  const finNames = fin.map((r) => r.name);
-  fin.push(...bass); // bassinage is always the last thing in the mix
+  const mixRows = [...slots.mix, ...slots.end];
   const bands = [];
-  if (aMin > 0) { if (main.length) bands.push({ label: "Autolyse · " + aMin + " min", rows: main }); if (fin.length) bands.push({ label: "Final mix", rows: fin }); }
-  else bands.push({ label: "Main mix", rows: [...main, ...fin] });
-  if (atFolds.length) bands.push({ label: "Stretch & folds", rows: atFolds });
+  if (slots.scald.length) bands.push({ label: "Scald · cook first", rows: slots.scald });
+  if (aMin > 0) { if (slots.autolyse.length) bands.push({ label: "Autolyse · " + aMin + " min", rows: slots.autolyse }); if (mixRows.length) bands.push({ label: "Final mix", rows: mixRows }); }
+  else bands.push({ label: "Main mix", rows: [...slots.autolyse, ...mixRows] });
+  [1, 2, 3].forEach((k) => { if (slots["fold" + k].length) bands.push({ label: "Fold " + k, rows: slots["fold" + k] }); });
   const ddt = showTemp(t.ddt ?? DDT_DEFAULT_C);
-  const scTxt = sc.on ? " Cooked scald goes in fully cooled." : "";
-  const bassTxt = bass.length ? " At the end of the mix, work in the bassinage water a little at a time until absorbed." : "";
+  const bassTxt = slots.end.length ? " At the end of the mix, work in the bassinage water a little at a time until absorbed." : "";
+  const scAdd = slots.scald.length ? " and the cooled scald" : "";
   const steps = [];
+  if (slots.scald.length) steps.push(sc.method === "poured" ? "Scald (make ahead): pour the just-boiled liquid over the scald flour and mix to a paste. Cool fully." : "Scald (make ahead): whisk the scald flour and liquid over medium heat to " + showTemp(65) + " until it thickens like pudding. Cool fully.");
   if (aMin > 0) {
-    steps.push("Autolyse: combine the autolyse ingredients and mix until no dry flour remains. Rest " + aMin + " min." + scTxt);
-    steps.push("Final mix: " + (finNames.length ? "add " + joinAnd(finNames) + ", then mix" : "mix") + " to " + ddt + "." + bassTxt);
+    steps.push("Autolyse: combine the autolyse ingredients" + scAdd + " and mix until no dry flour remains. Rest " + aMin + " min.");
+    const mixNames = slots.mix.map((r) => r.name);
+    steps.push("Final mix: " + (mixNames.length ? "add " + joinAnd(mixNames) + ", then mix" : "mix") + " to " + ddt + "." + bassTxt);
   } else {
-    steps.push("Mix: combine everything under Main mix and mix to " + ddt + "." + bassTxt + scTxt);
+    steps.push("Mix: combine everything under Main mix" + scAdd + " and mix to " + ddt + "." + bassTxt);
   }
   if (nF > 0) {
     steps.push("Stretch & folds × " + nF + (rest ? ", " + rest + " min apart" : "") + ".");
-    if (atFolds.length) steps.push("Fold " + Math.min(2, nF) + ": add " + joinAnd(atFolds.map((r) => r.name)) + " and fold gently to distribute.");
+    [1, 2, 3].forEach((k) => { const rows = slots["fold" + k]; if (rows.length) steps.push("Fold " + k + ": add " + joinAnd(rows.map((r) => r.name)) + " and fold gently to distribute."); });
   }
   // Fit: estimate the title, the ingredient column and the step list, and shrink the type for this sheet when the content would not
   // fit the top half (heights scale with the type; characters per line scale the other way). Nothing is ever clipped silently.
@@ -531,7 +572,7 @@ function mixSheetData({ b, i, total, t, params, groupOf, showTemp, waterTemp }) 
   const stepAt = (sc2) => DDT * sc2 + steps.reduce((a2, st) => a2 + Math.ceil(st.length / (SCH / sc2)) * SH * sc2 + SG * sc2, 0);
   const fitDown = (need) => { let v = 1; while (v > 0.5 && need(v) > 0.93 * avail) v = Math.round((v - 0.02) * 100) / 100; return v; };
   const scale = fitDown(ingAt), tscale = fitDown(stepAt);
-  return { n: i + 1, total, name: t.name, size: b.size, dough: b.dough, totalFlour: b.totalFlour, totalWater: b.totalWater, shape: proofInfo(t.shape).label, ddt, bands, steps, scale, tscale };
+  return { n: i + 1, total, name: t.name, size: b.size, dough: b.dough, totalFlour: b.totalFlour, totalWater: b.totalWater, shape: proofInfo(t.shape).label, ddt, bands, steps, scale, tscale, warns };
 }
 function MixSheetForm({ L, tempUnit, onFit }) {
   const ref = useRef(null);
@@ -953,6 +994,7 @@ const sameIngList = (x, y, skipFirstPct) => {
   for (let i = 0; i < xs.length; i++) {
     if ((xs[i].name || "") !== (ys[i].name || "")) return false;
     if (!(skipFirstPct && i === 0) && (+xs[i].pct || 0) !== (+ys[i].pct || 0)) return false;
+    if (cleanWhen(xs[i].when) !== cleanWhen(ys[i].when)) return false;
   }
   return true;
 };
@@ -962,6 +1004,7 @@ const sameLiqList = (xs, ys) => {
   for (let i = 0; i < xs.length; i++) {
     if ((xs[i].name || "") !== (ys[i].name || "")) return false;
     if ((+xs[i].pct || 0) !== (+ys[i].pct || 0) || (+xs[i].factor || 0) !== (+ys[i].factor || 0)) return false;
+    if (cleanWhen(xs[i].when) !== cleanWhen(ys[i].when)) return false;
   }
   return true;
 };
@@ -1953,6 +1996,7 @@ export default function App() {
   const addFlour = (ti) => patchDraft(ti, (d) => ({ ...d, flours: [...d.flours, mk("Flour " + (d.flours.length + 1), 0)] }));
   const removeFlour = (ti, idx) => patchDraft(ti, (d) => ({ ...d, flours: d.flours.filter((_, j) => j !== idx) }));
   const setIncName = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.map((f, j) => (j === idx ? { ...f, name: v } : f)) }));
+  const setIncWhen = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.map((f, j) => (j === idx ? { ...f, when: cleanWhen(v) } : f)) }));
   const setIncPct = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.map((f, j) => (j === idx ? { ...f, pct: Math.max(0, Number(v) || 0) } : f)) }));
   const addInc = (ti) => patchDraft(ti, (d) => ({ ...d, inclusions: [...d.inclusions, mk("Inclusion " + (d.inclusions.length + 1), 0)] }));
   const removeInc = (ti, idx) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.filter((_, j) => j !== idx) }));
@@ -2003,13 +2047,13 @@ export default function App() {
           flours: r.flours.map((fl, i) => ({ name: fl.name, pct: i === 0 ? mainPct(r) : (+fl.pct || 0) })),
           waterPct: +r.water || 0,
           scald: (() => { const sc = scaldInfo(r); return sc.on ? { flour: sc.flourName, pctOfTotalFlour: Math.round(sc.sf * 10) / 10, liquid: sc.liquidName, liquidPctOfFlour: Math.round(sc.S * 10) / 10, method: sc.method } : null; })(),
-          liquids: (r.liquids || []).map((l) => ({ name: l.name, pct: +l.pct || 0, waterFactorPct: +l.factor || 100 })),
+          liquids: (r.liquids || []).map((l) => ({ name: l.name, pct: +l.pct || 0, waterFactorPct: +l.factor || 100, ...(isScaldLiquid(r, l) ? { addedAt: "scald" } : cleanWhen(l.when) ? { addedAt: cleanWhen(l.when) } : {}) })),
           saltPct: +r.salt || 0, levainPct: +r.levain || 0, levainHydrationPct: +r.levHyd || 80, inoculationPct: +r.levInoc || 10,
           levainBuildHrs: +r.levBuildHrs || 5, levainRefTempC: +r.levRefTemp || 24, levainWholeGrainPct: +r.levWhole || 0,
           trueHydrationPct: Math.round(trueHydration(r) * 10) / 10,
           autolyseMin: +r.autolyse || 45, targetDoughTempC: Math.round((+r.ddt || DDT_DEFAULT_C) * 10) / 10,
           bakeTempC: +r.bakeTemp || 245, bakeMin: +r.bakeMin || 45, steamMin: +r.steamMin || 20,
-          inclusions: (r.inclusions || []).map((fl) => ({ name: fl.name, pct: +fl.pct || 0 })),
+          inclusions: (r.inclusions || []).map((fl) => ({ name: fl.name, pct: +fl.pct || 0, ...(cleanWhen(fl.when) ? { addedAt: cleanWhen(fl.when) } : {}) })),
         },
         loaves,
         rig: { mixerDoughCapacityG: maxBatch, ovenLoafCapacity: cap },
@@ -2287,6 +2331,9 @@ export default function App() {
         .bl-recipe-card .brc-promote{font-family:'DM Sans';font-size:12px;font-weight:600;color:#5a3fa0;background:#ede8f8;border:none;border-radius:7px;padding:5px 10px;cursor:pointer;}
         .bl-re-hd{display:flex;align-items:center;gap:12px;margin-bottom:18px;padding-bottom:14px;border-bottom:1.5px solid var(--line);}
         .bl-re-title{font-family:'Fraunces',serif;font-weight:600;font-size:20px;color:var(--ink);}
+        .when-end{display:flex;align-items:center;gap:6px;flex:0 1 192px;min-width:0;}
+        .when-sel{font-family:'DM Sans';font-size:12px;padding:6px 6px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);flex:1 1 auto;min-width:0;}
+        .bl-when{font-style:normal;font-family:'JetBrains Mono';font-size:10px;font-weight:700;color:var(--crust2);}
         .bl-eggnote{font-style:normal;font-weight:400;color:var(--ink2);font-size:.88em;}
         .bl-ai-recipe{margin-bottom:18px;border:1.5px solid var(--line);border-radius:10px;background:#faf7f0;overflow:hidden;}
         .bl-ai-recipe-toggle{width:100%;display:flex;align-items:center;gap:8px;padding:11px 14px;font-family:'DM Sans';font-size:13.5px;font-weight:600;color:var(--crust2);background:transparent;border:none;cursor:pointer;text-align:left;}
@@ -2350,7 +2397,8 @@ export default function App() {
         .bl-save.saved{background:transparent;color:var(--ink2);border-color:var(--line);cursor:default;}
         .bl-recmod{font-size:10.5px;color:var(--crust);font-style:italic;margin-bottom:6px;height:14px;}
         .bl-subhead{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--crust2);font-weight:600;margin:13px 0 7px;}
-        .ing-row{display:flex;gap:7px;align-items:center;margin-bottom:6px;}
+        .ing-row{display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin-bottom:6px;}
+        .ing-row .bl-ingwrap,.liq-row .bl-ingwrap{flex:1 1 130px;min-width:130px;}
         .ing-name{flex:1;min-width:0;font-family:'DM Sans';font-size:13px;padding:6px 8px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);}
         .ing-pct{display:flex;align-items:center;width:80px;flex:none;position:relative;}
         .ing-pct input{width:100%;font-family:'JetBrains Mono';font-size:13px;padding:6px 17px 6px 7px;border:1.5px solid var(--line);border-radius:6px;background:#fff;text-align:right;}
@@ -3192,7 +3240,7 @@ export default function App() {
               <RecipeAssistPanel
                 draft={editingDraft}
                 hasExisting={!!editingRecipeId}
-                onApplyFull={(r) => setEditingDraft((d) => ({ ...blankRecipe(), ...r, id: (d && d.id) || uid() }))}
+                onApplyFull={(r) => { const tidy = (xs) => (Array.isArray(xs) ? xs.map((x) => ({ ...x, id: x.id || uid(), when: cleanWhen(x.when) })) : undefined); setEditingDraft((d) => ({ ...blankRecipe(), ...r, ...(tidy(r.liquids) ? { liquids: tidy(r.liquids) } : {}), ...(tidy(r.inclusions) ? { inclusions: tidy(r.inclusions) } : {}), id: (d && d.id) || uid() })); }}
                 onApplyPatch={(changes) => setEditingDraft((d) => (d ? { ...d, ...changes } : d))}
               />
               <div className="bl-re-form">
@@ -3238,7 +3286,10 @@ export default function App() {
                     <IngredientInput className="ing-name" value={l.name} onCommit={(v) => patchEditLiq(idx, { name: v })} placeholder="Milk / egg / tangzhong liquid" ingredients={ingOptions} onNewName={ensurePantryIng} kind="liquid" />
                     <div className="liq-cell"><input type="number" min="0" value={l.pct} onChange={(e) => patchEditLiq(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
                     <div className="liq-cell"><input type="number" min="0" max="100" value={l.factor} onChange={(e) => patchEditLiq(idx, { factor: Math.max(0, Math.min(100, Number(e.target.value) || 0)) })} /><em>% water</em></div>
-                    <button className="ing-x" onClick={() => removeEditLiq(idx)}>×</button>
+                    <span className="when-end">
+                      <WhenSelect kind="liquid" value={isScaldLiquid(editingDraft, l) ? "scald" : cleanWhen(l.when)} def="autolyse" onChange={(v) => setEditingDraft((d) => (d ? applyLiqWhen(d, idx, v) : d))} />
+                      <button className="ing-x" onClick={() => removeEditLiq(idx)}>×</button>
+                    </span>
                   </div>
                 ))}
                 <button className="bl-add" onClick={addEditLiq}>+ Liquid</button>
@@ -3249,7 +3300,10 @@ export default function App() {
                   <div className="ing-row" key={f.id}>
                     <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchEditInc(idx, { name: v })} placeholder={"Inclusion " + (idx + 1)} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" />
                     <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => patchEditInc(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
-                    <button className="ing-x" onClick={() => removeEditInc(idx)}>×</button>
+                    <span className="when-end">
+                      <WhenSelect kind="inclusion" value={cleanWhen(f.when)} def={defaultWhen("inclusion", f.name, groupOf)} onChange={(v) => patchEditInc(idx, { when: cleanWhen(v) })} />
+                      <button className="ing-x" onClick={() => removeEditInc(idx)}>×</button>
+                    </span>
                   </div>
                 ))}
                 <button className="bl-add" onClick={addEditInc}>+ Inclusion</button>
@@ -3615,7 +3669,10 @@ export default function App() {
                     <IngredientInput className="ing-name" value={l.name} onCommit={(v) => setLiq(ti, idx, { name: v })} placeholder="Milk / egg / tangzhong liquid" ingredients={ingOptions} onNewName={ensurePantryIng} kind="liquid" />
                     <div className="liq-cell"><input type="number" min="0" data-f="liq-pct" value={l.pct} onChange={(e) => setLiq(ti, idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
                     <div className="liq-cell"><input type="number" min="0" max="100" data-f="liq-factor" value={l.factor} onChange={(e) => setLiq(ti, idx, { factor: Math.max(0, Math.min(100, Number(e.target.value) || 0)) })} /><em>% water</em></div>
-                    <button className="ing-x" title="Remove liquid" onClick={() => removeLiq(ti, idx)}>×</button>
+                    <span className="when-end">
+                      <WhenSelect kind="liquid" value={isScaldLiquid(t, l) ? "scald" : cleanWhen(l.when)} def="autolyse" folds={Math.floor(+params.folds || 0)} onChange={(v) => patchDraft(ti, (d) => applyLiqWhen(d, idx, v))} />
+                      <button className="ing-x" title="Remove liquid" onClick={() => removeLiq(ti, idx)}>×</button>
+                    </span>
                   </div>
                 ))}
                 <button className="bl-add" data-f="add-liq" onClick={() => addLiq(ti)}>+ Liquid</button>
@@ -3628,7 +3685,10 @@ export default function App() {
                   <div className="ing-row" key={f.id}>
                     <IngredientInput className="ing-name" value={f.name} onCommit={(v) => setIncName(ti, idx, v)} placeholder={"Inclusion " + (idx + 1)} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" />
                     <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => setIncPct(ti, idx, e.target.value)} /><em>%</em></div>
-                    <button className="ing-x" title="Remove inclusion" onClick={() => removeInc(ti, idx)}>×</button>
+                    <span className="when-end">
+                      <WhenSelect kind="inclusion" value={cleanWhen(f.when)} def={defaultWhen("inclusion", f.name, groupOf)} folds={Math.floor(+params.folds || 0)} onChange={(v) => setIncWhen(ti, idx, v)} />
+                      <button className="ing-x" title="Remove inclusion" onClick={() => removeInc(ti, idx)}>×</button>
+                    </span>
                   </div>
                 ))}
                 <button className="bl-add" onClick={() => addInc(ti)}>+ Inclusion</button>
@@ -4075,7 +4135,7 @@ export default function App() {
                         </div>
                       );
                     })()}
-                    {cols.map((l) => <div className="ing" key={l.key}><span className="nm">{l.name}</span><span className="g">{fmtG(b.weights[l.key])} g{l.key === "water" && mixWaterTemp != null ? <em className="bl-watertemp"> · {showTemp(mixWaterTemp)}</em> : null}{eggCount(l.name, b.weights[l.key]) ? <em className="bl-eggnote"> · {eggCount(l.name, b.weights[l.key])}</em> : null}</span></div>)}
+                    {cols.map((l) => <div className="ing" key={l.key}><span className="nm">{l.name}</span><span className="g">{fmtG(b.weights[l.key])} g{l.key === "water" && mixWaterTemp != null ? <em className="bl-watertemp"> · {showTemp(mixWaterTemp)}</em> : null}{eggCount(l.name, b.weights[l.key]) ? <em className="bl-eggnote"> · {eggCount(l.name, b.weights[l.key])}</em> : null}{(() => { const pl = placeLine(t, l, groupOf, Math.floor(+params.folds || 0)); return (/^fold/.test(pl.w) || pl.w === "end") ? <em className="bl-when" data-k="whentag"> · {pl.w === "end" ? "end of mix" : WHEN_LABEL[pl.w]}</em> : null; })()}</span></div>)}
                     <div className="ing tot"><span className="nm">Total flour</span><span className="g">{fmtG(b.totalFlour)} g</span></div>
                     <div className="ing tot"><span className="nm">Total water</span><span className="g">{fmtG(b.totalWater)} g</span></div>
                     {isA && <button className="bl-donebtn" onClick={(e) => { e.stopPropagation(); completeAndNext(i); }}>Done — built ✓</button>}
@@ -4429,6 +4489,7 @@ export default function App() {
               {shown.length === 0 && <div className="label-print-hint">No sheets selected.</div>}
               {shown.map((L) => (
                 <React.Fragment key={L.n}>
+                {L.warns.map((w, wi) => <div className="label-print-hint ms-warn" data-k="mswhen" key={wi}>B{L.n}: {w}</div>)}
                 {mixSheetOver[L.n] && <div className="label-print-hint ms-warn" data-k="mswarn">B{L.n}: more than fits on this sheet, even at the smallest type. The lowest rows may be cut off, so check the preview below. Trim or combine ingredients before printing.</div>}
                 <div className="label-sheet ms-page" data-k="mspage" style={{ width: MS_PAGE.w + "in", height: MS_PAGE.h + "in", position: "relative" }}>
                   {marks.map((m, mi) => <div className="ms-crop" key={mi} style={{ left: m.left + "in", top: m.top + "in", width: m.width + "in", height: m.height + "in" }} />)}
