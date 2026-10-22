@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import React, { useState, useEffect, useLayoutEffect, useMemo, useCallback, useRef } from "react";
 
 // ---------------------------------------------------------------------------
 // BakeLab Production Gantt  ·  v5
@@ -483,64 +483,91 @@ const cropMarkRects = (x, y, w, h, gap = 0.07, len = 0.28, th = 0.011) => {
 const joinAnd = (xs) => (xs.length <= 1 ? (xs[0] || "") : xs.slice(0, -1).join(", ") + " and " + xs[xs.length - 1]);
 // What goes on a mix sheet for one batch. The app does not record WHEN each ingredient is added, so it is derived:
 // flours, water, liquids and scald are the main (autolyse) mix; salt, levain and dry-group inclusions (sugar, spices) are the final mix;
-// bassinage and every other inclusion (butter, nuts, fruit, cheese, fresh) go in at the stretch and folds.
+// bassinage ALWAYS goes in at the end of the mix (never at the folds); every other inclusion (butter, nuts, fruit, cheese, fresh) goes in at the stretch and folds.
 function mixSheetData({ b, i, total, t, params, groupOf, showTemp, waterTemp }) {
   const sc = scaldInfo(t);
   const aMin = Math.max(0, Math.round((t && t.autolyse != null ? +t.autolyse : +params.autolyse) || 0));
   const nF = Math.max(0, Math.floor(+params.folds || 0));
   const rest = Math.round(+params.restBetween || 0);
   const lines = ingLines(t).filter((l) => l.pct > 0);
-  const main = [], fin = [], fold = [];
+  const oneFlour = (t.flours || []).length === 1; // with a single flour, "Scald flour" is unambiguous
+  const main = [], fin = [], fold = [], bass = [];
   lines.forEach((l) => {
-    const row = { key: l.key, name: l.name, g: b.weights[l.key], note: l.key === "water" && waterTemp != null ? showTemp(waterTemp) : "" };
-    if (l.key === "bassinage") fold.push(row);
+    const row = { key: l.key, name: oneFlour && l.key === "scf" ? "Scald flour" : l.name, g: b.weights[l.key], note: l.key === "water" && waterTemp != null ? showTemp(waterTemp) : "" };
+    if (l.key === "bassinage") bass.push(row);
     else if (l.key.indexOf("in_") === 0) (groupOf(l.name) === "dry" ? fin : fold).push(row);
     else if (l.key === "salt" || l.key === "levain") fin.push(row);
     else main.push(row);
   });
   if (nF === 0) fin.push(...fold); // no folds scheduled: those go in at the end of the mix
   const atFolds = nF > 0 ? fold : [];
+  const finNames = fin.map((r) => r.name);
+  fin.push(...bass); // bassinage is always the last thing in the mix
   const bands = [];
   if (aMin > 0) { if (main.length) bands.push({ label: "Autolyse · " + aMin + " min", rows: main }); if (fin.length) bands.push({ label: "Final mix", rows: fin }); }
   else bands.push({ label: "Main mix", rows: [...main, ...fin] });
   if (atFolds.length) bands.push({ label: "Stretch & folds", rows: atFolds });
   const ddt = showTemp(t.ddt ?? DDT_DEFAULT_C);
   const scTxt = sc.on ? " Cooked scald goes in fully cooled." : "";
+  const bassTxt = bass.length ? " At the end of the mix, work in the bassinage water a little at a time until absorbed." : "";
   const steps = [];
   if (aMin > 0) {
     steps.push("Autolyse: combine the autolyse ingredients and mix until no dry flour remains. Rest " + aMin + " min." + scTxt);
-    steps.push("Final mix: " + (fin.length ? "add " + joinAnd(fin.map((r) => r.name)) + ", then mix" : "mix") + " to " + ddt + ".");
+    steps.push("Final mix: " + (finNames.length ? "add " + joinAnd(finNames) + ", then mix" : "mix") + " to " + ddt + "." + bassTxt);
   } else {
-    steps.push("Mix: combine everything under Main mix and mix to " + ddt + "." + scTxt);
+    steps.push("Mix: combine everything under Main mix and mix to " + ddt + "." + bassTxt + scTxt);
   }
   if (nF > 0) {
     steps.push("Stretch & folds × " + nF + (rest ? ", " + rest + " min apart" : "") + ".");
-    if (atFolds.some((r) => r.key === "bassinage")) steps.push("Fold 1: work in the bassinage water a little at a time until absorbed.");
-    const incs = atFolds.filter((r) => r.key !== "bassinage");
-    if (incs.length) steps.push("Fold " + Math.min(2, nF) + ": add " + joinAnd(incs.map((r) => r.name)) + " and fold gently to distribute.");
+    if (atFolds.length) steps.push("Fold " + Math.min(2, nF) + ": add " + joinAnd(atFolds.map((r) => r.name)) + " and fold gently to distribute.");
   }
-  // Fit: estimate the title height, the ingredient column and the step list (names wrap at about 26 characters, steps at about 29),
-  // and shrink the type for this sheet when the content would not fit the top half. Nothing is ever clipped silently.
-  const nl = String(t.name || "").length, nSize = nl > 44 ? 9 : nl > 28 ? 10.5 : 12, nPer = nl > 44 ? 29 : nl > 28 ? 25 : 21;
-  const hdr = Math.max(0.3, Math.ceil(nl / nPer) * nSize * 1.05 / 72 + 0.3);
-  const avail = 3.2 - 0.2 - 0.07 - hdr - 0.06;
-  const ingNeed = bands.reduce((a, bd) => a + 0.155 + bd.rows.reduce((x, r) => x + Math.ceil((r.name.length + 1) / 26) * 0.142, 0), 0) + 0.2;
-  const stepNeed = steps.reduce((a, st) => a + Math.ceil(st.length / 29) * 0.134 + 0.035, 0);
-  const scale = Math.max(0.55, Math.min(1, 0.95 * avail / Math.max(ingNeed * 1.04, stepNeed, 0.01)));
-  return { n: i + 1, total, name: t.name, size: b.size, dough: b.dough, totalFlour: b.totalFlour, totalWater: b.totalWater, shape: proofInfo(t.shape).label, ddt, bands, steps, scale: Math.round(scale * 100) / 100 };
+  // Fit: estimate the title, the ingredient column and the step list, and shrink the type for this sheet when the content would not
+  // fit the top half (heights scale with the type; characters per line scale the other way). Nothing is ever clipped silently.
+  const nl = String(t.name || "").length, nSize = nl > 44 ? 10.8 : nl > 27 ? 12.6 : 14.4, nPer = nl > 44 ? 36 : nl > 27 ? 31 : 27;
+  const hdr = Math.ceil(nl / nPer) * nSize * 1.05 / 72 + 0.18;
+  const avail = 2.95 - 0.1 - 0.06 - 0.06 - hdr;
+  const ROW = 0.16, BAND = 0.175, NCH = 18, SH = 0.161, SG = 0.035, SCH = 27, DDT = 0.36;
+  const ingAt = (sc2) => 1.04 * (bands.reduce((a2, bd) => a2 + BAND * sc2 + bd.rows.reduce((x, r) => x + Math.max(1, Math.ceil(r.name.length / (NCH / sc2))) * ROW * sc2, 0), 0));
+  const stepAt = (sc2) => DDT * sc2 + steps.reduce((a2, st) => a2 + Math.ceil(st.length / (SCH / sc2)) * SH * sc2 + SG * sc2, 0);
+  const fitDown = (need) => { let v = 1; while (v > 0.5 && need(v) > 0.93 * avail) v = Math.round((v - 0.02) * 100) / 100; return v; };
+  const scale = fitDown(ingAt), tscale = fitDown(stepAt);
+  return { n: i + 1, total, name: t.name, size: b.size, dough: b.dough, totalFlour: b.totalFlour, totalWater: b.totalWater, shape: proofInfo(t.shape).label, ddt, bands, steps, scale, tscale };
 }
-function MixSheetForm({ L, tempUnit }) {
+function MixSheetForm({ L, tempUnit, onFit }) {
+  const ref = useRef(null);
+  const sig = JSON.stringify([L.name, L.bands, L.steps, L.size, L.ddt, tempUnit]);
+  // Fit: where the browser can lay the sheet out, measure it. The ingredient table and the steps are fitted separately: each starts at full
+  // size and shrinks until its content clears the box with a little room to spare. Without layout (tests) the estimated scales stay in force.
+  useLayoutEffect(() => {
+    const f = ref.current; if (!f) return;
+    let dead = false;
+    const q = (c) => f.querySelector("." + c);
+    const bb = (el) => el.getBoundingClientRect();
+    const ingFits = () => { const ing = q("ms-ing"), bands = ing.querySelectorAll(".ms-band"); if (!bands.length) return true; return bb(bands[bands.length - 1]).bottom - bb(ing).top <= bb(ing).height - 3; };
+    const stepsFit = () => bb(q("ms-steps")).bottom <= bb(q("ms-right")).bottom - 3;
+    const botOver = () => { const e = q("ms-bot"); return e.scrollHeight > e.clientHeight + 1; };
+    const run = () => {
+      if (dead || !f.clientHeight) return;
+      const down = (fits, prop) => { let v = 1; f.style.setProperty(prop, v); while (!fits() && v > 0.5) { v = Math.round((v - 0.02) * 100) / 100; f.style.setProperty(prop, v); } return v; };
+      const si = down(ingFits, "--ms-s"), st = down(stepsFit, "--ms-t");
+      f.setAttribute("data-fit", String(si)); f.setAttribute("data-fit-t", String(st));
+      if (onFit) onFit(L.n, !ingFits() || !stepsFit() || botOver());
+    };
+    run();
+    if (typeof document !== "undefined" && document.fonts && document.fonts.ready) document.fonts.ready.then(run);
+    return () => { dead = true; };
+  }, [sig]);
   const field = (label) => <div className="ms-f"><span>{label}</span><i /></div>;
   return (
-    <div className="ms-form" data-k="msform" data-scale={L.scale} style={{ "--ms-s": L.scale }}>
+    <div className="ms-form" ref={ref} data-k="msform" data-scale={L.scale} data-scale-t={L.tscale} style={{ "--ms-s": L.scale, "--ms-t": L.tscale }}>
+      <div className="ms-clip" data-k="msclip" />
       <div className="ms-top">
         <div className="ms-hd">
           <span className="ms-n">B{L.n}</span>
           <div className="ms-title">
-            <div className={"ms-name" + (L.name.length > 44 ? " xs" : L.name.length > 28 ? " sm" : "")}>{L.name}</div>
+            <div className={"ms-name" + (L.name.length > 44 ? " xs" : L.name.length > 27 ? " sm" : "")}>{L.name}</div>
             <div className="ms-sub">Mix {L.n} of {L.total} · {L.size} loaves · {fmtG(L.dough)} g dough · {L.shape}</div>
           </div>
-          <div className="ms-ddt"><span>Target dough temp</span><b>{L.ddt}</b></div>
         </div>
         <div className="ms-cols">
           <div className="ms-ing">
@@ -550,22 +577,22 @@ function MixSheetForm({ L, tempUnit }) {
                 {bd.rows.map((r, ri) => <div className="ms-row" key={ri}><span className="ms-rn">{r.name}</span><span className="ms-rg">{fmtG(r.g)} g{r.note ? <em>{r.note}</em> : null}</span></div>)}
               </div>
             ))}
-            <div className="ms-tot">{L.totalFlour > 0 && <span>Flour {fmtG(L.totalFlour)} g</span>}{L.totalWater > 0 && <span>Water {fmtG(L.totalWater)} g</span>}</div>
           </div>
-          <ol className="ms-steps">{L.steps.map((st, si) => <li key={si}>{st}</li>)}</ol>
+          <div className="ms-right">
+            <div className="ms-ddt"><span>Target dough temp</span><b>{L.ddt}</b></div>
+            <ol className="ms-steps">{L.steps.map((st, si) => <li key={si}>{st}</li>)}</ol>
+          </div>
         </div>
       </div>
       <div className="ms-bot">
-        <div className="ms-lh">Mix log</div>
         <div className="ms-fr">{field("Date")}{field("Autolyse mixed (time)")}{field("Final mix (time)")}</div>
         <div className="ms-fr">{field("Actual dough temp (°" + tempUnit + ")")}{field("pH after mix")}</div>
         <table className="ms-prog">
-          <colgroup><col style={{ width: "0.7in" }} /><col style={{ width: "0.7in" }} /><col style={{ width: "0.72in" }} /><col /></colgroup>
-          <thead><tr><th>Time</th><th>% rise</th><th>pH (if used)</th><th>Progress notes</th></tr></thead>
-          <tbody>{[0, 1, 2, 3, 4].map((r) => <tr key={r}><td /><td /><td /><td /></tr>)}</tbody>
+          <colgroup><col /><col style={{ width: "0.7in" }} /><col style={{ width: "0.7in" }} /><col style={{ width: "0.72in" }} /></colgroup>
+          <thead><tr><th>Progress notes</th><th>Time</th><th>% rise</th><th>pH (if used)</th></tr></thead>
+          <tbody>{["", "", "", "Shaping", "Cold Retard"].map((lab, r) => <tr key={r}><td className={lab ? "lbl" : undefined}>{lab}</td><td /><td /><td /></tr>)}</tbody>
         </table>
-        <div className="ms-fr">{field("Shaping: % rise / pH")}{field("Cold retard: % rise / pH")}</div>
-        <div className="ms-notes"><span>Bake notes</span><div className="ms-rules">{[0, 1, 2, 3].map((r) => <i key={r} />)}</div></div>
+        <div className="ms-notes"><span>Bake notes</span><div className="ms-rules">{[0, 1, 2].map((r) => <i key={r} />)}</div></div>
       </div>
     </div>
   );
@@ -1315,6 +1342,8 @@ export default function App() {
   const [labelOpen, setLabelOpen] = useState(false);
   const [mixSheetOpen, setMixSheetOpen] = useState(false);
   const [mixSheetOff, setMixSheetOff] = useState([]);
+  const [mixSheetOver, setMixSheetOver] = useState({});
+  const onMixFit = useCallback((n, over) => setMixSheetOver((st) => (!!st[n] === !!over ? st : { ...st, [n]: !!over })), []);
   const [labelOffX, setLabelOffX] = useState(0); // calibration nudge, mm
   const [labelSkip, setLabelSkip] = useState([]); // positions already peeled off sheet 1
   const [labelCopies, setLabelCopies] = useState({}); // batch index -> copy count (default 1)
@@ -2967,39 +2996,40 @@ export default function App() {
         .lc-foot{font-size:7pt;color:#555;border-top:0.5pt solid #ccc;padding-top:2pt;margin-top:3pt;}
         .ms-crop{position:absolute;background:#1a1a1a;}
         .ms-form{position:relative;box-sizing:border-box;width:4in;height:6.5in;overflow:hidden;background:#fff;color:#1a1a1a;font-family:'DM Sans',sans-serif;}
-        .ms-top{box-sizing:border-box;height:3.2in;padding:0.14in 0.16in 0.06in;border-bottom:1pt solid #1a1a1a;display:flex;flex-direction:column;gap:0.07in;overflow:hidden;}
+        .ms-clip{height:0.5in;}
+        .ms-top{box-sizing:border-box;height:2.95in;padding:0.1in 0.16in 0.06in;border-bottom:1pt solid #1a1a1a;display:flex;flex-direction:column;gap:0.06in;overflow:hidden;}
         .ms-hd{display:flex;align-items:center;gap:0.1in;}
-        .ms-n{flex:none;font-family:'JetBrains Mono';font-weight:700;font-size:13pt;color:#fff;background:#1a1a1a;border-radius:3pt;padding:2pt 6pt;}
+        .ms-n{flex:none;font-family:'JetBrains Mono';font-weight:700;font-size:15.6pt;color:#fff;background:#1a1a1a;border-radius:3pt;padding:2pt 7pt;}
         .ms-title{flex:1;min-width:0;}
-        .ms-name{font-family:'Fraunces',serif;font-weight:600;font-size:12pt;line-height:1.05;}
-        .ms-name.sm{font-size:10.5pt;}
-        .ms-name.xs{font-size:9pt;}
-        .ms-sub{font-family:'JetBrains Mono';font-size:6.2pt;color:#444;margin-top:2pt;}
-        .ms-ddt{flex:none;border:1.25pt solid #1a1a1a;border-radius:4pt;padding:2pt 6pt;text-align:center;line-height:1.1;}
-        .ms-ddt span{display:block;font-size:5.4pt;text-transform:uppercase;letter-spacing:.5pt;color:#444;}
-        .ms-ddt b{font-family:'JetBrains Mono';font-size:13pt;}
+        .ms-name{font-family:'Fraunces',serif;font-weight:600;font-size:14.4pt;line-height:1.05;}
+        .ms-name.sm{font-size:12.6pt;}
+        .ms-name.xs{font-size:10.8pt;}
+        .ms-sub{font-family:'DM Sans',sans-serif;font-weight:500;font-size:7.6pt;color:#444;margin-top:2pt;}
         .ms-cols{flex:1;display:flex;gap:0.12in;min-height:0;overflow:hidden;}
-        .ms-ing{flex:none;width:1.9in;display:flex;flex-direction:column;}
-        .ms-bh{font-family:'JetBrains Mono';font-size:calc(5.8pt * var(--ms-s,1));font-weight:700;letter-spacing:.6pt;text-transform:uppercase;color:#fff;background:#4a4a4a;padding:1pt 4pt;margin-top:2pt;}
-        .ms-row{display:flex;justify-content:space-between;align-items:baseline;gap:4pt;font-size:calc(7.8pt * var(--ms-s,1));line-height:1.25;border-bottom:0.4pt solid #d6d6d6;}
+        .ms-ing{flex:none;width:1.7in;display:flex;flex-direction:column;}
+        .ms-right{flex:1;min-width:0;display:flex;flex-direction:column;gap:calc(4pt * var(--ms-t,1));}
+        .ms-ddt{display:flex;justify-content:space-between;align-items:center;gap:4pt;border:1.25pt solid #1a1a1a;border-radius:4pt;padding:2pt 6pt;line-height:1.1;}
+        .ms-ddt span{font-size:calc(6.5pt * var(--ms-t,1));text-transform:uppercase;letter-spacing:.5pt;color:#444;}
+        .ms-ddt b{font-family:'JetBrains Mono';font-size:calc(15.6pt * var(--ms-t,1));}
+        .ms-bh{font-family:'JetBrains Mono';font-size:calc(7pt * var(--ms-s,1));font-weight:700;letter-spacing:.6pt;text-transform:uppercase;color:#fff;background:#4a4a4a;padding:1pt 4pt;margin-top:2pt;}
+        .ms-row{display:flex;justify-content:space-between;align-items:baseline;gap:4pt;font-size:calc(9.4pt * var(--ms-s,1));line-height:1.2;border-bottom:0.4pt solid #d6d6d6;}
         .ms-rn{min-width:0;overflow-wrap:anywhere;}
         .ms-rg{font-family:'JetBrains Mono';font-weight:700;flex:none;font-size:.94em;}
         .ms-rg em{font-style:normal;font-weight:500;font-size:.8em;color:#444;margin-left:3pt;}
-        .ms-tot{margin-top:auto;display:flex;justify-content:space-between;font-family:'JetBrains Mono';font-size:calc(6.4pt * var(--ms-s,1));border-top:0.75pt solid #1a1a1a;padding-top:1.5pt;}
-        .ms-steps{flex:1;min-width:0;margin:0;padding:0 0 0 0.13in;font-size:calc(7.4pt * var(--ms-s,1));line-height:1.3;}
-        .ms-steps li{margin-bottom:calc(2.5pt * var(--ms-s,1));}
-        .ms-bot{box-sizing:border-box;height:3.3in;padding:0.07in 0.16in 0.1in;display:flex;flex-direction:column;gap:0.04in;overflow:hidden;}
-        .ms-lh{font-family:'JetBrains Mono';font-size:6pt;font-weight:700;letter-spacing:1pt;text-transform:uppercase;color:#444;}
+        .ms-steps{margin:0;padding:0 0 0 0.15in;font-size:calc(8.9pt * var(--ms-t,1));line-height:1.3;}
+        .ms-steps li{margin-bottom:calc(2.5pt * var(--ms-t,1));}
+        .ms-bot{box-sizing:border-box;height:3.05in;padding:0.05in 0.16in 0.06in;display:flex;flex-direction:column;gap:0.035in;overflow:hidden;}
         .ms-fr{display:flex;gap:0.12in;}
-        .ms-f{flex:1;min-width:0;display:flex;flex-direction:column;font-size:6pt;color:#444;}
+        .ms-f{flex:1;min-width:0;display:flex;flex-direction:column;font-size:7.2pt;line-height:1.1;color:#444;}
         .ms-f i{display:block;height:0.19in;border-bottom:0.75pt solid #1a1a1a;}
         .ms-prog{border-collapse:collapse;width:100%;table-layout:fixed;}
-        .ms-prog th{font-size:5.8pt;font-weight:600;color:#444;text-align:left;padding:0 0 1pt 2pt;border-bottom:0.75pt solid #1a1a1a;}
-        .ms-prog td{height:0.19in;border-bottom:0.5pt solid #999;border-right:0.5pt solid #ccc;}
+        .ms-prog th{font-size:7pt;line-height:1.1;font-weight:600;color:#444;text-align:left;padding:0 0 1pt 2pt;border-bottom:0.75pt solid #1a1a1a;}
+        .ms-prog td{padding:0;height:0.22in;border-bottom:0.5pt solid #999;border-right:0.5pt solid #ccc;}
         .ms-prog td:last-child{border-right:none;}
-        .ms-notes{flex:none;height:0.86in;display:flex;flex-direction:column;font-size:6pt;color:#444;}
-        .ms-rules{flex:none;height:0.76in;overflow:hidden;}
-        .ms-rules i{display:block;height:0.19in;border-bottom:0.5pt solid #999;}
+        .ms-prog td.lbl{padding-left:2pt;font-size:8pt;font-weight:600;color:#1a1a1a;vertical-align:middle;}
+        .ms-notes{flex:none;display:flex;flex-direction:column;font-size:7.2pt;line-height:1.1;color:#444;}
+        .ms-rules{flex:none;height:0.66in;overflow:hidden;}
+        .ms-rules i{display:block;height:0.22in;border-bottom:0.5pt solid #999;}
         @media print { .ms-form, .ms-form *, .ms-crop { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
         @media (max-width:600px){ .label-stage{zoom:.42;} .label-print-ui{gap:9px;padding:11px 12px;} .lpu-spacer{flex-basis:100%;height:0;} }
         @media print {
@@ -4398,12 +4428,15 @@ export default function App() {
             <div className="label-sheets">
               {shown.length === 0 && <div className="label-print-hint">No sheets selected.</div>}
               {shown.map((L) => (
-                <div className="label-sheet ms-page" key={L.n} data-k="mspage" style={{ width: MS_PAGE.w + "in", height: MS_PAGE.h + "in", position: "relative" }}>
+                <React.Fragment key={L.n}>
+                {mixSheetOver[L.n] && <div className="label-print-hint ms-warn" data-k="mswarn">B{L.n}: more than fits on this sheet, even at the smallest type. The lowest rows may be cut off, so check the preview below. Trim or combine ingredients before printing.</div>}
+                <div className="label-sheet ms-page" data-k="mspage" style={{ width: MS_PAGE.w + "in", height: MS_PAGE.h + "in", position: "relative" }}>
                   {marks.map((m, mi) => <div className="ms-crop" key={mi} style={{ left: m.left + "in", top: m.top + "in", width: m.width + "in", height: m.height + "in" }} />)}
                   <div style={{ position: "absolute", left: fx + "in", top: fy + "in", width: MS_FORM.w + "in", height: MS_FORM.h + "in" }}>
-                    <MixSheetForm L={L} tempUnit={tempUnit} />
+                    <MixSheetForm L={L} tempUnit={tempUnit} onFit={onMixFit} />
                   </div>
                 </div>
+                </React.Fragment>
               ))}
             </div>
           </div>
