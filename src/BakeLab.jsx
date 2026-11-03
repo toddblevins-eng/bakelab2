@@ -25,6 +25,7 @@ const cloneRecipe = (r) => ({
   name: r.name, loafWeight: r.loafWeight, shape: r.shape || "round", water: r.water, salt: r.salt, levain: r.levain,
   levHyd: r.levHyd ?? 80, levInoc: r.levInoc ?? 10, levRefInoc: r.levRefInoc ?? 10, levBuildHrs: r.levBuildHrs ?? 5, levRefTemp: r.levRefTemp ?? 24,
   levWhole: r.levWhole ?? 0, levExpNote: r.levExpNote || "",
+  levSugar: r.levSugar ?? 0, levSugarName: r.levSugarName || "",
   ddt: r.ddt ?? DDT_DEFAULT_C,
   bakeTemp: r.bakeTemp ?? 245, bakeMin: r.bakeMin ?? 45, steamMin: r.steamMin ?? 20,
   autolyse: r.autolyse ?? 45,
@@ -38,7 +39,7 @@ const cloneRecipe = (r) => ({
   inclusions: r.inclusions.map((f) => ({ ...mk(f.name, f.pct), when: cleanWhen(f.when) })),
   liquids: (r.liquids || []).map((l) => ({ ...mkL(l.name, l.pct, l.factor ?? 100), when: cleanWhen(l.when) })),
 });
-const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", price: 0, scald: false, scaldFlour: "", scaldPct: 10, scaldHyd: 500, scaldLiquid: "", scaldMethod: "cooked", inclusions: [], liquids: [] });
+const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", levSugar: 0, levSugarName: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", price: 0, scald: false, scaldFlour: "", scaldPct: 10, scaldHyd: 500, scaldLiquid: "", scaldMethod: "cooked", inclusions: [], liquids: [] });
 
 // date helpers — defined early because DEFAULT_SLOTS uses them at module-eval time
 const todayISO = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
@@ -139,7 +140,7 @@ const computeRunCosts = ({ plan, types, builds, pantry, settings, refHyd, rental
     const t = types[b.ti]; if (!t) return;
     ingLines(t).forEach((l) => {
       const g = b.weights[l.key] || 0;
-      if (l.key.indexOf("fl_") === 0 || l.key.indexOf("in_") === 0 || l.key.indexOf("lq_") === 0 || l.key === "salt" || l.key === "scf" || l.key === "scl") addUse(b.ti, l.matchName || l.name, g);
+      if (l.key.indexOf("fl_") === 0 || l.key.indexOf("in_") === 0 || l.key.indexOf("lq_") === 0 || l.key === "salt" || l.key === "scf" || l.key === "scl" || l.key === "lsg") addUse(b.ti, l.matchName || l.name, g);
     });
   });
   (builds || []).forEach((bd) => {
@@ -530,12 +531,12 @@ function mixSheetData({ b, i, total, t, params, groupOf, showTemp, waterTemp }) 
   const aMin = Math.max(0, Math.round((t && t.autolyse != null ? +t.autolyse : +params.autolyse) || 0));
   const nF = Math.max(0, Math.floor(+params.folds || 0));
   const rest = Math.round(+params.restBetween || 0);
-  const lines = ingLines(t).filter((l) => l.pct > 0);
+  const lines = benchLines(t, b);
   const oneFlour = (t.flours || []).length === 1; // with a single flour, "Scald flour" is unambiguous
   const slots = { scald: [], autolyse: [], mix: [], fold1: [], fold2: [], fold3: [], end: [] };
   const warns = [];
   lines.forEach((l) => {
-    const row = { key: l.key, name: oneFlour && l.key === "scf" ? "Scald flour" : l.name, g: b.weights[l.key], note: l.key === "water" && waterTemp != null ? showTemp(waterTemp) : "" };
+    const row = { key: l.key, name: oneFlour && l.key === "scf" ? "Scald flour" : l.name, g: l.g, note: l.key === "water" && waterTemp != null ? showTemp(waterTemp) : "", sub: l.sugarG ? "incl. " + fmtG(l.sugarG) + " g sugar" : "" };
     const pl = placeLine(t, l, groupOf, nF);
     slots[pl.w].push(row);
     if (pl.asked !== pl.w && /^fold/.test(pl.asked)) warns.push(l.name + ": " + WHEN_LABEL[pl.asked] + " is more folds than this run has (" + nF + "), so it goes in " + (nF > 0 ? "at " + WHEN_LABEL[pl.w] : "at the end of the mix") + ".");
@@ -568,7 +569,7 @@ function mixSheetData({ b, i, total, t, params, groupOf, showTemp, waterTemp }) 
   const hdr = Math.ceil(nl / nPer) * nSize * 1.05 / 72 + 0.18;
   const avail = 2.95 - 0.1 - 0.06 - 0.06 - hdr;
   const ROW = 0.16, BAND = 0.175, NCH = 18, SH = 0.161, SG = 0.035, SCH = 27, DDT = 0.36;
-  const ingAt = (sc2) => 1.04 * (bands.reduce((a2, bd) => a2 + BAND * sc2 + bd.rows.reduce((x, r) => x + Math.max(1, Math.ceil(r.name.length / (NCH / sc2))) * ROW * sc2, 0), 0));
+  const ingAt = (sc2) => 1.04 * (bands.reduce((a2, bd) => a2 + BAND * sc2 + bd.rows.reduce((x, r) => x + (Math.max(1, Math.ceil(r.name.length / (NCH / sc2))) + (r.sub ? 0.8 : 0)) * ROW * sc2, 0), 0));
   const stepAt = (sc2) => DDT * sc2 + steps.reduce((a2, st) => a2 + Math.ceil(st.length / (SCH / sc2)) * SH * sc2 + SG * sc2, 0);
   const fitDown = (need) => { let v = 1; while (v > 0.5 && need(v) > 0.93 * avail) v = Math.round((v - 0.02) * 100) / 100; return v; };
   const scale = fitDown(ingAt), tscale = fitDown(stepAt);
@@ -615,7 +616,7 @@ function MixSheetForm({ L, tempUnit, onFit }) {
             {L.bands.map((bd, bi) => (
               <div className="ms-band" key={bi}>
                 <div className="ms-bh">{bd.label}</div>
-                {bd.rows.map((r, ri) => <div className="ms-row" key={ri}><span className="ms-rn">{r.name}</span><span className="ms-rg">{fmtG(r.g)} g{r.note ? <em>{r.note}</em> : null}</span></div>)}
+                {bd.rows.map((r, ri) => <div className={"ms-row" + (r.sub ? " has-sub" : "")} key={ri}><span className="ms-rn">{r.name}</span><span className="ms-rg">{fmtG(r.g)} g{r.note ? <em>{r.note}</em> : null}</span>{r.sub ? <span className="ms-rsub">{r.sub}</span> : null}</div>)}
               </div>
             ))}
           </div>
@@ -634,6 +635,161 @@ function MixSheetForm({ L, tempUnit, onFit }) {
           <tbody>{["", "", "", "Shaping", "Cold Retard"].map((lab, r) => <tr key={r}><td className={lab ? "lbl" : undefined}>{lab}</td><td /><td /><td /></tr>)}</tbody>
         </table>
         <div className="ms-notes"><span>Bake notes</span><div className="ms-rules">{[0, 1, 2].map((r) => <i key={r} />)}</div></div>
+      </div>
+    </div>
+  );
+}
+
+// ---- Help chat on each mix card: Claude answers with the context of that exact mix ----
+const HELP_MAX_MSGS = 40;
+const helpKey = (plan, i) => { const b = plan.list[i]; if (!b) return ""; return b.ti + ":" + plan.list.slice(0, i).filter((x) => x.ti === b.ti).length; };
+const HELP_CHIPS = [
+  ["Dough too slack", "The dough feels too slack. What should I do, and what do you think caused it?"],
+  ["Dough too stiff", "The dough feels too stiff. What should I do, and what do you think caused it?"],
+  ["Running late", "I'm running behind the schedule on this mix. What can I safely adjust?"],
+  ["Swap an ingredient", "I want to swap an ingredient in this mix. What would you change, and by how much?"],
+  ["Check my numbers", "Look over the numbers for this mix. Does anything look off or risky?"],
+];
+// Everything Claude is told about this mix. Temperatures arrive already in the baker's unit.
+function mixHelpContext(o) {
+  const { b, i, total, t, params, groupOf, showTemp, waterTemp, startMin, base, nowClock, runName, runDate, tempUnit, starterName, ambientTemp, starterTemp, lev, done, active } = o;
+  const rd = (x) => Math.round(x * 10) / 10;
+  const nF = Math.max(0, Math.floor(+params.folds || 0));
+  const aMin = Math.max(0, Math.round((t.autolyse != null ? +t.autolyse : +params.autolyse) || 0));
+  const sc = scaldInfo(t);
+  const weighed = benchLines(t, b).map((l) => { const pl = placeLine(t, l, groupOf, nF); return { name: l.name, grams: Math.round(l.g), addedAt: WHEN_LABEL[pl.w] || pl.w, ...(l.sugarG ? { includesSugarGrams: Math.round(l.sugarG) } : {}) }; });
+  return {
+    now: nowClock, runName, runDate,
+    units: { temperature: "°" + tempUnit, weight: "grams" },
+    batch: { number: "B" + (i + 1), of: total, loaves: b.size, doughGrams: Math.round(b.dough), pan: proofInfo(t.shape).label, status: done ? "marked built" : active ? "in progress" : "not started", totalFlourGrams: Math.round(b.totalFlour), waterLineGrams: Math.round(b.totalWater) },
+    weighedForThisBatch: weighed,
+    recipe: {
+      name: t.name,
+      flours: (t.flours || []).map((f, idx) => ({ name: f.name, pct: rd(flourPctOf(t, idx)) })),
+      waterPct: rd(+t.water || 0), saltPct: rd(+t.salt || 0), trueHydrationPct: rd(trueHydration(t)),
+      levain: { pctOfFlour: rd(+t.levain || 0), hydrationPct: +t.levHyd || 80, inoculationPct: +t.levInoc || 10, wholeGrainPct: +t.levWhole || 0, ...(levSugarPct(t) > 0 ? { sugar: levSugarName(t), sugarPctOfLevainFlour: +t.levSugar } : {}), note: t.levExpNote || "" },
+      bassinagePctOfWater: t.bassinage ? rd(+t.bassinagePct || 0) : 0,
+      scald: sc.on ? { flour: sc.flourName, flourPctOfTotal: rd(sc.sf), liquid: sc.liquidName, liquidPct: rd(sc.S), method: sc.method } : null,
+      liquids: (t.liquids || []).map((l) => ({ name: l.name, pct: rd(+l.pct || 0), waterContentPct: +l.factor || 100 })),
+      inclusions: (t.inclusions || []).map((f) => ({ name: f.name, pct: rd(+f.pct || 0) })),
+      bake: { temp: showTemp(t.bakeTemp ?? 245), minutes: +t.bakeMin || 45, steamMinutes: t.steamMin ?? 20 },
+      notesFromLastBakes: String(t.notes || "").slice(0, 600),
+    },
+    targets: { doughTemp: showTemp(t.ddt ?? DDT_DEFAULT_C), mixWaterTemp: waterTemp != null ? showTemp(waterTemp) : "not set", autolyseMinutes: aMin },
+    schedule: { autolyseStarts: fmtClock(startMin + base), finalMixStarts: fmtClock(startMin + base + aMin), mixMinutes: +params.mix || 15, stretchAndFolds: nF, restBetweenFoldsMinutes: +params.restBetween || 0, mixDay: runDate },
+    levain: { starter: starterName, ...(lev || {}) },
+    kitchen: { roomTemp: showTemp(ambientTemp), starterTemp: showTemp(starterTemp) },
+  };
+}
+// Shrinks a photo in the browser so it uploads quickly; falls back to the original when it cannot.
+async function helpPhoto(file) {
+  const url = await new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result)); fr.onerror = () => rej(new Error("Could not read that photo.")); fr.readAsDataURL(file); });
+  let small = null;
+  try {
+    small = await new Promise((res) => {
+      const img = new Image(); const tm = setTimeout(() => res(null), 4000);
+      img.onload = () => { clearTimeout(tm); try { const k = Math.min(1, 1280 / Math.max(img.width || 1, img.height || 1)); const c = document.createElement("canvas"); c.width = Math.max(1, Math.round((img.width || 1) * k)); c.height = Math.max(1, Math.round((img.height || 1) * k)); const g = c.getContext && c.getContext("2d"); if (!g) return res(null); g.drawImage(img, 0, 0, c.width, c.height); res(c.toDataURL("image/jpeg", 0.82)); } catch (e) { res(null); } };
+      img.onerror = () => { clearTimeout(tm); res(null); };
+      img.src = url;
+    });
+  } catch (e) { small = null; }
+  const use = small || url;
+  const m = /^data:(image\/[a-z+.-]+);base64,(.*)$/i.exec(use);
+  if (!m || m[2].length > 1300000) throw new Error("That photo is too large. Try a smaller one.");
+  return { type: m[1].toLowerCase(), data: m[2], url: use };
+}
+// Plain-text answers: paragraphs, "- " lists and **bold**; nothing is ever treated as HTML.
+function renderHelpText(str) {
+  const isLi = (l) => /^\s*[-•*]\s+/.test(l);
+  const bold = (txt, k) => txt.split(/(\*\*[^*]+\*\*)/g).map((p, j) => (/^\*\*[^*]+\*\*$/.test(p) ? <b key={k + "-" + j}>{p.slice(2, -2)}</b> : p));
+  const out = [];
+  String(str).split(/\n{2,}/).forEach((blk, bi) => {
+    // inside one block, a run of "- " lines becomes a list and any other lines stay a paragraph (so "Do this:" followed by bullets works)
+    let run = [], kind = null, n = 0;
+    const flush = () => {
+      if (!run.length) return;
+      const k = bi + "-" + n++;
+      if (kind === "li") out.push(<ul key={k}>{run.map((l, li) => <li key={li}>{bold(l.replace(/^\s*[-•*]\s+/, ""), k + "-" + li)}</li>)}</ul>);
+      else out.push(<p key={k}>{run.map((l, li) => <React.Fragment key={li}>{li > 0 && <br />}{bold(l, k + "-" + li)}</React.Fragment>)}</p>);
+      run = [];
+    };
+    blk.split("\n").forEach((l) => { const kd = isLi(l) ? "li" : "p"; if (kd !== kind) { flush(); kind = kd; } run.push(l); });
+    flush();
+  });
+  return out;
+}
+function MixHelpPanel({ title, ctx, messages, onMessages, onClose }) {
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [live, setLive] = useState("");
+  const [error, setError] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const listRef = useRef(null), alive = useRef(true), abortRef = useRef(null), lastPhoto = useRef(null);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; if (abortRef.current) { try { abortRef.current.abort(); } catch (e) {} } }; }, []);
+  useEffect(() => { const k = (e) => { if (e.key === "Escape") onClose(); }; document.addEventListener("keydown", k); return () => document.removeEventListener("keydown", k); }, [onClose]);
+  useEffect(() => { const el = listRef.current; if (el) el.scrollTop = el.scrollHeight; }, [messages, live, busy, error]);
+  const ask = async (msgs, ph) => {
+    setBusy(true); setError(""); setLive("");
+    const ac = typeof AbortController !== "undefined" ? new AbortController() : null; abortRef.current = ac;
+    const api = msgs.map((m, idx) => {
+      const last = idx === msgs.length - 1;
+      if (last && ph) return { role: "user", content: [{ type: "image", source: { type: "base64", media_type: ph.type, data: ph.data } }, { type: "text", text: m.content }] };
+      return { role: m.role, content: m.photo ? m.content + " [a photo was attached]" : m.content };
+    });
+    try {
+      const resp = await fetch("/api/mix-help", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: api, context: ctx }), ...(ac ? { signal: ac.signal } : {}) });
+      if (!resp.ok) { let msg = "Request failed (" + resp.status + ")"; try { const j = await resp.json(); msg = j.error || msg; } catch (e) {} throw new Error(msg); }
+      let acc = "";
+      if (resp.body && resp.body.getReader) {
+        const reader = resp.body.getReader(), dec = new TextDecoder();
+        for (;;) { const { done, value } = await reader.read(); if (done) break; acc += dec.decode(value, { stream: true }); if (alive.current) setLive(acc); }
+        acc += dec.decode();
+      } else acc = await resp.text();
+      if (!alive.current) return;
+      if (!acc.trim()) throw new Error("Claude sent back nothing. Try again.");
+      onMessages([...msgs, { role: "assistant", content: acc, ts: Date.now() }]);
+    } catch (e) {
+      if (alive.current && !(e && e.name === "AbortError")) setError((e && e.message) || "Something went wrong talking to Claude.");
+    } finally { if (alive.current) { setBusy(false); setLive(""); } }
+  };
+  const send = (text) => {
+    const q = String(text == null ? input : text).trim();
+    if ((!q && !photo) || busy) return;
+    const um = { role: "user", content: q || "What do you make of my dough in this photo?", ts: Date.now(), ...(photo ? { photo: true } : {}) };
+    const next = [...messages, um];
+    lastPhoto.current = photo; onMessages(next); setInput(""); setPhoto(null);
+    ask(next, photo);
+  };
+  const canRetry = !busy && error && messages.length > 0 && messages[messages.length - 1].role === "user";
+  const onFile = async (e) => { const f = e.target.files && e.target.files[0]; e.target.value = ""; if (!f) return; try { setError(""); setPhoto(await helpPhoto(f)); } catch (er) { setError(er.message); } };
+  return (
+    <div className="help-overlay" data-k="help" role="dialog" aria-modal="true" aria-label={"Help: " + title} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="help-sheet">
+        <div className="help-hd">
+          <div className="help-title"><b>Help</b><span>{title}</span></div>
+          {messages.length > 0 && <button className="help-clear" data-f="help-clear" disabled={busy} onClick={() => onMessages([])}>Clear</button>}
+          <button className="help-x" data-f="help-close" aria-label="Close" onClick={onClose}>×</button>
+        </div>
+        <div className="help-list" ref={listRef} data-k="helplist">
+          {messages.length === 0 && !busy && (
+            <div className="help-empty">
+              <p>Ask anything about this mix. I can see the recipe, this batch's weights, your temperatures and your schedule.</p>
+              <div className="help-chips">{HELP_CHIPS.map(([label, q]) => <button key={label} data-f="help-chip" onClick={() => send(q)}>{label}</button>)}</div>
+            </div>
+          )}
+          {messages.map((m, i) => <div className={"help-msg " + m.role} key={i} data-k={"help-" + m.role}>{m.role === "assistant" ? renderHelpText(m.content) : <p>{m.content}{m.photo ? " 📷" : ""}</p>}</div>)}
+          {busy && <div className="help-msg assistant live" data-k="help-live">{live ? renderHelpText(live) : <p className="help-think">Thinking…</p>}</div>}
+          {error && <div className="help-err" data-k="help-err"><span>{error}</span>{canRetry && <button data-f="help-retry" onClick={() => ask(messages, lastPhoto.current)}>Retry</button>}</div>}
+        </div>
+        <div className="help-foot">
+          <div className="help-note">Suggestions only. It can't change your recipe or the app.</div>
+          {photo && <div className="help-photochip" data-k="help-photochip"><img src={photo.url} alt="Attached dough" /><button aria-label="Remove photo" onClick={() => setPhoto(null)}>×</button></div>}
+          <div className="help-row">
+            <label className="help-photo" title="Attach a photo"><input type="file" accept="image/*" data-f="help-photo" onChange={onFile} />📷</label>
+            <textarea className="help-input" data-f="help-input" rows={2} placeholder="Ask about this mix…" value={input} disabled={busy} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") send(); }} />
+            <button className="help-send" data-f="help-send" disabled={busy || (!input.trim() && !photo)} onClick={() => send()}>Send</button>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -775,7 +931,7 @@ const normalizeFoodSafety = (fs) => {
     })),
   };
 };
-const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, rentalHours: 0, rentalRate: null, soldLoaves: {}, costLock: null, deduction: null, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null });
+const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, rentalHours: 0, rentalRate: null, soldLoaves: {}, costLock: null, deduction: null, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null, helpChats: {} });
 const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), complete: false, day: day || defaultDay() });
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
@@ -1011,6 +1167,8 @@ const sameLiqList = (xs, ys) => {
 const sameFormula = (a, b) => {
   if (!a || !b) return false;
   for (const k of RECIPE_FORMULA_KEYS) { if (String(a[k] ?? "") !== String(b[k] ?? "")) return false; }
+  if ((+a.levSugar || 0) !== (+b.levSugar || 0)) return false;
+  if ((+a.levSugar || 0) > 0 && normName(levSugarName(a)) !== normName(levSugarName(b))) return false;
   return sameIngList(a.flours, b.flours, true) && sameIngList(a.inclusions, b.inclusions, false) && sameLiqList(a.liquids, b.liquids) && JSON.stringify(scaldKeyPart(a)) === JSON.stringify(scaldKeyPart(b));
 };
 const flourPctOf = (t, idx) => (idx === 0 ? mainPct(t) : (+t.flours[idx].pct || 0));
@@ -1048,6 +1206,15 @@ const scaldInfo = (t) => {
   return { enabled: true, on, flourIdx, flourName, flourPct, sf, hyd, wantS, avail, S, liqIdx, isWater, liquidName, method: t.scaldMethod === "poured" ? "poured" : "cooked", warns };
 };
 
+// Sugar added to the levain build (e.g. a sweet stiff levain): % of the levain's feed flour, ON TOP of any sugar in the dough. It becomes its own line
+// ("lsg") so dough weight, costing and the shopping list count it, but at the bench it is weighed as part of the levain (see benchLines).
+const levSugarName = (t) => (String(t.levSugarName || "").trim() || "Granulated sugar");
+const levSugarPct = (t) => {
+  const S = Math.max(0, +t.levSugar || 0), lev = +t.levain || 0;
+  if (!(S > 0) || !(lev > 0)) return 0;
+  const H = +t.levHyd || 80, I = Math.max(0.1, +t.levInoc || 10);
+  return lev * (S / 100) / (1 + H / 100 + I / 100);
+};
 const ingLines = (t) => {
   const sc = scaldInfo(t);
   const L = [];
@@ -1067,14 +1234,17 @@ const ingLines = (t) => {
   if (sc.on && !sc.isWater) L.push({ key: "scl", name: "Scald " + sc.liquidName, matchName: sc.liquidName, pct: sc.S });
   L.push({ key: "salt", name: "Salt", pct: +t.salt || 0 });
   L.push({ key: "levain", name: "Levain", pct: +t.levain || 0 });
+  { const ls = levSugarPct(t); if (ls > 0) L.push({ key: "lsg", name: "Sugar (in levain)", matchName: levSugarName(t), pct: ls }); }
   t.inclusions.forEach((f) => L.push({ key: "in_" + f.id, name: f.name, pct: +f.pct || 0 }));
   return L;
 };
+// Lines as they are weighed at the bench: the levain's sugar goes into the levain you build, so it shows inside the Levain line ("incl. X g sugar"), not on its own.
+const benchLines = (t, b) => ingLines(t).filter((l) => l.pct > 0 && l.key !== "lsg").map((l) => (l.key === "levain" && (b.weights.lsg || 0) > 0 ? { ...l, g: (b.weights.levain || 0) + b.weights.lsg, sugarG: b.weights.lsg } : { ...l, g: b.weights[l.key] }));
 
 // id-independent signature of a formula, with main flour normalized
 const formulaKey = (r) => JSON.stringify({
   lw: +r.loafWeight, sh: r.shape || "round", w: +r.water, s: +r.salt, lv: +r.levain,
-  lh: +r.levHyd || 80, li: +r.levInoc || 10, ri: +r.levRefInoc || 10, lb: +r.levBuildHrs || 5, lr: +r.levRefTemp || 24, lwh: +r.levWhole || 0, lxn: r.levExpNote || "", bt: +r.bakeTemp || 245, bm: +r.bakeMin || 45, sm: +r.steamMin || 20, au: +r.autolyse || 45, cn: r.calNote || "",
+  lh: +r.levHyd || 80, li: +r.levInoc || 10, ri: +r.levRefInoc || 10, lb: +r.levBuildHrs || 5, lr: +r.levRefTemp || 24, lwh: +r.levWhole || 0, ls: +r.levSugar || 0, ln: (+r.levSugar || 0) > 0 ? normName(levSugarName(r)) : "", lxn: r.levExpNote || "", bt: +r.bakeTemp || 245, bm: +r.bakeMin || 45, sm: +r.steamMin || 20, au: +r.autolyse || 45, cn: r.calNote || "",
   fl: r.flours.map((f, i) => [f.name, i === 0 ? mainPct(r) : +f.pct || 0]),
   inc: r.inclusions.map((f) => [f.name, +f.pct || 0]),
   lq: (r.liquids || []).map((l) => [l.name, +l.pct || 0, +l.factor || 100]),
@@ -1084,7 +1254,7 @@ const formulaKey = (r) => JSON.stringify({
 // signature of the base dough only (flours + hydration + salt + levain build + autolyse + DDT); inclusions / loaf weight / shape / bake ignored
 const baseDoughKey = (r) => JSON.stringify({
   w: +r.water || 0, s: +r.salt || 0, lv: +r.levain || 0,
-  lh: +r.levHyd || 80, li: +r.levInoc || 10, ri: +r.levRefInoc || 10, lb: +r.levBuildHrs || 5, lr: +r.levRefTemp || 24, lwh: +r.levWhole || 0,
+  lh: +r.levHyd || 80, li: +r.levInoc || 10, ri: +r.levRefInoc || 10, lb: +r.levBuildHrs || 5, lr: +r.levRefTemp || 24, lwh: +r.levWhole || 0, ls: +r.levSugar || 0, ln: (+r.levSugar || 0) > 0 ? normName(levSugarName(r)) : "",
   au: +r.autolyse || 45, dt: Math.round((+r.ddt || DDT_DEFAULT_C) * 10) / 10,
   fl: r.flours.map((f, i) => [f.name, i === 0 ? mainPct(r) : +f.pct || 0]),
   lq: (r.liquids || []).map((l) => [l.name, +l.pct || 0, +l.factor || 100]),
@@ -1386,6 +1556,8 @@ export default function App() {
   const [mixSheetOpen, setMixSheetOpen] = useState(false);
   const [mixSheetOff, setMixSheetOff] = useState([]);
   const [mixSheetOver, setMixSheetOver] = useState({});
+  const [helpChats, setHelpChats] = useState({}); // per batch: [{ role, content, ts, photo? }]
+  const [helpOpen, setHelpOpen] = useState(null);
   const onMixFit = useCallback((n, over) => setMixSheetOver((st) => (!!st[n] === !!over ? st : { ...st, [n]: !!over })), []);
   const [labelOffX, setLabelOffX] = useState(0); // calibration nudge, mm
   const [labelSkip, setLabelSkip] = useState([]); // positions already peeled off sheet 1
@@ -1454,6 +1626,7 @@ export default function App() {
     setDoneBatches(Array.isArray(d.doneBatches) ? d.doneBatches : []);
     setFoodSafety(normalizeFoodSafety(d.foodSafety));
     setMixWaterTemp(typeof d.mixWaterTemp === "number" ? d.mixWaterTemp : null);
+    setHelpChats(d.helpChats && typeof d.helpChats === "object" ? d.helpChats : {}); setHelpOpen(null);
     setCalcInputs(d.calcInputs && typeof d.calcInputs === "object" ? d.calcInputs : null);
   };
   const openDay = (id) => { const e = days.find((x) => x.id === id); if (!e) return; loadDayVars(e.day || {}); setDayName(e.name || "Untitled"); setDayDate(e.date || todayISO()); setCurrentDayId(id); setTab("plan"); setActiveBatch(null); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
@@ -1615,9 +1788,9 @@ export default function App() {
   // autosave the open day's snapshot
   useEffect(() => {
     if (!loaded || view !== "editor" || !currentDayId) return;
-    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, rentalHours, rentalRate, soldLoaves, costLock, deduction, doneBatches, foodSafety, mixWaterTemp, calcInputs };
+    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, rentalHours, rentalRate, soldLoaves, costLock, deduction, doneBatches, foodSafety, mixWaterTemp, calcInputs, helpChats };
     setDays((ds) => { const nd = ds.map((d) => (d.id === currentDayId ? { ...d, name: dayName, date: dayDate, updatedAt: Date.now(), day: snap } : d)); persist(DAYS_KEY, nd); return nd; });
-  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, rentalHours, rentalRate, soldLoaves, costLock, deduction, doneBatches, foodSafety, mixWaterTemp, calcInputs, dayName, dayDate, currentDayId, view, loaded]);
+  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, rentalHours, rentalRate, soldLoaves, costLock, deduction, doneBatches, foodSafety, mixWaterTemp, calcInputs, helpChats, dayName, dayDate, currentDayId, view, loaded]);
 
   // remember where this device is (only after boot has restored, so we never overwrite the saved spot with defaults)
   useEffect(() => {
@@ -1715,7 +1888,7 @@ export default function App() {
       ingLines(t).forEach((l) => {
         if (l.pct <= 0) return;
         const g = b.weights[l.key] || 0; if (!g) return;
-        const cat = (l.key.startsWith("fl_") || l.key === "scf") ? "flour" : l.key.startsWith("in_") ? "inc" : "liquid";
+        const cat = (l.key.startsWith("fl_") || l.key === "scf") ? "flour" : (l.key.startsWith("in_") || l.key === "lsg") ? "inc" : "liquid";
         const nm = l.matchName || l.name;
         const key = (nm || "").trim().toLowerCase() + "|" + cat;
         if (!tot[key]) tot[key] = { name: nm, cat, g: 0 };
@@ -1738,12 +1911,12 @@ export default function App() {
       types.forEach((t, ti) => {
         const batches = plan.list.map((b, gi) => ({ b, gi })).filter((x) => x.b.ti === ti);
         if (batches.length === 0) return;
-        const k = [+t.levHyd || 80, +t.levInoc || 10, +t.levRefInoc || 10, +t.levBuildHrs || 5, +t.levRefTemp || 24, +t.levWhole || 0].join("|");
+        const k = [+t.levHyd || 80, +t.levInoc || 10, +t.levRefInoc || 10, +t.levBuildHrs || 5, +t.levRefTemp || 24, +t.levWhole || 0, +t.levSugar || 0, (+t.levSugar || 0) > 0 ? normName(levSugarName(t)) : ""].join("|");
         if (!sig[k]) sig[k] = { ti, names: [], items: [] };
         if (sig[k].names.indexOf(t.name) === -1) sig[k].names.push(t.name);
         batches.forEach((x) => {
           const base = schedule[x.gi] ? schedule[x.gi].base : 0;
-          sig[k].items.push({ gi: x.gi, mixOff: base + ((t.autolyse != null ? +t.autolyse : +params.autolyse) || 0), levW: x.b.weights["levain"] || 0 });
+          sig[k].items.push({ gi: x.gi, mixOff: base + ((t.autolyse != null ? +t.autolyse : +params.autolyse) || 0), levW: x.b.weights["levain"] || 0, lsgW: x.b.weights["lsg"] || 0 });
         });
       });
       Object.values(sig).forEach((g) => { g.items.sort((a, b) => a.mixOff - b.mixOff); raw.push({ ti: g.ti, name: g.names.join(" + "), items: g.items }); });
@@ -1753,7 +1926,7 @@ export default function App() {
         if (batches.length === 0) return;
         const withMix = batches.map((x) => {
           const base = schedule[x.gi] ? schedule[x.gi].base : 0;
-          return { gi: x.gi, mixOff: base + ((types[ti] && types[ti].autolyse != null ? +types[ti].autolyse : +params.autolyse) || 0), levW: x.b.weights["levain"] || 0 };
+          return { gi: x.gi, mixOff: base + ((types[ti] && types[ti].autolyse != null ? +types[ti].autolyse : +params.autolyse) || 0), levW: x.b.weights["levain"] || 0, lsgW: x.b.weights["lsg"] || 0 };
         }).sort((a, b) => a.mixOff - b.mixOff);
         let group = [];
         const flush = () => { if (group.length) raw.push({ ti, name: t.name, items: group }); group = []; };
@@ -1811,10 +1984,12 @@ export default function App() {
       const M = bd.items.reduce((a, x) => a + x.levW, 0) * (1 + bufPct / 100);
       const denom = 1 + bd.H / 100 + bd.I / 100;
       const flourL = M / denom, waterL = flourL * bd.H / 100, seedL = flourL * bd.I / 100;
+      const sugarL = bd.items.reduce((a, x) => a + (x.lsgW || 0), 0) * (1 + bufPct / 100);
+      const sugarName = sugarL > 0 ? levSugarName(types[bd.ti]) : "";
       const mTot = flourL + waterL + seedL;
       const Twater = waterL > 0 ? (Tlev * mTot - flourL * ambientTemp - seedL * starterTemp) / waterL : Tlev;
       const holdMin = bd.items[bd.items.length - 1].mixOff - bd.targetPeak;
-      return { ...bd, key, retarded, buffered, bufPct, retardHold, retardLate, peakOff, desired, Tlev, M, flourL, waterL, seedL, Twater, holdMin };
+      return { ...bd, key, retarded, buffered, bufPct, retardHold, retardLate, peakOff, desired, Tlev, M, flourL, waterL, seedL, sugarL, sugarName, Twater, holdMin };
     });
     return { feedOff, autoFeed, builds: out };
   }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard, levBuffer, levBufferPct, levCombine]);
@@ -2049,7 +2224,7 @@ export default function App() {
           scald: (() => { const sc = scaldInfo(r); return sc.on ? { flour: sc.flourName, pctOfTotalFlour: Math.round(sc.sf * 10) / 10, liquid: sc.liquidName, liquidPctOfFlour: Math.round(sc.S * 10) / 10, method: sc.method } : null; })(),
           liquids: (r.liquids || []).map((l) => ({ name: l.name, pct: +l.pct || 0, waterFactorPct: +l.factor || 100, ...(isScaldLiquid(r, l) ? { addedAt: "scald" } : cleanWhen(l.when) ? { addedAt: cleanWhen(l.when) } : {}) })),
           saltPct: +r.salt || 0, levainPct: +r.levain || 0, levainHydrationPct: +r.levHyd || 80, inoculationPct: +r.levInoc || 10,
-          levainBuildHrs: +r.levBuildHrs || 5, levainRefTempC: +r.levRefTemp || 24, levainWholeGrainPct: +r.levWhole || 0,
+          levainBuildHrs: +r.levBuildHrs || 5, ...((+r.levSugar || 0) > 0 ? { levainSugarPctOfLevainFlour: +r.levSugar, levainSugarName: levSugarName(r) } : {}), levainRefTempC: +r.levRefTemp || 24, levainWholeGrainPct: +r.levWhole || 0,
           trueHydrationPct: Math.round(trueHydration(r) * 10) / 10,
           autolyseMin: +r.autolyse || 45, targetDoughTempC: Math.round((+r.ddt || DDT_DEFAULT_C) * 10) / 10,
           bakeTempC: +r.bakeTemp || 245, bakeMin: +r.bakeMin || 45, steamMin: +r.steamMin || 20,
@@ -2331,6 +2506,44 @@ export default function App() {
         .bl-recipe-card .brc-promote{font-family:'DM Sans';font-size:12px;font-weight:600;color:#5a3fa0;background:#ede8f8;border:none;border-radius:7px;padding:5px 10px;cursor:pointer;}
         .bl-re-hd{display:flex;align-items:center;gap:12px;margin-bottom:18px;padding-bottom:14px;border-bottom:1.5px solid var(--line);}
         .bl-re-title{font-family:'Fraunces',serif;font-weight:600;font-size:20px;color:var(--ink);}
+        .bl-helpbtn{width:100%;margin-top:10px;padding:11px;font-family:'DM Sans';font-size:14px;font-weight:600;color:var(--crust2);background:#fff;border:1.5px solid var(--crust);border-radius:9px;cursor:pointer;}
+        .help-overlay{--cream:#fffdf8;--ink:#241508;--ink2:#7a5a3a;--line:#d4c4a8;--crust:#b5651d;--crust2:#8a4a14;font-family:'DM Sans',system-ui,sans-serif;color:var(--ink);position:fixed;inset:0;z-index:300;background:rgba(26,15,7,.5);display:flex;align-items:flex-end;justify-content:center;}
+        .help-sheet{width:100%;max-width:680px;height:min(90vh,780px);background:var(--cream);border-radius:16px 16px 0 0;display:flex;flex-direction:column;box-shadow:0 -8px 40px rgba(0,0,0,.3);overflow:hidden;}
+        @media (min-width:760px){.help-overlay{align-items:center;}.help-sheet{border-radius:16px;height:min(82vh,740px);}}
+        .help-hd{display:flex;align-items:center;gap:8px;padding:12px 14px;background:#2a1c10;color:#f5efe3;}
+        .help-title{flex:1;min-width:0;display:flex;flex-direction:column;}
+        .help-title b{font-family:'Fraunces',serif;font-size:17px;}
+        .help-title span{font-family:'JetBrains Mono';font-size:11px;opacity:.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .help-hd button{font-family:'DM Sans';font-size:13px;font-weight:600;color:#f5efe3;background:rgba(245,239,227,.14);border:none;border-radius:8px;padding:8px 12px;cursor:pointer;}
+        .help-hd .help-x{font-size:20px;line-height:1;padding:6px 12px;}
+        .help-list{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px;-webkit-overflow-scrolling:touch;}
+        .help-empty p{margin:0 0 12px;font-size:14px;color:var(--ink2);line-height:1.45;}
+        .help-chips{display:flex;flex-wrap:wrap;gap:8px;}
+        .help-chips button{font-family:'DM Sans';font-size:13.5px;font-weight:600;padding:9px 13px;border:1.5px solid var(--crust);background:#fff;color:var(--crust2);border-radius:999px;cursor:pointer;}
+        .help-msg{max-width:92%;padding:10px 13px;border-radius:14px;font-size:15px;line-height:1.45;word-wrap:break-word;overflow-wrap:anywhere;}
+        .help-msg p{margin:0 0 8px;} .help-msg p:last-child{margin-bottom:0;} .help-msg ul{margin:0 0 8px;padding-left:20px;} .help-msg li{margin-bottom:3px;}
+        .help-msg.user{align-self:flex-end;background:var(--crust2);color:#fff;border-bottom-right-radius:4px;}
+        .help-msg.assistant{align-self:flex-start;background:#fff;border:1px solid var(--line);color:var(--ink);border-bottom-left-radius:4px;}
+        .help-think{color:var(--ink2);font-style:italic;}
+        .help-err{align-self:stretch;display:flex;gap:10px;align-items:center;justify-content:space-between;font-size:13.5px;color:#b3261e;background:#fdecea;border-radius:10px;padding:10px 12px;}
+        .help-err button{font-family:'DM Sans';font-weight:600;font-size:13px;border:none;background:#b3261e;color:#fff;border-radius:8px;padding:7px 12px;cursor:pointer;flex:none;}
+        .help-foot{border-top:1px solid var(--line);padding:8px 12px 12px;background:#faf7f0;}
+        .help-note{font-size:11.5px;color:var(--ink2);margin-bottom:6px;}
+        .help-photochip{display:inline-flex;align-items:flex-start;gap:4px;margin-bottom:6px;}
+        .help-photochip img{height:56px;width:auto;border-radius:8px;border:1px solid var(--line);}
+        .help-photochip button{border:none;background:#b3261e;color:#fff;border-radius:50%;width:22px;height:22px;line-height:1;cursor:pointer;font-size:14px;}
+        .help-row{display:flex;gap:8px;align-items:flex-end;}
+        .help-photo{flex:none;width:44px;height:44px;display:flex;align-items:center;justify-content:center;font-size:20px;border:1.5px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;}
+        .help-photo input{display:none;}
+        .help-input{flex:1;min-width:0;font-family:'DM Sans';font-size:16px;padding:10px 12px;border:1.5px solid var(--line);border-radius:10px;resize:none;background:#fff;color:var(--ink);box-sizing:border-box;}
+        .help-send{flex:none;height:44px;padding:0 18px;font-family:'DM Sans';font-size:15px;font-weight:700;color:#fff;background:var(--crust2);border:none;border-radius:10px;cursor:pointer;}
+        .help-send:disabled,.help-input:disabled{opacity:.5;cursor:default;}
+        @media print { .help-overlay { display: none !important; } }
+        .bl-lev-sugar{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0;align-items:flex-end;}
+        .bl-lev-sugar .bl-field2{flex:1 1 200px;min-width:0;}
+        .bl-lev-sugar .bl-sub-note{display:block;margin-left:0;}
+        .bl-lev-sugar .ing-name{font-family:'DM Sans',sans-serif;font-size:14px;padding:9px 10px;}
+        .bl-lev-sugar .wrap2{display:flex;align-items:center;gap:6px;}
         .when-end{display:flex;align-items:center;gap:6px;flex:0 1 192px;min-width:0;}
         .when-sel{font-family:'DM Sans';font-size:12px;padding:6px 6px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);flex:1 1 auto;min-width:0;}
         .bl-when{font-style:normal;font-family:'JetBrains Mono';font-size:10px;font-weight:700;color:var(--crust2);}
@@ -3062,6 +3275,8 @@ export default function App() {
         .ms-bh{font-family:'JetBrains Mono';font-size:calc(7pt * var(--ms-s,1));font-weight:700;letter-spacing:.6pt;text-transform:uppercase;color:#fff;background:#4a4a4a;padding:1pt 4pt;margin-top:2pt;}
         .ms-row{display:flex;justify-content:space-between;align-items:baseline;gap:4pt;font-size:calc(9.4pt * var(--ms-s,1));line-height:1.2;border-bottom:0.4pt solid #d6d6d6;}
         .ms-rn{min-width:0;overflow-wrap:anywhere;}
+        .ms-row.has-sub{flex-wrap:wrap;}
+        .ms-rsub{flex:1 0 100%;text-align:right;font-size:.74em;line-height:1.1;color:#444;margin-top:-1pt;padding-bottom:1pt;}
         .ms-rg{font-family:'JetBrains Mono';font-weight:700;flex:none;font-size:.94em;}
         .ms-rg em{font-style:normal;font-weight:500;font-size:.8em;color:#444;margin-left:3pt;}
         .ms-steps{margin:0;padding:0 0 0 0.15in;font-size:calc(8.9pt * var(--ms-t,1));line-height:1.3;}
@@ -3323,6 +3538,10 @@ export default function App() {
                   <div className="bl-field2"><label>Inoculation %</label><input type="number" min="0" value={editingDraft.levInoc ?? 10} onChange={(e) => patchEdit({ levInoc: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div className="bl-field2"><label>Build to peak (h)</label><input type="number" min="0" step="0.25" value={editingDraft.levBuildHrs ?? 5} onChange={(e) => patchEdit({ levBuildHrs: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div className="bl-field2"><label>Ref temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(editingDraft.levRefTemp ?? 24))} onChange={(e) => patchEdit({ levRefTemp: uToC(Number(e.target.value) || 0) })} /></div>
+                </div>
+                <div className="bl-re-row" data-k="levsugar">
+                  <div className="bl-field2"><label>Sugar in levain % <span className="bl-sub-note">of levain flour · on top of the dough's sugar</span></label><input data-f="levSugar" type="number" min="0" step="0.5" value={editingDraft.levSugar ?? 0} onChange={(e) => patchEdit({ levSugar: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  {(+editingDraft.levSugar || 0) > 0 && <div className="bl-field2"><label>Which sugar</label><IngredientInput className="ing-name" value={editingDraft.levSugarName || ""} placeholder="Granulated sugar" onCommit={(v) => patchEdit({ levSugarName: v })} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" /></div>}
                 </div>
                 <div className="bl-subhead">Notes <span className="bl-sub-note">carries between bakes · shared with the Prep tab</span></div>
                 <BufferedInput className="bl-notes-ta" rows={4} value={editingDraft.notes || ""} onCommit={(v) => patchEdit({ notes: v })} placeholder="What happened last time, what to change…" />
@@ -3659,6 +3878,10 @@ export default function App() {
                     <div className="bl-field2"><label>Ref temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(t.levRefTemp ?? 24))} onChange={(e) => setDraft(ti, { levRefTemp: uToC(Number(e.target.value) || 0) })} /></div>
                     <div className="bl-field2"><label>Whole grain in levain</label><div className="wrap2"><input type="number" min="0" value={t.levWhole ?? 0} onChange={(e) => setDraft(ti, { levWhole: Math.max(0, Number(e.target.value) || 0) })} /><span className="pc">%</span></div></div>
                   </div>
+                  <div className="bl-lev-sugar" data-k="levsugar">
+                    <div className="bl-field2"><label>Sugar in levain <span className="bl-sub-note">% of levain flour · on top of the dough's sugar</span></label><div className="wrap2"><input data-f="levSugar" type="number" min="0" step="0.5" value={t.levSugar ?? 0} onChange={(e) => setDraft(ti, { levSugar: Math.max(0, Number(e.target.value) || 0) })} /><span className="pc">%</span></div></div>
+                    {(+t.levSugar || 0) > 0 && <div className="bl-field2"><label>Which sugar</label><IngredientInput className="ing-name" value={t.levSugarName || ""} placeholder="Granulated sugar" onCommit={(v) => setDraft(ti, { levSugarName: v })} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" /></div>}
+                  </div>
                   <div className="bl-lev-exp"><label>Levain flour / experiment note</label><BufferedInput className="bl-lev-expnote" value={t.levExpNote || ""} onCommit={(v) => setDraft(ti, { levExpNote: v })} placeholder="e.g. straight bread flour · or 5% rye pre-ferment" /></div>
                   <div className="bl-lev-hint">Timing, water temp and the build recipe are computed on the <b>Levain</b> tab from {starter.name}'s calibration.</div>
                 </div>
@@ -3985,11 +4208,12 @@ export default function App() {
                       <div className="ing"><span>Mature starter</span><span>{fmtG(bd.seedL)} g</span></div>
                       <div className="ing"><span>Flour</span><span>{fmtG(bd.flourL)} g</span></div>
                       <div className="ing"><span>Water</span><span>{fmtG(bd.waterL)} g</span></div>
+                      {bd.sugarL > 0 && <div className="ing" data-k="levsugarrow"><span>{bd.sugarName}</span><span>{fmtG(bd.sugarL)} g</span></div>}
                       <div className="lbuffer">
                         <label className="lbuffer-tog"><input type="checkbox" checked={bd.buffered} onChange={() => toggleLevBuffer(bd.key)} /><span>Buffer — spillage / bucket loss</span></label>
                         {bd.buffered && <span className="lbuffer-pct"><input type="number" min="0" step="0.5" value={levBufferPct[bd.key] ?? 2} onChange={(e) => setLevBufferPct((r) => ({ ...r, [bd.key]: e.target.value }))} /><span>%</span></span>}
                       </div>
-                      <div className="ing tot"><span>Total levain{bd.buffered ? " · +" + bd.bufPct + "%" : ""}</span><span>{fmtG(bd.M)} g</span></div>
+                      <div className="ing tot"><span>Total levain{bd.buffered ? " · +" + bd.bufPct + "%" : ""}</span><span>{fmtG(bd.M + (bd.sugarL || 0))} g</span></div>
                     </div>
                     {bd.retarded && bd.retardLate && <div className="lwarn">⚠ Even at room temp this peaks after the mix — it won't be ready in time. Feed earlier.</div>}
                     {bd.retarded && !bd.retardLate && <div className="lretardnote">Built at normal temp to peak, then held cold to preserve it until mix — no extreme water or seed needed.</div>}
@@ -4115,7 +4339,7 @@ export default function App() {
               {plan.list.map((_, idx) => idx).sort((a, b) => (doneBatches.includes(a) ? 1 : 0) - (doneBatches.includes(b) ? 1 : 0)).map((i) => {
                 const b = plan.list[i];
                 const t = types[b.ti];
-                const cols = ingLines(t).filter((l) => l.pct > 0);
+                const cols = benchLines(t, b);
                 const base = schedule[i] ? schedule[i].base : 0;
                 const mixStart = base + ((t && t.autolyse != null ? +t.autolyse : +params.autolyse) || 0);
                 const isA = activeBatch === i, isD = doneBatches.includes(i);
@@ -4135,9 +4359,10 @@ export default function App() {
                         </div>
                       );
                     })()}
-                    {cols.map((l) => <div className="ing" key={l.key}><span className="nm">{l.name}</span><span className="g">{fmtG(b.weights[l.key])} g{l.key === "water" && mixWaterTemp != null ? <em className="bl-watertemp"> · {showTemp(mixWaterTemp)}</em> : null}{eggCount(l.name, b.weights[l.key]) ? <em className="bl-eggnote"> · {eggCount(l.name, b.weights[l.key])}</em> : null}{(() => { const pl = placeLine(t, l, groupOf, Math.floor(+params.folds || 0)); return (/^fold/.test(pl.w) || pl.w === "end") ? <em className="bl-when" data-k="whentag"> · {pl.w === "end" ? "end of mix" : WHEN_LABEL[pl.w]}</em> : null; })()}</span></div>)}
+                    {cols.map((l) => <div className="ing" key={l.key}><span className="nm">{l.name}</span><span className="g">{fmtG(l.g)} g{l.key === "water" && mixWaterTemp != null ? <em className="bl-watertemp"> · {showTemp(mixWaterTemp)}</em> : null}{l.sugarG ? <em className="bl-when" data-k="levsugartag"> · incl. {fmtG(l.sugarG)} g sugar</em> : null}{eggCount(l.name, l.g) ? <em className="bl-eggnote"> · {eggCount(l.name, l.g)}</em> : null}{(() => { const pl = placeLine(t, l, groupOf, Math.floor(+params.folds || 0)); return (/^fold/.test(pl.w) || pl.w === "end") ? <em className="bl-when" data-k="whentag"> · {pl.w === "end" ? "end of mix" : WHEN_LABEL[pl.w]}</em> : null; })()}</span></div>)}
                     <div className="ing tot"><span className="nm">Total flour</span><span className="g">{fmtG(b.totalFlour)} g</span></div>
                     <div className="ing tot"><span className="nm">Total water</span><span className="g">{fmtG(b.totalWater)} g</span></div>
+                    <button className="bl-helpbtn" data-f="help" onClick={(e) => { e.stopPropagation(); setHelpOpen(i); }}>✦ Help{(helpChats[helpKey(plan, i)] || []).length ? " · " + (helpChats[helpKey(plan, i)] || []).length : ""}</button>
                     {isA && <button className="bl-donebtn" onClick={(e) => { e.stopPropagation(); completeAndNext(i); }}>Done — built ✓</button>}
                   </div>
                 );
@@ -4460,6 +4685,13 @@ export default function App() {
       )}
     </div>
 
+    {helpOpen !== null && plan.list[helpOpen] && (() => {
+      const i = helpOpen, b = plan.list[i], t = types[b.ti], key = helpKey(plan, i);
+      const bd = (levainPlan.builds || []).find((x) => x.items.some((it) => it.gi === i));
+      const lev = bd ? { feedAt: fmtClock(startMin + levainPlan.feedOff), peakBy: fmtClock(startMin + bd.peakOff), buildTime: fmtDur(Math.round(bd.retarded ? bd.baseAdjMin : bd.desired)), levainTemp: showTemp(bd.Tlev), buildWaterTemp: showTemp(bd.Twater), coldRetard: !!bd.retarded, buildSharedBy: bd.name, seedGrams: Math.round(bd.seedL), flourGrams: Math.round(bd.flourL), waterGrams: Math.round(bd.waterL), sugarGrams: Math.round(bd.sugarL || 0), totalLevainGrams: Math.round(bd.M + (bd.sugarL || 0)) } : null;
+      const ctx = mixHelpContext({ b, i, total: plan.list.length, t, params, groupOf, showTemp, waterTemp: mixWaterTemp, startMin, base: schedule[i] ? schedule[i].base : 0, nowClock: fmtClock(nowMin), runName: dayName, runDate: dayDate, tempUnit, starterName: starter.name, ambientTemp, starterTemp, lev, done: doneBatches.includes(i), active: activeBatch === i });
+      return <MixHelpPanel key={key} title={"B" + (i + 1) + " · " + t.name} ctx={ctx} messages={helpChats[key] || []} onMessages={(ms) => setHelpChats((h) => ({ ...h, [key]: ms.slice(-HELP_MAX_MSGS) }))} onClose={() => setHelpOpen(null)} />;
+    })()}
     {mixSheetOpen && (() => {
       const total = (plan.list || []).length;
       const all = (plan.list || []).map((b, i) => mixSheetData({ b, i, total, t: types[b.ti], params, groupOf, showTemp, waterTemp: mixWaterTemp }));
@@ -4508,7 +4740,7 @@ export default function App() {
       const P = AVERY_6468;
       const data = (plan.list || []).map((b, i) => {
         const t = types[b.ti];
-        return { n: i + 1, name: t.name, size: b.size, dough: b.dough, totalFlour: b.totalFlour, totalWater: b.totalWater, lines: ingLines(t).filter((l) => l.pct > 0).map((l) => ({ name: l.name, g: b.weights[l.key] })) };
+        return { n: i + 1, name: t.name, size: b.size, dough: b.dough, totalFlour: b.totalFlour, totalWater: b.totalWater, lines: benchLines(t, b).map((l) => ({ name: l.name, g: l.g })) };
       });
       const expanded = [];
       data.forEach((L, i) => { const c = Math.max(1, Math.min(10, Math.floor(+labelCopies[i] || 1))); for (let k = 0; k < c; k++) expanded.push(L); });
