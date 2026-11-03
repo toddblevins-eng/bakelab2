@@ -397,8 +397,16 @@ function ScaldEditor({ t, onPatch }) {
       <label className="sd-tog"><input data-f="scaldOn" type="checkbox" checked={on} onChange={(e) => onPatch({ scald: e.target.checked })} /><span>Scald / tangzhong — cook part of the flour first</span></label>
       {on && (<>
         <div className="sd-presets">
-          <button data-f="presetTz" onClick={() => onPatch({ scaldHyd: 500, scaldMethod: "cooked" })}>Tangzhong 1:5</button>
-          <button data-f="presetYu" onClick={() => onPatch({ scaldHyd: 200, scaldMethod: "poured" })}>Yudane 1:2</button>
+          {(() => {
+            // the preset that matches the current ratio + method is highlighted; anything else is "custom"
+            const hyd = +t.scaldHyd, poured = t.scaldMethod === "poured";
+            const isTz = hyd === 500 && !poured, isYu = hyd === 200 && poured;
+            return (<>
+              <button data-f="presetTz" className={isTz ? "on" : ""} aria-pressed={isTz} onClick={() => onPatch({ scaldHyd: 500, scaldMethod: "cooked" })}>Tangzhong 1:5</button>
+              <button data-f="presetYu" className={isYu ? "on" : ""} aria-pressed={isYu} onClick={() => onPatch({ scaldHyd: 200, scaldMethod: "poured" })}>Yudane 1:2</button>
+              {!isTz && !isYu && <span className="sd-custom" data-k="scaldcustom">Custom ratio</span>}
+            </>);
+          })()}
         </div>
         <div className="sd-row">
           <label className="sd-f"><span>Scald flour (% of total flour)</span><input data-f="scaldPct" type="number" min="0" step="0.5" value={t.scaldPct ?? 10} onFocus={(e) => e.target.select()} onChange={(e) => onPatch({ scaldPct: num(e.target.value) })} /></label>
@@ -2807,6 +2815,8 @@ export default function App() {
         .sd-tog input{width:16px;height:16px;accent-color:var(--crust);cursor:pointer;flex:none;}
         .sd-presets{display:flex;gap:7px;margin:9px 0 8px;flex-wrap:wrap;}
         .sd-presets button{font-family:'DM Sans';font-size:11.5px;font-weight:600;padding:5px 10px;border-radius:7px;border:1.5px solid var(--crust);background:#fff;color:var(--crust2);cursor:pointer;}
+        .sd-presets button.on{background:var(--crust);color:#fff;border-color:var(--crust2);box-shadow:0 0 0 2px rgba(181,101,29,.25);}
+        .sd-custom{align-self:center;font-family:'DM Sans';font-size:11.5px;font-weight:600;color:var(--ink2);font-style:italic;}
         .sd-row{display:flex;flex-wrap:wrap;gap:8px 10px;}
         .sd-f{display:flex;flex-direction:column;gap:3px;font-size:10.5px;color:var(--ink2);flex:1 1 140px;min-width:0;}
         .sd-f input,.sd-f select{font-family:'JetBrains Mono';font-size:13px;padding:6px 8px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);min-width:0;width:100%;box-sizing:border-box;}
