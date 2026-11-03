@@ -70,6 +70,31 @@ const PROOF_CONTAINERS = [
   { key: "pullman2", label: "2 lb Pullman", count: "2 lb Pullman pans" },
 ];
 const proofInfo = (k) => PROOF_CONTAINERS.find((c) => c.key === k) || PROOF_CONTAINERS[0];
+// ---- Equipment (shared by every run). A mixer is limited by the GROSS FLOUR in a mix; an oven holds a different number of each pan type. ----
+const DEFAULT_EQUIPMENT = {
+  mixers: [{ id: "mx_spiral", name: "Large spiral mixer", flourKg: 0 }],
+  ovens: [
+    { id: "ov_icombi", name: "Rational iCombi Pro", boule: 12, pullman1: 0, pullman2: 0 },
+    { id: "ov_dutch4", name: "Dutch oven oven (holds 4)", boule: 4, pullman1: 0, pullman2: 0 },
+    { id: "ov_dutch2", name: "Dutch oven oven (holds 2)", boule: 2, pullman1: 0, pullman2: 0 },
+  ],
+};
+const eqNum = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
+const cleanEquipment = (e) => {
+  const mixers = (Array.isArray(e && e.mixers) ? e.mixers : []).filter((x) => x && typeof x === "object" && x.id).map((x) => ({ id: String(x.id), name: String(x.name || "Mixer"), flourKg: eqNum(x.flourKg) }));
+  const ovens = (Array.isArray(e && e.ovens) ? e.ovens : []).filter((x) => x && typeof x === "object" && x.id).map((x) => ({ id: String(x.id), name: String(x.name || "Oven"), boule: Math.floor(eqNum(x.boule)), pullman1: Math.floor(eqNum(x.pullman1)), pullman2: Math.floor(eqNum(x.pullman2)) }));
+  return { mixers, ovens };
+};
+// round and oval share the "boule" number; each Pullman size has its own
+const ovenKey = (shape) => (shape === "pullman1" || shape === "pullman2" ? shape : "boule");
+const ovenShapeCap = (oven, shape) => (oven ? Math.max(0, Math.floor(+oven[ovenKey(shape)] || 0)) : 0);
+// Flour physically in the mixer, in recipe-% units: every flour line (scald flour included) plus the flour inside the levain build (feed flour and the flour in the seed, same maths as costing).
+const grossFlourUnits = (t, refH) => {
+  let f = 0; ingLines(t).forEach((l) => { if (l.key.indexOf("fl_") === 0 || l.key === "scf") f += l.pct; });
+  const lev = +t.levain || 0, H = +t.levHyd || 80, I = Math.max(0.1, +t.levInoc || 10);
+  const den = 1 + H / 100 + I / 100, feed = lev / den;
+  return f + feed + feed * (I / 100) * 100 / (100 + (+refH || 80));
+};
 const MASS_G = { g: 1, kg: 1000, lb: 453.592, oz: 28.3495 };
 const VOL_ML = { mL: 1, L: 1000 };
 const PACK_UNITS = ["kg", "g", "lb", "oz", "L", "mL", "each"];
@@ -648,6 +673,42 @@ function MixSheetForm({ L, tempUnit, onFit }) {
   );
 }
 
+// ---- Equipment tab: mixers (gross flour capacity) and ovens (loaves per load, by pan type) ----
+function EquipmentTab({ equipment, setEquipment }) {
+  const [arm, setArm] = useState(null); // two taps to delete
+  const upd = (kind, id, patch) => setEquipment((e) => ({ ...e, [kind]: e[kind].map((x) => (x.id === id ? { ...x, ...patch } : x)) }));
+  const add = (kind) => setEquipment((e) => ({ ...e, [kind]: [...e[kind], kind === "mixers" ? { id: uid(), name: "New mixer", flourKg: 0 } : { id: uid(), name: "New oven", boule: 0, pullman1: 0, pullman2: 0 }] }));
+  const del = (kind, id) => { if (arm !== id) { setArm(id); return; } setArm(null); setEquipment((e) => ({ ...e, [kind]: e[kind].filter((x) => x.id !== id) })); };
+  const num = (v, set, step) => <input type="number" min="0" step={step || 1} placeholder="0" value={v || ""} onChange={(e) => set(e.target.value === "" ? 0 : Math.max(0, Number(e.target.value) || 0))} />;
+  return (
+    <div className="eq-wrap" data-k="equipmenttab">
+      <h3 className="eq-h">Equipment</h3>
+      <p className="eq-intro">Set these once; each run picks its mixer and oven on the Plan tab. A mixer is limited by the gross flour in a mix (your flours, scald flour and the levain's own flour). An oven holds a different number of each pan type.</p>
+      <h4 className="eq-sub">Mixers</h4>
+      {equipment.mixers.map((m) => (
+        <div className="eq-card" key={m.id} data-k="mixercard">
+          <div className="bl-field eq-name"><label>Name</label><input data-f="mxName" value={m.name} onChange={(e) => upd("mixers", m.id, { name: e.target.value })} /></div>
+          <div className="bl-field"><label>Max gross flour per mix (kg)</label>{num(m.flourKg, (v) => upd("mixers", m.id, { flourKg: v }), 0.5)}</div>
+          <button className={"eq-del" + (arm === m.id ? " armed" : "")} data-f="mxDel" onClick={() => del("mixers", m.id)}>{arm === m.id ? "Tap again to delete" : "Delete"}</button>
+        </div>
+      ))}
+      <button className="bl-add" data-f="mxAdd" onClick={() => add("mixers")}>+ Add mixer</button>
+      <h4 className="eq-sub">Ovens</h4>
+      {equipment.ovens.map((o) => (
+        <div className="eq-card" key={o.id} data-k="ovencard">
+          <div className="bl-field eq-name"><label>Name</label><input data-f="ovName" value={o.name} onChange={(e) => upd("ovens", o.id, { name: e.target.value })} /></div>
+          <div className="bl-field"><label>Boules / ovals per load</label>{num(o.boule, (v) => upd("ovens", o.id, { boule: Math.floor(v) }))}</div>
+          <div className="bl-field"><label>1 lb Pullmans per load</label>{num(o.pullman1, (v) => upd("ovens", o.id, { pullman1: Math.floor(v) }))}</div>
+          <div className="bl-field"><label>2 lb Pullmans per load</label>{num(o.pullman2, (v) => upd("ovens", o.id, { pullman2: Math.floor(v) }))}</div>
+          <button className={"eq-del" + (arm === o.id ? " armed" : "")} data-f="ovDel" onClick={() => del("ovens", o.id)}>{arm === o.id ? "Tap again to delete" : "Delete"}</button>
+        </div>
+      ))}
+      <button className="bl-add" data-f="ovAdd" onClick={() => add("ovens")}>+ Add oven</button>
+      <p className="eq-intro">A Pullman number left at 0 falls back to the boule number. Different pan types can share a load: a load is full when their shares add up to one oven.</p>
+    </div>
+  );
+}
+
 // ---- Help chat on each mix card: Claude answers with the context of that exact mix ----
 const HELP_MAX_MSGS = 40;
 const helpKey = (plan, i) => { const b = plan.list[i]; if (!b) return ""; return b.ti + ":" + plan.list.slice(0, i).filter((x) => x.ti === b.ti).length; };
@@ -885,7 +946,7 @@ const DEFAULT_STARTER = {
 const DAYS_KEY = "bakelab-days-v1";
 const LASTLOC_KEY = "bakelab-lastloc-v1"; // per-DEVICE (localStorage): where this device was last, so a home-screen launch reopens there
 const TAB_KEYS = ["plan", "prep", "levain", "safety", "build", "fold", "bake", "timers", "costs"];
-const HOME_TAB_KEYS = ["bakedays", "recipes", "pantry", "starter"];
+const HOME_TAB_KEYS = ["bakedays", "recipes", "pantry", "equipment", "starter"];
 
 // ---- stay awake -----------------------------------------------------------
 // Keep-awake video adapted from NoSleep.js (MIT, © Rich Tibbett). Used only where the Screen Wake Lock API can't be trusted.
@@ -939,7 +1000,7 @@ const normalizeFoodSafety = (fs) => {
     })),
   };
 };
-const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, rentalHours: 0, rentalRate: null, soldLoaves: {}, costLock: null, deduction: null, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null, helpChats: {} });
+const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, rentalHours: 0, rentalRate: null, soldLoaves: {}, costLock: null, deduction: null, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null, helpChats: {}, mixerId: null, ovenId: null });
 const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), complete: false, day: day || defaultDay() });
 
 // Buffered text field: keeps a local value so the cursor/focus survives the
@@ -1450,6 +1511,12 @@ export default function App() {
   const [editingDraft, setEditingDraft] = useState(null);
   const [slots, setSlots] = useState(DEFAULT_SLOTS);
   const [maxBatch, setMaxBatch] = useState(19000);
+  const [equipment, setEquipment] = useState(DEFAULT_EQUIPMENT); // shared across runs
+  const [mixerId, setMixerId] = useState(null); // this run's mixer / oven (null = type the numbers by hand, as before)
+  const [ovenId, setOvenId] = useState(null);
+  const mixer = equipment.mixers.find((x) => x.id === mixerId) || null;
+  const oven = equipment.ovens.find((x) => x.id === ovenId) || null;
+  const mixerFlourCapG = mixer ? eqNum(mixer.flourKg) * 1000 : 0;
   const [ambientTemp, setAmbientTemp] = useState(21);
   const [starterTemp, setStarterTemp] = useState(21);
   const [inocCal, setInocCal] = useState([{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 6.5 }]);
@@ -1607,6 +1674,7 @@ export default function App() {
     setParams({ ...DEFAULTS, ...(d.params || {}) });
     setSlots(normalizeSlots(d.slots));
     setMaxBatch(typeof d.maxBatch === "number" ? d.maxBatch : 19000);
+    setMixerId(typeof d.mixerId === "string" ? d.mixerId : null); setOvenId(typeof d.ovenId === "string" ? d.ovenId : null);
     setAmbientTemp(typeof d.ambientTemp === "number" ? d.ambientTemp : 21);
     setStarterTemp(typeof d.starterTemp === "number" ? d.starterTemp : 21);
     setFeedMode(d.feedMode === "manual" ? "manual" : "auto");
@@ -1661,7 +1729,10 @@ export default function App() {
       const loaves = Math.max(0, Math.floor(+t.loaves || 0));
       const W = Math.max(0, +t.loafWeight || 0);
       const totalDough = loaves * W;
-      const maxLPB = (maxBatch > 0 && W > 0) ? Math.floor(maxBatch / W) : 0;
+      // gross flour one loaf puts in the mixer (buffer included); with a mixer that has a flour capacity, that is what limits a mix
+      const fplG = (W > 0 && pctSum > 0) ? (W / pctSum) * grossFlourUnits(t, starter.refHyd) * dbF : 0;
+      const byFlour = mixerFlourCapG > 0 && fplG > 0;
+      const maxLPB = byFlour ? Math.floor(mixerFlourCapG / fplG) : ((maxBatch > 0 && W > 0) ? Math.floor(maxBatch / W) : 0);
       let batchCount = 0, sizes = [];
       if (loaves > 0 && maxLPB > 0) { batchCount = Math.ceil(loaves / maxLPB); const base = Math.floor(loaves / batchCount), rem = loaves % batchCount; sizes = Array.from({ length: batchCount }, (_, i) => base + (i < rem ? 1 : 0)); }
       else if (loaves > 0) { batchCount = loaves; sizes = Array(loaves).fill(1); }
@@ -1677,16 +1748,16 @@ export default function App() {
           if (l.key.indexOf("fl_") === 0 || l.key === "scf") tf += g;
           else if (l.key === "water" || l.key === "bassinage" || l.key === "scw") tw += g;
         });
-        return { ti, name: t.name, size: sz, dough: sz * W * dbF, weights, totalFlour: tf, totalWater: tw };
+        return { ti, name: t.name, size: sz, dough: sz * W * dbF, grossFlour: sz * fplG, weights, totalFlour: tf, totalWater: tw };
       });
-      summaries[ti] = { ti, name: t.name, loaves, W, totalDough, batchCount, sizes, maxLPB, impossible: loaves > 0 && maxLPB <= 0, floursOver: otherFlourSum(t) > 100 };
+      summaries[ti] = { ti, name: t.name, loaves, W, totalDough, batchCount, sizes, maxLPB, byFlour, fplG, impossible: loaves > 0 && maxLPB <= 0, floursOver: otherFlourSum(t) > 100 };
     });
     // batch list ordered by each recipe's chosen mix order (recipe blocks stay contiguous)
     const order = [...types.keys()].sort((a, b) => ((types[a].mixOrder || 99) - (types[b].mixOrder || 99)) || (a - b));
     const list = [];
     order.forEach((ti) => { (perType[ti] || []).forEach((b) => list.push(b)); });
     return { list, summaries };
-  }, [types, maxBatch, doughBuffer, doughBufferPct]);
+  }, [types, maxBatch, doughBuffer, doughBufferPct, mixerFlourCapG, starter.refHyd]);
 
   // recipes that share a base dough -> combined mix guidance (additive; does not touch the batch/levain engine)
   const baseDoughGroups = useMemo(() => {
@@ -1706,18 +1777,19 @@ export default function App() {
       });
       const baseDoughPerLoaf = unitPerLoaf * BP;
       const k = baseDoughKey(t);
-      if (!groups[k]) groups[k] = { key: k, BP, basePcts, members: [], totalBase: 0, mixOrder: t.mixOrder || 99 };
+      if (!groups[k]) groups[k] = { key: k, BP, basePcts, members: [], totalBase: 0, mixOrder: t.mixOrder || 99, flourPerG: BP > 0 ? grossFlourUnits(t, starter.refHyd) / BP : 0 };
       groups[k].members.push({ ti, name: t.name, loaves, inc });
       groups[k].totalBase += baseDoughPerLoaf * loaves * dbF;
       groups[k].mixOrder = Math.min(groups[k].mixOrder, t.mixOrder || 99);
     });
     const cap = maxBatch > 0 ? maxBatch : 0;
     return Object.values(groups).filter((g) => g.members.length >= 2).sort((a, b) => a.mixOrder - b.mixOrder).map((g) => {
-      const nBatches = cap > 0 ? Math.max(1, Math.ceil(g.totalBase / cap)) : 1;
+      const byFlour = mixerFlourCapG > 0 && g.flourPerG > 0;
+      const nBatches = byFlour ? Math.max(1, Math.ceil(g.totalBase * g.flourPerG / mixerFlourCapG)) : (cap > 0 ? Math.max(1, Math.ceil(g.totalBase / cap)) : 1);
       const weighOut = Object.keys(g.basePcts).map((name) => ({ name, g: g.BP > 0 ? g.totalBase * g.basePcts[name] / g.BP : 0 }));
-      return { key: g.key, members: g.members, totalBase: g.totalBase, nBatches, weighOut, cap };
+      return { key: g.key, members: g.members, totalBase: g.totalBase, nBatches, weighOut, cap, byFlour, flourCapKg: mixerFlourCapG / 1000 };
     });
-  }, [types, maxBatch, doughBuffer, doughBufferPct]);
+  }, [types, maxBatch, doughBuffer, doughBufferPct, mixerFlourCapG, starter.refHyd]);
 
   const totalBatches = Math.max(1, plan.list.length);
 
@@ -1749,6 +1821,7 @@ export default function App() {
               if (Array.isArray(gc.pantry) || extra.length) setPantry([...basePantry, ...extra]);
             }
             if (gc.costSettings && typeof gc.costSettings === "object") setCostSettings((cs) => ({ ...cs, ...gc.costSettings }));
+            if (gc.equipment && typeof gc.equipment === "object" && (Array.isArray(gc.equipment.mixers) || Array.isArray(gc.equipment.ovens))) setEquipment(cleanEquipment(gc.equipment));
           }
           let loadedDays = null;
           const dRec = await window.storage.get(DAYS_KEY);
@@ -1792,13 +1865,13 @@ export default function App() {
     })();
   }, []);
   // persist shared globals
-  useEffect(() => { if (!loaded) return; persist(GLOBALS_KEY, { coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, pantry, costSettings }); }, [coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, pantry, costSettings, loaded]);
+  useEffect(() => { if (!loaded) return; persist(GLOBALS_KEY, { coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, pantry, costSettings, equipment }); }, [coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, pantry, costSettings, equipment, loaded]);
   // autosave the open day's snapshot
   useEffect(() => {
     if (!loaded || view !== "editor" || !currentDayId) return;
-    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, rentalHours, rentalRate, soldLoaves, costLock, deduction, doneBatches, foodSafety, mixWaterTemp, calcInputs, helpChats };
+    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, rentalHours, rentalRate, soldLoaves, costLock, deduction, doneBatches, foodSafety, mixWaterTemp, calcInputs, helpChats, mixerId, ovenId };
     setDays((ds) => { const nd = ds.map((d) => (d.id === currentDayId ? { ...d, name: dayName, date: dayDate, updatedAt: Date.now(), day: snap } : d)); persist(DAYS_KEY, nd); return nd; });
-  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, rentalHours, rentalRate, soldLoaves, costLock, deduction, doneBatches, foodSafety, mixWaterTemp, calcInputs, helpChats, dayName, dayDate, currentDayId, view, loaded]);
+  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, rentalHours, rentalRate, soldLoaves, costLock, deduction, doneBatches, foodSafety, mixWaterTemp, calcInputs, helpChats, mixerId, ovenId, dayName, dayDate, currentDayId, view, loaded]);
 
   // remember where this device is (only after boot has restored, so we never overwrite the saved spot with defaults)
   useEffect(() => {
@@ -2023,7 +2096,10 @@ export default function App() {
 
   // ---- bake schedule: groups per-recipe sessions by date, one oven sequential ----
   const bakePlan = useMemo(() => {
-    const cap = Math.max(1, Math.floor(+params.ovenCap || 1));
+    const flatCap = Math.max(1, Math.floor(+params.ovenCap || 1));
+    // loaves of one pan type per load: from the selected oven (a blank Pullman number falls back to the boule number), else the flat "loaves per load"
+    const capFor = (shape) => { if (oven) { const c = ovenShapeCap(oven, shape) || ovenShapeCap(oven, "round"); if (c > 0) return c; } return flatCap; };
+    const cap = flatCap;
     const preheat = Math.max(0, +params.preheatMin || 0);
     const recover = Math.max(0, +params.recoverMin || 0);
     // collect per-date recipe entries
@@ -2035,7 +2111,7 @@ export default function App() {
         if (loaves <= 0) return;
         const date = sess.date || todayISO();
         if (!dateMap[date]) dateMap[date] = [];
-        dateMap[date].push({ ti, name: t.name, loaves, bakeOrder: t.bakeOrder || ti + 1, bakeMin: Math.max(1, +t.bakeMin || 45), steamMin: Math.min(Math.max(1, +t.bakeMin || 45), Math.max(0, +t.steamMin || 0)), temp: +t.bakeTemp || 245 });
+        dateMap[date].push({ ti, name: t.name, shape: t.shape, loaves, bakeOrder: t.bakeOrder || ti + 1, bakeMin: Math.max(1, +t.bakeMin || 45), steamMin: Math.min(Math.max(1, +t.bakeMin || 45), Math.max(0, +t.steamMin || 0)), temp: +t.bakeTemp || 245 });
       });
     });
     const scheduleDate = (date, items) => {
@@ -2050,17 +2126,21 @@ export default function App() {
       });
       const loads = [];
       Object.values(groups).sort((a, b) => a.order - b.order).forEach((g) => {
-        const queue = g.items.map((it) => ({ ti: it.ti, name: it.name, left: it.loaves })).filter((q) => q.left > 0);
+        const queue = g.items.map((it) => ({ ti: it.ti, name: it.name, left: it.loaves, c: capFor(it.shape) })).filter((q) => q.left > 0);
         let qi = 0;
         while (qi < queue.length) {
-          const parts = []; let room = cap;
-          while (room > 0 && qi < queue.length) {
-            const q = queue[qi]; const take = Math.min(room, q.left);
-            parts.push({ ti: q.ti, name: q.name, n: take }); q.left -= take; room -= take;
+          // a load is full when the shares add to 1: each loaf takes 1/c of the oven, c being what the oven holds of THAT pan type
+          const parts = []; let room = 1;
+          while (qi < queue.length) {
+            const q = queue[qi]; const fit = Math.floor(room * q.c + 1e-9);
+            if (fit <= 0) break;
+            const take = Math.min(fit, q.left);
+            parts.push({ ti: q.ti, name: q.name, n: take }); q.left -= take; room -= take / q.c;
             if (q.left === 0) qi++;
           }
+          if (!parts.length) break;
           const label = parts.length === 1 ? parts[0].name : parts.map((p) => p.n + " " + p.name).join(" · ");
-          loads.push({ parts, label, n: parts.reduce((a, p) => a + p.n, 0), bakeMin: g.bakeMin, steamMin: g.steamMin, temp: g.temp });
+          loads.push({ parts, label, n: parts.reduce((a, p) => a + p.n, 0), fill: Math.min(1, Math.max(0, 1 - room)), bakeMin: g.bakeMin, steamMin: g.steamMin, temp: g.temp });
         }
       });
       let cur = preheat;
@@ -2074,8 +2154,19 @@ export default function App() {
       const allocated = (slots[ti].sessions || []).reduce((a, _, si) => a + sessionLoaves(slots[ti], si), 0);
       return { ti, name: t.name, shaped, allocated, remaining: shaped - allocated };
     }).filter((p) => p.shaped > 0 || p.allocated > 0);
-    return { cap, preheat, recover, dateSchedules, pool };
-  }, [types, plan, slots, params.ovenCap, params.preheatMin, params.recoverMin]);
+    const notes = [];
+    if (oven) {
+      const seen = {};
+      Object.values(dateMap).forEach((its) => its.forEach((it) => {
+        const k = ovenKey(it.shape);
+        if (seen[k] || ovenShapeCap(oven, it.shape) > 0) return;
+        seen[k] = 1;
+        const used = capFor(it.shape);
+        notes.push(k === "boule" ? oven.name + " has no boule number set; loads use " + used + " per load." : proofInfo(it.shape).label + ": no number set for " + oven.name + ", so loads use its boule number (" + used + ").");
+      }));
+    }
+    return { cap, preheat, recover, dateSchedules, pool, notes };
+  }, [types, plan, slots, oven, params.ovenCap, params.preheatMin, params.recoverMin]);
 
   // temperature unit display/input conversion (math stays in Celsius)
   const cToU = (c) => (tempUnit === "F" ? c * 9 / 5 + 32 : c);
@@ -2221,7 +2312,8 @@ export default function App() {
     if (cid) setCoreRecipes((rs) => rs.map((x) => x.id === cid ? { ...x, notes: v } : x));
   };
   const runAnalysis = async (r) => {
-    const id = r.id, loaves = Math.max(1, +aiLoaves[id] || 24), W = +r.loafWeight || 0, cap = +params.ovenCap || 15;
+    const id = r.id, loaves = Math.max(1, +aiLoaves[id] || 24), W = +r.loafWeight || 0, ovenC = oven ? (ovenShapeCap(oven, r.shape) || ovenShapeCap(oven, "round")) : 0, cap = ovenC || (+params.ovenCap || 15);
+    const lnR = ingLines(r), pSR = lnR.reduce((a, l) => a + l.pct, 0), fplR = (pSR > 0 && W > 0) ? (W / pSR) * grossFlourUnits(r, starter.refHyd) : 0, byFlourR = mixerFlourCapG > 0 && fplR > 0;
     setAiState((st) => ({ ...st, [id]: { loading: true } }));
     try {
       const payload = {
@@ -2239,8 +2331,8 @@ export default function App() {
           inclusions: (r.inclusions || []).map((fl) => ({ name: fl.name, pct: +fl.pct || 0, ...(cleanWhen(fl.when) ? { addedAt: cleanWhen(fl.when) } : {}) })),
         },
         loaves,
-        rig: { mixerDoughCapacityG: maxBatch, ovenLoafCapacity: cap },
-        derived: { totalDoughG: Math.round(loaves * W), mixerBatches: maxBatch > 0 ? Math.ceil(loaves * W / maxBatch) : 1, ovenLoads: cap > 0 ? Math.ceil(loaves / cap) : 1 },
+        rig: { mixerDoughCapacityG: maxBatch, ...(byFlourR ? { mixerGrossFlourCapacityG: Math.round(mixerFlourCapG) } : {}), ovenLoafCapacity: cap },
+        derived: { totalDoughG: Math.round(loaves * W), mixerBatches: byFlourR ? Math.ceil(loaves * fplR / mixerFlourCapG) : (maxBatch > 0 ? Math.ceil(loaves * W / maxBatch) : 1), ovenLoads: cap > 0 ? Math.ceil(loaves / cap) : 1 },
       };
       const resp = await fetch("/api/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
       const data = await resp.json().catch(() => null);
@@ -2547,6 +2639,21 @@ export default function App() {
         .help-send{flex:none;height:44px;padding:0 18px;font-family:'DM Sans';font-size:15px;font-weight:700;color:#fff;background:var(--crust2);border:none;border-radius:10px;cursor:pointer;}
         .help-send:disabled,.help-input:disabled{opacity:.5;cursor:default;}
         @media print { .help-overlay { display: none !important; } }
+        .bl-cap.bl-equip{flex-direction:column;align-items:stretch;}
+        .eq-pick{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;width:100%;}
+        .bl-cap.bl-equip .bl-field{width:290px;max-width:100%;} .bl-equip .bl-field select{width:100%;font-family:'DM Sans';font-size:15px;padding:9px 10px;border:1.5px solid var(--line);border-radius:9px;background:#fff;color:var(--ink);}
+        .eq-notes{display:flex;flex-direction:column;gap:5px;align-items:flex-start;}
+        .eq-warn{color:#b3261e;font-size:12.5px;font-weight:600;}
+        .eq-bakenote{flex-basis:100%;}
+        .eq-link{border:none;background:none;padding:0;font-family:'DM Sans';font-size:12.5px;font-weight:700;color:var(--crust2);text-decoration:underline;cursor:pointer;}
+        .eq-ro{flex:1 1 260px;} .eq-roval{font-size:13px;color:var(--ink);line-height:1.4;padding-top:2px;} .eq-roval span{color:var(--ink2);font-size:11.5px;}
+        .eq-h{font-family:'Fraunces',serif;font-size:22px;margin:4px 0 6px;color:var(--ink);} .eq-sub{font-family:'Fraunces',serif;font-size:16px;margin:18px 0 8px;color:var(--crust2);}
+        .eq-intro{font-size:13px;color:var(--ink2);line-height:1.45;margin:0 0 6px;max-width:640px;}
+        .eq-card{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;border:1.5px solid var(--line);border-radius:12px;background:#fffdf8;padding:12px 14px;margin-bottom:10px;}
+        .eq-card .bl-field{margin:0;width:150px;} .eq-card .eq-name{width:240px;max-width:100%;}
+        .eq-card .bl-field input{width:100%;box-sizing:border-box;}
+        .eq-del{margin-left:auto;font-family:'DM Sans';font-size:12.5px;font-weight:600;padding:8px 12px;border:1.5px solid var(--line);background:#fff;color:var(--ink2);border-radius:8px;cursor:pointer;}
+        .eq-del.armed{background:#b3261e;border-color:#b3261e;color:#fff;}
         .bl-lev-sugar{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0;align-items:flex-end;}
         .bl-lev-sugar .bl-field2{flex:1 1 200px;min-width:0;}
         .bl-lev-sugar .bl-sub-note{display:block;margin-left:0;}
@@ -3184,7 +3291,7 @@ export default function App() {
           .bl-root{padding:0 12px 34px;}
           .bl-head{margin:0 -12px;padding:12px 12px 0;}
           .bl-tabs{margin:0 -12px 20px;padding:11px 14px;}
-          .bl-brandstrip{flex-wrap:wrap;} .bl-runnav{width:100%;margin-left:0;margin-top:2px;} .bl-runnav button{flex:1;min-height:40px;}
+          .bl-brandstrip{flex-wrap:wrap;} .bl-runnav{width:100%;margin-left:0;margin-top:2px;} .bl-runnav button{flex:1 1 auto;min-width:0;min-height:40px;padding:8px 6px;font-size:12px;white-space:nowrap;}
           .bl-title{font-size:20px;} .bl-title small{font-size:9px;letter-spacing:1.8px;} .bl-hap-logo{height:33px;} .bl-prodname{font-size:21px;}
           .bl-hap-logo-sm{height:32px;} .bl-prodname-sm{font-size:20px;}
           .bl-panel{padding:13px;}
@@ -3408,6 +3515,7 @@ export default function App() {
               <button className={homeTab === "bakedays" ? "on" : ""} onClick={() => setHomeTab("bakedays")}>Runs</button>
               <button className={homeTab === "recipes" ? "on" : ""} onClick={() => { setHomeTab("recipes"); setBuilderView("list"); }}>Recipes</button>
               <button className={homeTab === "pantry" ? "on" : ""} onClick={() => setHomeTab("pantry")}>Pantry</button>
+              <button className={homeTab === "equipment" ? "on" : ""} data-f="home-equipment" onClick={() => setHomeTab("equipment")}>Equipment</button>
               <button className={homeTab === "starter" ? "on" : ""} onClick={() => setHomeTab("starter")}>{(starter.name && starter.name.trim()) || "Starter"}</button>
             </div>
           </div>
@@ -3622,6 +3730,7 @@ export default function App() {
           )}
           </>)}
 
+          {homeTab === "equipment" && <EquipmentTab equipment={equipment} setEquipment={setEquipment} />}
           {homeTab === "pantry" && <PantryTab pantry={pantry} setPantry={setPantry} costSettings={costSettings} setCostSettings={setCostSettings} coreRecipes={coreRecipes} />}
           {homeTab === "starter" && (() => {
             const S = Math.max(0, +starter.mSeed || 0);
@@ -3737,6 +3846,7 @@ export default function App() {
             <button data-f="nav-bakedays" onClick={() => goHomeTab("bakedays")}>Runs</button>
             <button data-f="nav-recipes" onClick={() => goHomeTab("recipes")}>Recipes</button>
             <button data-f="nav-pantry" onClick={() => goHomeTab("pantry")}>Pantry</button>
+            <button data-f="nav-equipment" onClick={() => goHomeTab("equipment")}>Equipment</button>
             <button data-f="nav-starter" onClick={() => goHomeTab("starter")}>{(starter.name && starter.name.trim()) || "Starter"}</button>
           </div>
         </div>
@@ -3815,7 +3925,7 @@ export default function App() {
                 {(() => {
                   const N = sm.loaves, mx = sm.maxLPB, bc = sm.batchCount;
                   if (N <= 0) return null;
-                  if (mx <= 0) return <div className="bl-optimize warn">⚡ One loaf ({fmtG(sm.W)} g) is heavier than the {maxBatch / 1000}kg mixer cap — lower loaf weight or raise capacity.</div>;
+                  if (mx <= 0) return <div className="bl-optimize warn">⚡ {sm.byFlour ? <>One loaf puts {fmtG(sm.fplG)} g of flour in the mixer, more than the {fmtKg(mixerFlourCapG)} flour capacity of the {mixer.name}</> : <>One loaf ({fmtG(sm.W)} g) is heavier than the {maxBatch / 1000}kg mixer cap</>} — lower loaf weight or raise capacity.</div>;
                   const full = bc * mx, fillPct = Math.round((100 * N) / full), maxed = N === full, trimTo = (bc - 1) * mx;
                   return (
                     <div className="bl-optimize">
@@ -3946,10 +4056,28 @@ export default function App() {
         </div>
         <button className="bl-addrec" onClick={addSlot}>+ Add another recipe</button>
 
-        <div className="bl-cap">
-          <div className="bl-field"><label>Max dough per batch (kg)</label>
-            <input type="number" min="0" step="0.5" value={maxBatch / 1000} onChange={(e) => setMaxBatch(Math.max(0, (Number(e.target.value) || 0) * 1000))} /></div>
-          <div className="note">This capacity — your mixer / bulk vessel — decides the batch count, not the loaf total. At {maxBatch / 1000}kg you can mix ~{Math.floor(maxBatch / 850)} loaves at 850g per batch. Per-batch weights appear under Batch builds.</div>
+        <div className="bl-cap bl-equip" data-k="equipcard">
+          <div className="eq-pick">
+            <div className="bl-field"><label>Mixer</label>
+              <select data-f="mixerSel" value={mixer ? mixer.id : ""} onChange={(e) => setMixerId(e.target.value || null)}>
+                <option value="">Manual (max dough per batch)</option>
+                {equipment.mixers.map((x) => <option key={x.id} value={x.id}>{x.name}{eqNum(x.flourKg) > 0 ? " · " + eqNum(x.flourKg) + " kg flour" : " · no capacity set"}</option>)}
+              </select></div>
+            {(!mixer || mixerFlourCapG <= 0) && <div className="bl-field"><label>Max dough per batch (kg)</label>
+              <input type="number" min="0" step="0.5" value={maxBatch / 1000} onChange={(e) => setMaxBatch(Math.max(0, (Number(e.target.value) || 0) * 1000))} /></div>}
+            <div className="bl-field"><label>Oven</label>
+              <select data-f="ovenSel" value={oven ? oven.id : ""} onChange={(e) => setOvenId(e.target.value || null)}>
+                <option value="">Manual (loaves per load, Bake tab)</option>
+                {equipment.ovens.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+              </select></div>
+          </div>
+          <div className="note eq-notes" data-k="equipnote">
+            {mixer && mixerFlourCapG > 0 && types.map((t, ti) => { const sm = plan.summaries[ti]; return (sm && sm.loaves > 0 && sm.byFlour) ? <div key={"m" + ti}>{t.name}: about {fmtG(sm.fplG)} g of gross flour per loaf, so up to <b>{sm.maxLPB}</b> {sm.maxLPB === 1 ? "loaf" : "loaves"} per mix ({fmtKg(mixerFlourCapG)} flour limit).</div> : null; })}
+            {mixer && mixerFlourCapG <= 0 && <div className="eq-warn">{mixer.name} has no flour capacity yet, so the manual max dough applies. Set it on the Equipment tab.</div>}
+            {(!mixer || mixerFlourCapG <= 0) && <div>This capacity — your mixer / bulk vessel — decides the batch count, not the loaf total. At {maxBatch / 1000}kg you can mix ~{Math.floor(maxBatch / 850)} loaves at 850g per batch. Per-batch weights appear under Batch builds.</div>}
+            {oven && <div data-k="ovenplansum">{oven.name} holds per load: {oven.boule || "–"} boules/ovals · {oven.pullman1 || "–"} 1 lb Pullmans · {oven.pullman2 || "–"} 2 lb Pullmans.</div>}
+            <button className="eq-link" data-f="openEquipment" onClick={() => goHomeTab("equipment")}>Edit equipment</button>
+          </div>
         </div>
       </div>
 
@@ -4045,8 +4173,9 @@ export default function App() {
             <label className="bl-dbuf-tog"><input type="checkbox" checked={doughBuffer} onChange={(e) => setDoughBuffer(e.target.checked)} /><span>Dough buffer — mix extra to cover bowl / bench loss</span></label>
             {doughBuffer && <span className="bl-dbuf-pct"><input type="number" min="0" max="25" step="0.5" value={doughBufferPct} onChange={(e) => setDoughBufferPct(Math.max(0, Math.min(25, Number(e.target.value) || 0)))} /><em>%</em></span>}
             {doughBuffer && (() => {
-              const over = plan.list.map((b, i) => (maxBatch > 0 && b.dough > maxBatch) ? ("B" + (i + 1)) : null).filter(Boolean);
-              return over.length > 0 ? <div className="bl-dbuf-warn">Over the {fmtKg(maxBatch)} mixer at this buffer: {over.join(" · ")} — trim the buffer or split the batch.</div> : null;
+              const flourMode = mixerFlourCapG > 0;
+              const over = plan.list.map((b, i) => (flourMode ? b.grossFlour > mixerFlourCapG + 0.5 : (maxBatch > 0 && b.dough > maxBatch)) ? ("B" + (i + 1)) : null).filter(Boolean);
+              return over.length > 0 ? <div className="bl-dbuf-warn">Over the {flourMode ? fmtKg(mixerFlourCapG) + " flour limit" : fmtKg(maxBatch) + " mixer"} at this buffer: {over.join(" · ")} — trim the buffer or split the batch.</div> : null;
             })()}
           </div>
           <div className="bl-card sc-card" data-k="stock">
@@ -4322,7 +4451,7 @@ export default function App() {
               <div className="bl-bd-hd"><span className="bl-bd-title">Shared base doughs</span><span className="bl-bd-sub">mix together · split at shaping</span></div>
               {baseDoughGroups.map((g, gi) => (
                 <div className="bl-bd-group" key={gi}>
-                  <div className="bl-bd-total">{fmtG(g.totalBase)} g base · {g.nBatches} {g.nBatches === 1 ? "mix" : "mixes"}{g.nBatches > 1 ? " (÷ evenly · " + (g.cap / 1000) + " kg cap)" : ""}</div>
+                  <div className="bl-bd-total">{fmtG(g.totalBase)} g base · {g.nBatches} {g.nBatches === 1 ? "mix" : "mixes"}{g.nBatches > 1 ? " (÷ evenly · " + (g.byFlour ? g.flourCapKg + " kg flour cap" : (g.cap / 1000) + " kg cap") + ")" : ""}</div>
                   <div className="bl-bd-weigh">{g.weighOut.map((w, wi) => <span className="bl-bd-ing" key={wi}>{w.name} <b>{fmtG(w.g)} g</b>{eggCount(w.name, w.g) ? <em className="bl-eggnote"> · {eggCount(w.name, w.g)}</em> : null}</span>)}</div>
                   <div className="bl-bd-split">
                     {g.members.map((m, mi) => (
@@ -4458,9 +4587,12 @@ export default function App() {
         <div className="bl-panel">
           <h3>Bake — set dates on each recipe card in Plan</h3>
           <div className="bl-cond">
-            <div className="bl-field2"><label>Loaves per load</label><input type="number" min="1" value={params.ovenCap ?? 2} onChange={(e) => setP("ovenCap", e.target.value)} /></div>
+            {oven
+              ? <div className="bl-field2 eq-ro"><label>Loaves per load</label><div className="eq-roval" data-k="ovensum">{oven.name}: {oven.boule || "–"} boules/ovals · {oven.pullman1 || "–"} 1 lb Pullmans · {oven.pullman2 || "–"} 2 lb Pullmans <span>(change the oven on the Plan tab)</span></div></div>
+              : <div className="bl-field2"><label>Loaves per load</label><input type="number" min="1" value={params.ovenCap ?? 2} onChange={(e) => setP("ovenCap", e.target.value)} /></div>}
             <div className="bl-field2"><label>Preheat (min)</label><input type="number" min="0" value={params.preheatMin ?? 45} onChange={(e) => setP("preheatMin", e.target.value)} /></div>
             <div className="bl-field2"><label>Recover between (min)</label><input type="number" min="0" value={params.recoverMin ?? 7} onChange={(e) => setP("recoverMin", e.target.value)} /></div>
+            {bakePlan.notes.length > 0 && <div className="eq-warn eq-bakenote" data-k="ovennotes">{bakePlan.notes.join(" ")}</div>}
           </div>
           {types.map((t, ti) => (plan.summaries[ti] && plan.summaries[ti].loaves > 0 ? (
             <div className="bl-levparams" key={ti}>
@@ -4513,7 +4645,7 @@ export default function App() {
                             <div className="bl-load">
                               <div className="lo-no">{ld.i + 1}</div>
                               <div className="lo-body">
-                                <div className="lo-hd"><span className="lo-nm">{ld.label}</span><span className="lo-n">{ld.n} {ld.n === 1 ? "loaf" : "loaves"}</span><span className="lo-temp">{showTemp(ld.temp)}</span></div>
+                                <div className="lo-hd"><span className="lo-nm">{ld.label}</span><span className="lo-n">{ld.n} {ld.n === 1 ? "loaf" : "loaves"}{oven ? " · " + Math.round(ld.fill * 100) + "% full" : ""}</span><span className="lo-temp">{showTemp(ld.temp)}</span></div>
                                 <div className="lo-bar">
                                   {ld.steamMin > 0 && <div className="seg steam" style={{ flexGrow: ld.steamMin }} title="steam" />}
                                   {ld.bakeMin - ld.steamMin > 0 && <div className="seg vent" style={{ flexGrow: ld.bakeMin - ld.steamMin }} title="dry (steam released)" />}
