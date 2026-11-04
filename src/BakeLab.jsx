@@ -407,7 +407,7 @@ function CostsTab({ res, locked, lockedAt, hours, setHours, rate, setRate, defau
 }
 
 // Scald editor, shared by the recipe editor and each Plan card. `onPatch(partial)` writes recipe fields.
-function ScaldEditor({ t, onPatch }) {
+function ScaldEditor({ t, onPatch, buf }) {
   const sc = scaldInfo(t);
   const on = !!t.scald;
   const flours = t.flours || [], liquids = t.liquids || [];
@@ -453,6 +453,13 @@ function ScaldEditor({ t, onPatch }) {
             </select></label>
         </div>
         {sc.on && <div className="sd-read" data-k="scaldRead">Scald = {rd(sc.sf)}% flour + {rd(sc.S)}% {sc.liquidName.toLowerCase()}. Main mix keeps {rd(sc.flourPct - sc.sf)}% {sc.flourName} and {rd(sc.avail - sc.S)}% {sc.liquidName.toLowerCase()}. Total flour and hydration are unchanged.</div>}
+        {buf && sc.on && (
+          <label className="sc-buf sd-buf" data-k="scaldbufplan">
+            <input type="checkbox" data-f="scaldBufPlan" checked={!!buf.on} onChange={buf.onToggle} />
+            <span>Buffer — pot loss (cook extra; the dough still gets the exact amount)</span>
+            {buf.on && <span className="lbuffer-pct"><input type="number" data-f="scaldBufPctPlan" min="0" step="0.5" value={buf.pct} onChange={(e) => buf.onPct(e.target.value)} /><span>%</span></span>}
+          </label>
+        )}
         {sc.warns.map((w, i) => <div className="sd-warn" key={i}>{w}</div>)}
       </>)}
     </div>
@@ -1314,7 +1321,7 @@ const ingLines = (t) => {
 const benchLines = (t, b) => ingLines(t).filter((l) => l.pct > 0 && l.key !== "lsg").map((l) => (l.key === "levain" && (b.weights.lsg || 0) > 0 ? { ...l, g: (b.weights.levain || 0) + b.weights.lsg, sugarG: b.weights.lsg } : { ...l, g: b.weights[l.key] }));
 // Scald buffer: cook a little extra so pot loss can't leave the dough short. The dough still takes the exact amount.
 const SCALD_BUF_DEFAULT = 5;
-const BUILD_ID = "2026-11-03 e"; // bump on every delivery: it is shown in the header so the running build is never a guess
+const BUILD_ID = "2026-11-03 f"; // bump on every delivery: it is shown in the header so the running build is never a guess
 const scaldBufFactor = (t) => (t && t.scaldBuf ? 1 + Math.max(0, +t.scaldBufPct || 0) / 100 : 1);
 // The scald as the baker handles it for one batch: what goes into the dough (flour + liquid, already prepped) and what to cook (that plus the buffer).
 const scaldAmounts = (t, b) => {
@@ -2900,6 +2907,7 @@ export default function App() {
         .sc-nums{font-family:'JetBrains Mono';font-size:12px;color:var(--ink2);}
         .sc-flag{font-size:12.5px;margin-left:auto;color:var(--ink2);}
         .sc-buf{display:flex;align-items:center;gap:8px;width:100%;font-size:12.5px;color:var(--ink2);cursor:pointer;} .sc-buf input[type=number]{width:58px;padding:5px 7px;font-family:'JetBrains Mono';font-size:12.5px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);} .sc-buf .lbuffer-pct{display:inline-flex;align-items:center;gap:4px;}
+        .sd-buf{margin-top:8px;} .sc-buf input[type=checkbox]{accent-color:var(--crust);width:18px;height:18px;}
         .sc-row.short{background:#fdf0ef;} .sc-row.short .sc-flag{color:var(--alert);font-weight:700;}
         .sc-row.low{background:#fff6e3;} .sc-row.low .sc-flag{color:var(--crust2);font-weight:700;}
         .sc-flag em{font-style:normal;font-weight:400;color:var(--ink2);} .sc-flag em.late{color:var(--alert);font-weight:700;}
@@ -4036,7 +4044,7 @@ export default function App() {
                 ))}
                 <button className="bl-add" data-f="add-liq" onClick={() => addLiq(ti)}>+ Liquid</button>
                 <HydrationLine t={t} onSetWater={(w) => setFixed(ti, "water", w)} />
-                <ScaldEditor t={t} onPatch={(p) => setDraft(ti, p)} />
+                <ScaldEditor t={t} onPatch={(p) => setDraft(ti, p)} buf={{ on: !!t.scaldBuf, pct: t.scaldBufPct ?? SCALD_BUF_DEFAULT, onToggle: () => patchSlot(ti, (sl) => ({ ...sl, scaldBuf: !sl.scaldBuf })), onPct: (v) => patchSlot(ti, (sl) => ({ ...sl, scaldBufPct: v })) }} />
 
                 <div className="bl-subhead">Inclusions</div>
                 {t.inclusions.length === 0 && <div className="ing-empty">No inclusions</div>}
