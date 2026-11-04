@@ -1321,7 +1321,7 @@ const ingLines = (t) => {
 const benchLines = (t, b) => ingLines(t).filter((l) => l.pct > 0 && l.key !== "lsg").map((l) => (l.key === "levain" && (b.weights.lsg || 0) > 0 ? { ...l, g: (b.weights.levain || 0) + b.weights.lsg, sugarG: b.weights.lsg } : { ...l, g: b.weights[l.key] }));
 // Scald buffer: cook a little extra so pot loss can't leave the dough short. The dough still takes the exact amount.
 const SCALD_BUF_DEFAULT = 5;
-const BUILD_ID = "2026-11-03 f"; // bump on every delivery: it is shown in the header so the running build is never a guess
+const BUILD_ID = "2026-11-03 g"; // bump on every delivery: it is shown in the header so the running build is never a guess
 const scaldBufFactor = (t) => (t && t.scaldBuf ? 1 + Math.max(0, +t.scaldBufPct || 0) / 100 : 1);
 // The scald as the baker handles it for one batch: what goes into the dough (flour + liquid, already prepped) and what to cook (that plus the buffer).
 const scaldAmounts = (t, b) => {
@@ -2094,6 +2094,10 @@ export default function App() {
     });
     return { feedOff, autoFeed, builds: out };
   }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard, levBuffer, levBufferPct, levCombine]);
+  // The Plan card's levain buffer is a per-recipe remote for the same per-build setting the Levain tab uses (one build can serve several batches, and one recipe can have several builds).
+  const levBuildsFor = (ti) => (levainPlan.builds || []).filter((bd) => bd.items.some((x) => plan.list[x.gi] && plan.list[x.gi].ti === ti));
+  const setLevBufferFor = (ti, on) => setLevBuffer((r) => { const n = { ...r }; levBuildsFor(ti).forEach((bd) => { n[bd.key] = on; }); return n; });
+  const setLevBufferPctFor = (ti, v) => setLevBufferPct((r) => { const n = { ...r }; levBuildsFor(ti).forEach((bd) => { n[bd.key] = v; }); return n; });
 
   // scalds to make ahead, totalled across every batch of the run
   const scaldPrep = useMemo(() => {
@@ -2907,6 +2911,7 @@ export default function App() {
         .sc-nums{font-family:'JetBrains Mono';font-size:12px;color:var(--ink2);}
         .sc-flag{font-size:12.5px;margin-left:auto;color:var(--ink2);}
         .sc-buf{display:flex;align-items:center;gap:8px;width:100%;font-size:12.5px;color:var(--ink2);cursor:pointer;} .sc-buf input[type=number]{width:58px;padding:5px 7px;font-family:'JetBrains Mono';font-size:12.5px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);} .sc-buf .lbuffer-pct{display:inline-flex;align-items:center;gap:4px;}
+        .lev-buf{margin:2px 0 8px;} .lev-buf-tog{display:inline-flex;align-items:center;gap:8px;cursor:pointer;} .lev-buf-note{font-size:11.5px;color:var(--ink2);margin-left:auto;}
         .sd-buf{margin-top:8px;} .sc-buf input[type=checkbox]{accent-color:var(--crust);width:18px;height:18px;}
         .sc-row.short{background:#fdf0ef;} .sc-row.short .sc-flag{color:var(--alert);font-weight:700;}
         .sc-row.low{background:#fff6e3;} .sc-row.low .sc-flag{color:var(--crust2);font-weight:700;}
@@ -4026,6 +4031,20 @@ export default function App() {
                     <div className="bl-field2"><label>Sugar in levain <span className="bl-sub-note">% of levain flour · on top of the dough's sugar</span></label><div className="wrap2"><input data-f="levSugar" type="number" min="0" step="0.5" value={t.levSugar ?? 0} onChange={(e) => setDraft(ti, { levSugar: Math.max(0, Number(e.target.value) || 0) })} /><span className="pc">%</span></div></div>
                     {(+t.levSugar || 0) > 0 && <div className="bl-field2"><label>Which sugar</label><IngredientInput className="ing-name" value={t.levSugarName || ""} placeholder="Granulated sugar" onCommit={(v) => setDraft(ti, { levSugarName: v })} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" /></div>}
                   </div>
+                  {(() => {
+                    const bks = levBuildsFor(ti); if (!bks.length || !((+t.levain || 0) > 0)) return null;
+                    const nOn = bks.filter((bd) => bd.buffered).length, all = nOn === bks.length;
+                    const shared = bks.some((bd) => bd.items.some((x) => plan.list[x.gi] && plan.list[x.gi].ti !== ti));
+                    const totalG = bks.reduce((a, bd) => a + bd.M + (bd.sugarL || 0), 0);
+                    const raw = levBufferPct[bks[0].key], pctVal = (raw === undefined || raw === null) ? 2 : raw;
+                    return (
+                      <div className="sc-buf lev-buf" data-k="levbufplan">
+                        <label className="lev-buf-tog"><input type="checkbox" data-f="levBufPlan" checked={all} onChange={() => setLevBufferFor(ti, !all)} /><span>Buffer — spillage / bucket loss</span></label>
+                        {nOn > 0 && <span className="lbuffer-pct"><input type="number" data-f="levBufPctPlan" min="0" step="0.5" value={pctVal} onChange={(e) => setLevBufferPctFor(ti, e.target.value)} /><span>%</span></span>}
+                        <span className="lev-buf-note" data-k="levbufnote">Builds {fmtG(totalG)} g levain{nOn > 0 ? " incl. +" + (bks.find((bd) => bd.buffered) || {}).bufPct + "%" : ""}{shared ? " · shared build" : ""}{nOn > 0 && !all ? " · only some builds buffered (see Levain tab)" : ""}</span>
+                      </div>
+                    );
+                  })()}
                   <div className="bl-lev-exp"><label>Levain flour / experiment note</label><BufferedInput className="bl-lev-expnote" value={t.levExpNote || ""} onCommit={(v) => setDraft(ti, { levExpNote: v })} placeholder="e.g. straight bread flour · or 5% rye pre-ferment" /></div>
                   <div className="bl-lev-hint">Timing, water temp and the build recipe are computed on the <b>Levain</b> tab from {starter.name}'s calibration.</div>
                 </div>
