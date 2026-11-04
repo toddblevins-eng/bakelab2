@@ -164,7 +164,7 @@ const computeRunCosts = ({ plan, types, builds, pantry, settings, refHyd, rental
   plan.list.forEach((b) => {
     const t = types[b.ti]; if (!t) return;
     ingLines(t).forEach((l) => {
-      const g = b.weights[l.key] || 0;
+      const g = (b.weights[l.key] || 0) * ((l.key === "scf" || l.key === "scl") ? scaldBufFactor(t) : 1);
       if (l.key.indexOf("fl_") === 0 || l.key.indexOf("in_") === 0 || l.key.indexOf("lq_") === 0 || l.key === "salt" || l.key === "scf" || l.key === "scl" || l.key === "lsg") addUse(b.ti, l.matchName || l.name, g);
     });
   });
@@ -514,7 +514,7 @@ const isScaldLiquid = (t, l) => !!t && !!t.scald && !!t.scaldLiquid && normName(
 const defaultWhen = (kind, name, groupOf) => (kind === "liquid" ? "autolyse" : (groupOf(name) === "dry" ? "mix" : "fold2"));
 const placeLine = (t, l, groupOf, nF) => {
   const k = l.key;
-  if (k === "scf" || k === "scw" || k === "scl") return { w: "scald", asked: "scald" };
+  if (k === "scf" || k === "scw" || k === "scl" || k === "scald") return { w: "scald", asked: "scald" };
   if (k === "bassinage") return { w: "end", asked: "end" };
   if (k === "salt" || k === "levain") return { w: "mix", asked: "mix" };
   if (k.indexOf("fl_") === 0 || k === "water") return { w: "autolyse", asked: "autolyse" };
@@ -569,11 +569,14 @@ function mixSheetData({ b, i, total, t, params, groupOf, showTemp, waterTemp }) 
   const slots = { scald: [], autolyse: [], mix: [], fold1: [], fold2: [], fold3: [], end: [] };
   const warns = [];
   lines.forEach((l) => {
-    const row = { key: l.key, name: oneFlour && l.key === "scf" ? "Scald flour" : l.name, g: l.g, note: l.key === "water" && waterTemp != null ? showTemp(waterTemp) : "", sub: l.sugarG ? "incl. " + fmtG(l.sugarG) + " g sugar" : "" };
+    const isSc = l.key === "scf" || l.key === "scw" || l.key === "scl";
+    const sk = isSc ? scaldBufFactor(t) : 1;
+    const row = { key: l.key, name: oneFlour && l.key === "scf" ? "Scald flour" : l.name, g: l.g * sk, note: l.key === "water" && waterTemp != null ? showTemp(waterTemp) : "", sub: l.sugarG ? "incl. " + fmtG(l.sugarG) + " g sugar" : (isSc && sk > 1 ? "incl. " + Math.round((sk - 1) * 1000) / 10 + "% buffer" : "") };
     const pl = placeLine(t, l, groupOf, nF);
     slots[pl.w].push(row);
     if (pl.asked !== pl.w && /^fold/.test(pl.asked)) warns.push(l.name + ": " + WHEN_LABEL[pl.asked] + " is more folds than this run has (" + nF + "), so it goes in " + (nF > 0 ? "at " + WHEN_LABEL[pl.w] : "at the end of the mix") + ".");
   });
+  { const sa = scaldAmounts(t, b); if (sa && slots.scald.length) slots.autolyse.push({ key: "scald", name: "Scald (cooked)", g: sa.dough, note: "", sub: "pre-made" }); }
   const mixRows = [...slots.mix, ...slots.end];
   const bands = [];
   if (slots.scald.length) bands.push({ label: "Scald · cook first", rows: slots.scald });
@@ -738,7 +741,7 @@ function mixHelpContext(o) {
       waterPct: rd(+t.water || 0), saltPct: rd(+t.salt || 0), trueHydrationPct: rd(trueHydration(t)),
       levain: { pctOfFlour: rd(+t.levain || 0), hydrationPct: +t.levHyd || 80, inoculationPct: +t.levInoc || 10, wholeGrainPct: +t.levWhole || 0, ...(levSugarPct(t) > 0 ? { sugar: levSugarName(t), sugarPctOfLevainFlour: +t.levSugar } : {}), note: t.levExpNote || "" },
       bassinagePctOfWater: t.bassinage ? rd(+t.bassinagePct || 0) : 0,
-      scald: sc.on ? { flour: sc.flourName, flourPctOfTotal: rd(sc.sf), liquid: sc.liquidName, liquidPct: rd(sc.S), method: sc.method } : null,
+      scald: sc.on ? { flour: sc.flourName, flourPctOfTotal: rd(sc.sf), liquid: sc.liquidName, liquidPct: rd(sc.S), method: sc.method, bufferPct: t.scaldBuf ? (+t.scaldBufPct || 0) : 0 } : null,
       liquids: (t.liquids || []).map((l) => ({ name: l.name, pct: rd(+l.pct || 0), waterContentPct: +l.factor || 100 })),
       inclusions: (t.inclusions || []).map((f) => ({ name: f.name, pct: rd(+f.pct || 0) })),
       bake: { temp: showTemp(t.bakeTemp ?? 245), minutes: +t.bakeMin || 45, steamMinutes: t.steamMin ?? 20 },
@@ -1309,6 +1312,16 @@ const ingLines = (t) => {
 };
 // Lines as they are weighed at the bench: the levain's sugar goes into the levain you build, so it shows inside the Levain line ("incl. X g sugar"), not on its own.
 const benchLines = (t, b) => ingLines(t).filter((l) => l.pct > 0 && l.key !== "lsg").map((l) => (l.key === "levain" && (b.weights.lsg || 0) > 0 ? { ...l, g: (b.weights.levain || 0) + b.weights.lsg, sugarG: b.weights.lsg } : { ...l, g: b.weights[l.key] }));
+// Scald buffer: cook a little extra so pot loss can't leave the dough short. The dough still takes the exact amount.
+const SCALD_BUF_DEFAULT = 5;
+const BUILD_ID = "2026-11-03 e"; // bump on every delivery: it is shown in the header so the running build is never a guess
+const scaldBufFactor = (t) => (t && t.scaldBuf ? 1 + Math.max(0, +t.scaldBufPct || 0) / 100 : 1);
+// The scald as the baker handles it for one batch: what goes into the dough (flour + liquid, already prepped) and what to cook (that plus the buffer).
+const scaldAmounts = (t, b) => {
+  const sc = scaldInfo(t); if (!sc.on) return null;
+  const fl = b.weights.scf || 0, lq = (sc.isWater ? b.weights.scw : b.weights.scl) || 0, k = scaldBufFactor(t);
+  return { sc, fl, lq, dough: fl + lq, cookFl: fl * k, cookLq: lq * k, buf: k > 1 ? Math.round((k - 1) * 1000) / 10 : 0 };
+};
 
 // id-independent signature of a formula, with main flour normalized
 const formulaKey = (r) => JSON.stringify({
@@ -1344,7 +1357,7 @@ const buildStages = (p) => {
 
 const parseTime = (hhmm) => { const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; };
 const fmtClock = (t) => { const x = ((Math.round(t) % 1440) + 1440) % 1440; let h = Math.floor(x / 60); const m = x % 60; const ap = h >= 12 ? "p" : "a"; h = h % 12; if (h === 0) h = 12; return `${h}:${String(m).padStart(2, "0")}${ap}`; };
-const fmtDur = (min) => { if (min < 60) return `${min}m`; const h = Math.floor(min / 60), m = min % 60; return m ? `${h}h ${m}m` : `${h}h`; };
+const fmtDur = (min) => { const t = Math.round(+min || 0); if (t < 60) return `${t}m`; const h = Math.floor(t / 60), m = t % 60; return m ? `${h}h ${m}m` : `${h}h`; };
 const fmtG = (x) => { if (!x) return "—"; const v = Math.round(x * 10) / 10; return v >= 10 ? String(Math.round(v)) : String(v); };
 const fmtKg = (g) => (g / 1000).toFixed(2) + "kg";
 const fmtTemp = (c) => (Math.round(c * 10) / 10) + "°C";
@@ -1717,7 +1730,7 @@ export default function App() {
   const startMin = parseTime(startTime);
 
   // production "types" derived from slots (formula + day quantity)
-  const types = useMemo(() => slots.map((s, i) => ({ ...s.draft, loaves: s.loaves, mixOrder: s.mixOrder ?? i + 1, bakeOrder: s.bakeOrder ?? i + 1 })), [slots]);
+  const types = useMemo(() => slots.map((s, i) => ({ ...s.draft, loaves: s.loaves, mixOrder: s.mixOrder ?? i + 1, bakeOrder: s.bakeOrder ?? i + 1, scaldBuf: !!s.scaldBuf, scaldBufPct: s.scaldBufPct ?? SCALD_BUF_DEFAULT })), [slots]);
 
   // ---- batch planner -------------------------------------------------------
   const plan = useMemo(() => {
@@ -1968,7 +1981,7 @@ export default function App() {
       const t = types[b.ti];
       ingLines(t).forEach((l) => {
         if (l.pct <= 0) return;
-        const g = b.weights[l.key] || 0; if (!g) return;
+        const g = (b.weights[l.key] || 0) * ((l.key === "scf" || l.key === "scl") ? scaldBufFactor(t) : 1); if (!g) return; // the scald buffer is real flour and milk you need on hand
         const cat = (l.key.startsWith("fl_") || l.key === "scf") ? "flour" : (l.key.startsWith("in_") || l.key === "lsg") ? "inc" : "liquid";
         const nm = l.matchName || l.name;
         const key = (nm || "").trim().toLowerCase() + "|" + cat;
@@ -2082,7 +2095,8 @@ export default function App() {
       const sc = scaldInfo(t); if (!sc.on) return;
       let fl = 0, lq = 0;
       plan.list.forEach((b) => { if (b.ti === ti) { fl += b.weights.scf || 0; lq += (sc.isWater ? b.weights.scw : b.weights.scl) || 0; } });
-      if (fl > 0) out.push({ ti, name: t.name, flourName: sc.flourName, fl, liquidName: sc.liquidName, lq, method: sc.method });
+      const k = scaldBufFactor(t);
+      if (fl > 0) out.push({ ti, name: t.name, flourName: sc.flourName, fl: fl * k, liquidName: sc.liquidName, lq: lq * k, method: sc.method, k, dough: fl + lq, on: !!t.scaldBuf, pct: t.scaldBufPct });
     });
     return out;
   }, [plan, types]);
@@ -2403,6 +2417,7 @@ export default function App() {
         .bl-root{--chrome:#1a0f07;--chrome2:#2f1c0f;--chrome3:#3d2010;--chrome-t:#f5efe3;--chrome-m:#b09070;--paper:#f4eeda;--paper2:#e8d9be;--cream:#fffdf8;--ink:#241508;--ink2:#7a5a3a;--line:#d4c4a8;--crust:#b5651d;--crust2:#8a4a14;--active:#c4521f;--passive:#dfc99a;--passive-line:#c9ad79;--sand:#a08060;--alert:#b32d24;--alert-bg:#f6d9d4;font-family:'DM Sans',system-ui,sans-serif;color:var(--ink);background:var(--paper);padding:0 22px 40px;min-height:100vh;overflow-x:clip;}
         .bl-head{background:var(--chrome);margin:0 -22px;padding:14px 22px 0;border-bottom:none;display:flex;flex-direction:column;gap:0;}
         .bl-brandstrip{display:flex;align-items:center;gap:11px;padding-bottom:12px;border-bottom:1px solid rgba(245,239,227,.08);margin-bottom:12px;}
+        .bl-build-id{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.04em;color:var(--chrome-m,#b09070);opacity:.75;margin-left:0;align-self:center;white-space:nowrap;}
         .bl-hap-logo-sm{height:20px;width:auto;color:var(--chrome-t);display:block;}
         .bl-prodname-sm{font-family:'Fraunces',serif;font-weight:600;font-size:16px;color:var(--chrome-m);letter-spacing:-0.2px;}
         .bl-runnav{margin-left:auto;display:inline-flex;border:1.5px solid rgba(245,239,227,.18);border-radius:8px;overflow:hidden;flex:none;}
@@ -2884,6 +2899,7 @@ export default function App() {
         .sc-name{font-weight:600;color:var(--ink);min-width:120px;}
         .sc-nums{font-family:'JetBrains Mono';font-size:12px;color:var(--ink2);}
         .sc-flag{font-size:12.5px;margin-left:auto;color:var(--ink2);}
+        .sc-buf{display:flex;align-items:center;gap:8px;width:100%;font-size:12.5px;color:var(--ink2);cursor:pointer;} .sc-buf input[type=number]{width:58px;padding:5px 7px;font-family:'JetBrains Mono';font-size:12.5px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);} .sc-buf .lbuffer-pct{display:inline-flex;align-items:center;gap:4px;}
         .sc-row.short{background:#fdf0ef;} .sc-row.short .sc-flag{color:var(--alert);font-weight:700;}
         .sc-row.low{background:#fff6e3;} .sc-row.low .sc-flag{color:var(--crust2);font-weight:700;}
         .sc-flag em{font-style:normal;font-weight:400;color:var(--ink2);} .sc-flag em.late{color:var(--alert);font-weight:700;}
@@ -3510,7 +3526,7 @@ export default function App() {
       {view === "home" && (
         <div className="bl-home">
           <div className="bl-home-hd">
-            <div className="bl-title"><HapLogo className="bl-hap-logo" /><span className="bl-prodname">BakeLab</span><small>production studio</small></div>
+            <div className="bl-title"><HapLogo className="bl-hap-logo" /><span className="bl-prodname">BakeLab</span><small>production studio</small><span className="bl-build-id" data-k="buildid">build {BUILD_ID}</span></div>
             <div className="bl-home-tabs">
               <button className={homeTab === "bakedays" ? "on" : ""} onClick={() => setHomeTab("bakedays")}>Runs</button>
               <button className={homeTab === "recipes" ? "on" : ""} onClick={() => { setHomeTab("recipes"); setBuilderView("list"); }}>Recipes</button>
@@ -3841,7 +3857,7 @@ export default function App() {
 
       {view === "editor" && (<>
       <div className="bl-head">
-        <div className="bl-brandstrip"><HapLogo className="bl-hap-logo-sm" /><span className="bl-prodname-sm">BakeLab</span>
+        <div className="bl-brandstrip"><HapLogo className="bl-hap-logo-sm" /><span className="bl-prodname-sm">BakeLab</span><span className="bl-build-id" data-k="buildid">build {BUILD_ID}</span>
           <div className="bl-runnav" data-k="runnav">
             <button data-f="nav-bakedays" onClick={() => goHomeTab("bakedays")}>Runs</button>
             <button data-f="nav-recipes" onClick={() => goHomeTab("recipes")}>Recipes</button>
@@ -4212,8 +4228,13 @@ export default function App() {
               {scaldPrep.map((p) => (
                 <div className="sc-row ok" key={p.ti}>
                   <span className="sc-name">{p.name}</span>
-                  <span className="sc-nums">{fmtG(p.fl)} g {p.flourName} + {fmtG(p.lq)} g {p.liquidName.toLowerCase()}</span>
+                  <span className="sc-nums">{fmtG(p.fl)} g {p.flourName} + {fmtG(p.lq)} g {p.liquidName.toLowerCase()}{p.k > 1 ? " · " + fmtG(p.dough) + " g goes in the dough" : ""}</span>
                   <span className="sc-flag">{p.method === "poured" ? "pour boiling liquid over, mix" : "cook to " + showTemp(65) + ", stirring"}</span>
+                  <label className="sc-buf" data-k="scaldbuf">
+                    <input type="checkbox" data-f="scaldBuf" checked={p.on} onChange={() => patchSlot(p.ti, (sl) => ({ ...sl, scaldBuf: !sl.scaldBuf }))} />
+                    <span>Buffer — pot loss</span>
+                    {p.on && <span className="lbuffer-pct"><input type="number" data-f="scaldBufPct" min="0" step="0.5" value={p.pct ?? SCALD_BUF_DEFAULT} onChange={(e) => patchSlot(p.ti, (sl) => ({ ...sl, scaldBufPct: e.target.value }))} /><span>%</span></span>}
+                  </label>
                 </div>
               ))}
             </div>
@@ -4478,7 +4499,9 @@ export default function App() {
               {plan.list.map((_, idx) => idx).sort((a, b) => (doneBatches.includes(a) ? 1 : 0) - (doneBatches.includes(b) ? 1 : 0)).map((i) => {
                 const b = plan.list[i];
                 const t = types[b.ti];
-                const cols = benchLines(t, b);
+                const sa = scaldAmounts(t, b);
+                // the scald is pre-made, so it is ONE ingredient at the bench: flour + liquid together
+                const cols = (() => { const L = benchLines(t, b); if (!sa) return L; const out = []; let put = false; L.forEach((l) => { if (l.key === "scf" || l.key === "scw" || l.key === "scl") { if (!put) { out.push({ key: "scald", name: "Scald", g: sa.dough, premade: true }); put = true; } } else out.push(l); }); return out; })();
                 const base = schedule[i] ? schedule[i].base : 0;
                 const mixStart = base + ((t && t.autolyse != null ? +t.autolyse : +params.autolyse) || 0);
                 const isA = activeBatch === i, isD = doneBatches.includes(i);
@@ -4489,16 +4512,15 @@ export default function App() {
                     <div className="meta"><span><b>{b.size}</b> loaves</span><span><b>{fmtG(b.dough)}</b> g dough</span><span>{proofInfo(t.shape).label}</span></div>
                     <div className="bl-build-ddt">Target dough temp<b>{showTemp(t.ddt ?? DDT_DEFAULT_C)}</b></div>
                     {(() => {
-                      const sc = scaldInfo(t); if (!sc.on) return null;
-                      const wg = sc.isWater ? (b.weights.scw || 0) : (b.weights.scl || 0);
+                      if (!sa) return null; const sc = sa.sc;
                       return (
                         <div className="bl-scald-call" data-k="scaldcall">
-                          <b>Cook first — scald.</b> {fmtG(b.weights.scf || 0)} g {sc.flourName} + {fmtG(wg)} g {sc.liquidName.toLowerCase()}.{" "}
+                          <b>Cook first — scald.</b> {fmtG(sa.cookFl)} g {sc.flourName} + {fmtG(sa.cookLq)} g {sc.liquidName.toLowerCase()}{sa.buf > 0 ? " (includes a " + sa.buf + "% buffer; " + fmtG(sa.dough) + " g goes in the dough)" : ""}.{" "}
                           {sc.method === "poured" ? "Pour the just-boiled liquid over the flour and mix to a paste." : "Whisk over medium heat to " + showTemp(65) + " until it thickens like pudding."} Cool fully before mixing (make it ahead; the fridge is fine).
                         </div>
                       );
                     })()}
-                    {cols.map((l) => <div className="ing" key={l.key}><span className="nm">{l.name}</span><span className="g">{fmtG(l.g)} g{l.key === "water" && mixWaterTemp != null ? <em className="bl-watertemp"> · {showTemp(mixWaterTemp)}</em> : null}{l.sugarG ? <em className="bl-when" data-k="levsugartag"> · incl. {fmtG(l.sugarG)} g sugar</em> : null}{eggCount(l.name, l.g) ? <em className="bl-eggnote"> · {eggCount(l.name, l.g)}</em> : null}{(() => { const pl = placeLine(t, l, groupOf, Math.floor(+params.folds || 0)); return (/^fold/.test(pl.w) || pl.w === "end") ? <em className="bl-when" data-k="whentag"> · {pl.w === "end" ? "end of mix" : WHEN_LABEL[pl.w]}</em> : null; })()}</span></div>)}
+                    {cols.map((l) => <div className="ing" key={l.key}><span className="nm">{l.name}</span><span className="g">{fmtG(l.g)} g{l.key === "water" && mixWaterTemp != null ? <em className="bl-watertemp"> · {showTemp(mixWaterTemp)}</em> : null}{l.sugarG ? <em className="bl-when" data-k="levsugartag"> · incl. {fmtG(l.sugarG)} g sugar</em> : null}{l.premade ? <em className="bl-when" data-k="scaldtag"> · pre-made</em> : null}{eggCount(l.name, l.g) ? <em className="bl-eggnote"> · {eggCount(l.name, l.g)}</em> : null}{(() => { const pl = placeLine(t, l, groupOf, Math.floor(+params.folds || 0)); return (/^fold/.test(pl.w) || pl.w === "end") ? <em className="bl-when" data-k="whentag"> · {pl.w === "end" ? "end of mix" : WHEN_LABEL[pl.w]}</em> : null; })()}</span></div>)}
                     <div className="ing tot"><span className="nm">Total flour</span><span className="g">{fmtG(b.totalFlour)} g</span></div>
                     <div className="ing tot"><span className="nm">Total water</span><span className="g">{fmtG(b.totalWater)} g</span></div>
                     <button className="bl-helpbtn" data-f="help" onClick={(e) => { e.stopPropagation(); setHelpOpen(i); }}>✦ Help{(helpChats[helpKey(plan, i)] || []).length ? " · " + (helpChats[helpKey(plan, i)] || []).length : ""}</button>
