@@ -42,6 +42,23 @@ const cloneRecipe = (r) => ({
 });
 const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", levSugar: 0, levSugarName: "", levSeedHyd: "", levSeedName: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", price: 0, scald: false, scaldFlour: "", scaldPct: 10, scaldHyd: 500, scaldLiquid: "", scaldMethod: "cooked", inclusions: [], liquids: [] });
 
+// ---- Library recipes remember when they were last saved, and the version from before that save (one step back) ----
+const CORE_META = ["updatedAt", "updateKind", "prev", "prevAt"];
+const coreContent = (r) => { const o = { ...r }; CORE_META.forEach((k) => { delete o[k]; }); return o; };
+const stripIds = (x) => (Array.isArray(x) ? x.map(stripIds) : (x && typeof x === "object" ? Object.fromEntries(Object.keys(x).filter((k) => k !== "id").sort().map((k) => [k, stripIds(x[k])])) : x));
+// "did anything change?" ignores row ids and the stamp itself; a legacy recipe is normalised the same way a save would
+const sameCoreContent = (a, b) => JSON.stringify(stripIds(cloneRecipe(coreContent(a)))) === JSON.stringify(stripIds(cloneRecipe(coreContent(b))));
+const stampCore = (old, next, kind) => {
+  const now = new Date().toISOString();
+  if (!old) return { ...coreContent(next), id: next.id, updatedAt: now, updateKind: "created" };
+  if (sameCoreContent(old, next)) return { ...coreContent(next), id: next.id, ...(old.updatedAt ? { updatedAt: old.updatedAt, updateKind: old.updateKind || "saved" } : {}), ...(old.prev ? { prev: old.prev, prevAt: old.prevAt || "" } : {}) };
+  return { ...coreContent(next), id: next.id, updatedAt: now, updateKind: kind || "saved", prev: coreContent(old), prevAt: old.updatedAt || "" };
+};
+// Revert = go back to the snapshot. It is deliberately one-way: the snapshot is consumed, so there is nothing further back. Bake notes are a log, so they stay.
+const revertCore = (cur) => (cur && cur.prev ? { ...cur.prev, id: cur.id, notes: cur.notes ?? cur.prev.notes ?? "", updatedAt: new Date().toISOString(), updateKind: "reverted" } : cur);
+const fmtStamp = (iso) => { try { return new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }); } catch (e) { return ""; } };
+const coreStampText = (r) => (r && r.updatedAt ? ({ created: "Created", reverted: "Reverted" }[r.updateKind] || "Updated") + " " + fmtStamp(r.updatedAt) : "Last updated: not recorded");
+
 // date helpers — defined early because DEFAULT_SLOTS uses them at module-eval time
 const todayISO = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
 const addDaysISO = (iso, n) => { try { const d = new Date((iso || todayISO()) + "T00:00:00"); d.setDate(d.getDate() + n); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); } catch (e) { return todayISO(); } };
@@ -1352,7 +1369,7 @@ const ingLines = (t) => {
 const benchLines = (t, b) => ingLines(t).filter((l) => l.pct > 0 && l.key !== "lsg").map((l) => (l.key === "levain" && (b.weights.lsg || 0) > 0 ? { ...l, g: (b.weights.levain || 0) + b.weights.lsg, sugarG: b.weights.lsg } : { ...l, g: b.weights[l.key] }));
 // Scald buffer: cook a little extra so pot loss can't leave the dough short. The dough still takes the exact amount.
 const SCALD_BUF_DEFAULT = 5;
-const BUILD_ID = "2026-11-05 c"; // bump on every delivery: it is shown in the header so the running build is never a guess
+const BUILD_ID = "2026-11-05 d"; // bump on every delivery: it is shown in the header so the running build is never a guess
 const scaldBufFactor = (t) => (t && t.scaldBuf ? 1 + Math.max(0, +t.scaldBufPct || 0) / 100 : 1);
 // The scald as the baker handles it for one batch: what goes into the dough (flour + liquid, already prepped) and what to cook (that plus the buffer).
 const scaldAmounts = (t, b) => {
@@ -1678,6 +1695,7 @@ export default function App() {
   const [aiLoaves, setAiLoaves] = useState({});
   const [calcInputs, setCalcInputs] = useState(null); // last calculator inputs, internal °C
   const [delTarget, setDelTarget] = useState(null); // {id,name,kind} recipe pending delete confirmation
+  const [revertTarget, setRevertTarget] = useState(null); // {id,name} recipe pending revert confirmation
   const [labelOpen, setLabelOpen] = useState(false);
   const [mixSheetOpen, setMixSheetOpen] = useState(false);
   const [mixSheetOff, setMixSheetOff] = useState([]);
@@ -2343,7 +2361,7 @@ export default function App() {
     const oldCore = coreRecipes.find((x) => x.id === slot.coreRecipeId);
     const norm = cloneRecipe(slot.draft); norm.flours = norm.flours.map((f, i) => (i === 0 ? { ...f, pct: mainPct(slot.draft) } : f));
     const r = { ...norm, id: slot.coreRecipeId };
-    setCoreRecipes((rs) => rs.map((x) => x.id === r.id ? r : x));
+    setCoreRecipes((rs) => rs.map((x) => x.id === r.id ? stampCore(x, r, "saved") : x));
     if (oldCore) setSlots((ss) => ss.map((sl) => (sl.coreRecipeId === r.id && sameFormula(sl.draft, oldCore)) ? { ...sl, draft: cloneRecipe(r) } : sl));
   };
   const saveSlotAsRemix = (ti) => { remixRecipe(ti); patchSlot(ti, (sl) => ({ ...sl, coreRecipeId: "" })); };
@@ -2421,13 +2439,19 @@ export default function App() {
     else {
       const oldCore = coreRecipes.find((x) => x.id === r.id);
       const curDone = !!(days.find((d) => d.id === currentDayId) || {}).complete;
-      setCoreRecipes((rs) => editingRecipeId ? rs.map((x) => x.id === r.id ? r : x) : [r, ...rs]);
+      setCoreRecipes((rs) => editingRecipeId ? rs.map((x) => x.id === r.id ? stampCore(x, r, "saved") : x) : [stampCore(null, r), ...rs]);
       if (editingRecipeId && oldCore && !curDone) setSlots((ss) => ss.map((s) => (s.coreRecipeId === r.id && sameFormula(s.draft, oldCore)) ? { ...s, draft: cloneRecipe(r) } : s));
     }
     setBuilderView("list");
   };
-  const promoteRemixToCore = (id) => { const r = remixes.find((x) => x.id === id); if (!r) return; setCoreRecipes((rs) => [{ ...r, id: uid() }, ...rs]); setRemixes((rs) => rs.filter((x) => x.id !== id)); };
+  const promoteRemixToCore = (id) => { const r = remixes.find((x) => x.id === id); if (!r) return; setCoreRecipes((rs) => [stampCore(null, { ...r, id: uid() }), ...rs]); setRemixes((rs) => rs.filter((x) => x.id !== id)); };
   const deleteCoreRecipe = (id) => setCoreRecipes((rs) => rs.filter((x) => x.id !== id));
+  const revertCoreRecipe = (id) => {
+    const cur = coreRecipes.find((x) => x.id === id); if (!cur || !cur.prev) return;
+    const rev = revertCore(cur), curDone = !!(days.find((d) => d.id === currentDayId) || {}).complete;
+    setCoreRecipes((rs) => rs.map((x) => (x.id === id ? rev : x)));
+    if (!curDone) setSlots((ss) => ss.map((sl) => ((sl.coreRecipeId === id && sameFormula(sl.draft, cur)) ? { ...sl, draft: cloneRecipe(rev) } : sl)));
+  };
   const deleteRemix = (id) => setRemixes((rs) => rs.filter((x) => x.id !== id));
   // Dropdown source: the pantry's recipe ingredients (packaging and consumables are not offered). Names the baker types into a recipe are remembered in the pantry.
   const ingOptions = useMemo(() => pantry.filter((it) => (it.usage || "recipe") === "recipe").map((it) => ({ id: it.id, name: it.name, group: validGroup(it.group) })), [pantry]);
@@ -3117,6 +3141,9 @@ export default function App() {
         .bl-confirm-acts button{flex:1;font-family:'DM Sans';font-weight:700;font-size:14px;padding:12px;border-radius:9px;cursor:pointer;}
         .bl-confirm-cancel{border:1.5px solid var(--line);background:#fff;color:var(--ink2);}
         .bl-confirm-cancel:hover{background:var(--paper2);}
+        .bl-confirm .bl-confirm-warn{color:#8a2a1a;margin-top:-10px;}
+        .brc-stamp{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px;padding-top:6px;border-top:1px dashed var(--line);font-size:11px;color:var(--ink2);}
+        .brc-revert{font-family:'DM Sans';font-size:11.5px;font-weight:600;padding:4px 10px;border-radius:7px;border:1.5px solid var(--line);background:#fff;color:var(--crust2);cursor:pointer;} .brc-revert:hover{border-color:var(--alert);color:var(--alert);}
         .bl-confirm-del{border:none;background:var(--alert);color:#fff;}
         .bl-confirm-del:hover{background:#8f231c;}
         .bl-progress{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;font-size:12px;color:var(--ink2);}
@@ -3753,6 +3780,10 @@ export default function App() {
                     <div className="brc-body">
                       <div className="brc-meta">{r.flours && r.flours.map((f, i) => (i === 0 ? `${Math.max(0, 100 - (r.flours.slice(1).reduce((a, x) => a + (+x.pct || 0), 0)))}% ${f.name}` : `${f.pct}% ${f.name}`)).join(" · ")}</div>
                       <div className="brc-meta">{r.loafWeight}g · {r.water}% water · {r.levain}% levain @ {r.levHyd ?? 80}% · <b>{Math.round(trueHydration(r) * 10) / 10}% true hyd</b></div>
+                      <div className="brc-stamp" data-k="recipestamp" onClick={(e) => e.stopPropagation()}>
+                        <span data-k="stamptext">{coreStampText(r)}</span>
+                        {r.prev && <button className="brc-revert" data-f="revert-recipe" title="Go back to the version from before the last save" onClick={() => setRevertTarget({ id: r.id, name: r.name })}>↶ Revert</button>}
+                      </div>
                       <div className="brc-ai" onClick={(e) => e.stopPropagation()}>
                         <div className="brc-ai-row">
                           <label>loaves <input type="number" min="1" value={aiLoaves[r.id] ?? 24} onChange={(e) => setAiLoaves((st) => ({ ...st, [r.id]: Math.max(1, Number(e.target.value) || 1) }))} /></label>
@@ -4925,6 +4956,22 @@ export default function App() {
           </div>
         </div>
       )}
+      {revertTarget && (() => {
+        const cur = coreRecipes.find((x) => x.id === revertTarget.id); if (!cur || !cur.prev) return null;
+        return (
+          <div className="bl-modal-overlay" data-k="revertmodal" onClick={() => setRevertTarget(null)}>
+            <div className="bl-modal bl-confirm" role="dialog" aria-modal="true" aria-label="Revert recipe" onClick={(e) => e.stopPropagation()}>
+              <h3>Revert recipe?</h3>
+              <p>“<b>{cur.name || "Untitled"}</b>” goes back to how it was before your last save{cur.prevAt ? <> (the version from {fmtStamp(cur.prevAt)})</> : ""}. The version saved {fmtStamp(cur.updatedAt)} is replaced.</p>
+              <p className="bl-confirm-warn"><b>This can’t be undone.</b> Once you revert, the current version is gone for good and there is no older version to go back to. Your bake notes are kept. If the run you have open is still using the current version, it switches back too.</p>
+              <div className="bl-confirm-acts">
+                <button className="bl-confirm-cancel" data-f="revert-cancel" onClick={() => setRevertTarget(null)}>Cancel</button>
+                <button className="bl-confirm-del" data-f="revert-confirm" onClick={() => { revertCoreRecipe(cur.id); setRevertTarget(null); }}>Revert</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
 
     {helpOpen !== null && plan.list[helpOpen] && (() => {
