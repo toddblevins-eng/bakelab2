@@ -30,6 +30,7 @@ THELMA, THE STARTER
 - Her feed flour is a bulk mix of 1000 g organic red fife roller-milled flour, 250 g organic red fife whole wheat stone-ground, and 250 g organic stone-ground rye, until a white bread flour is used.
 - No discard: levain is built by feeding the whole culture.
 - Levains are fed with sifted flour to control crumb darkening.
+- The milk bread levain is seeded from a separate stiff starter, always fed at 50% hydration with P&H enriched strong bread flour. It is kept apart from Thelma because the milk bread should use an enriched white strong flour, not the organic, roller-milled, unenriched flour Thelma is fed.
 
 HOW THE BAKER WORKS
 - Baker's percentages everywhere.
@@ -47,7 +48,9 @@ WHAT THE APP'S TERMS MEAN
 - Scald (tangzhong or yudane): part of the flour and liquid made ahead as a cooked or poured paste, cooled, then added. It is carved out of the recipe's own flour and liquid, so total flour and hydration do not change.
 - Sugar in the levain: sugar built into the levain (a sweet stiff levain), as a percentage of the levain's flour, on top of any sugar in the dough itself.
 - Build to peak: the hours the levain takes to peak at the reference temperature, entered per recipe from experience. The app scales it for inoculation, hydration and temperature but does not predict the effect of sugar.
-- True hydration counts the water in milk and egg and the water and flour inside the levain.
+- Levain hydration is the hydration of the FINISHED levain (fresh feed and seed together). A recipe can name its own seed starter and that starter's hydration; if it does not, Thelma's is used.
+- True hydration counts the water in milk and egg, the water in butter (about 16%), and the water and flour inside the levain. Sugar and other dry inclusions add no water.
+- Scald flour is set as a percentage of total flour (10%, 20% or 30% are the quick options), with the liquid as a ratio to the scald flour (for example 2:1 for a yudane).
 `;
 
 // ============================  HOUSE RULES (usually leave alone)  ============================
