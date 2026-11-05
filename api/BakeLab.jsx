@@ -1,0 +1,5026 @@
+import React, { useState, useEffect, useLayoutEffect, useMemo, useCallback, useRef } from "react";
+
+// ---------------------------------------------------------------------------
+// BakeLab Production Gantt  ·  v5
+// Recipe library (save / load / new) feeding two production slots,
+// baker's-% with a balancing main flour, auto batch count, draggable schedule.
+// ---------------------------------------------------------------------------
+
+const STORAGE_KEY = "bakelab-gantt-config-v8";
+const PX = 1.7;   // pixels per minute
+const SNAP = 5;   // drag snap, minutes
+const NEW = "__new__";
+
+const uid = () => Math.random().toString(36).slice(2, 9);
+const mk = (name, pct) => ({ id: uid(), name, pct });
+const mkL = (name, pct, factor) => ({ id: uid(), name, pct, factor });
+// "When added": stored as `when` on each liquid and inclusion ("" = automatic). A liquid that is in the scald is derived from the scald settings.
+const WHEN_VALUES = ["autolyse", "mix", "fold1", "fold2", "fold3"];
+const WHEN_LABEL = { autolyse: "Autolyse", mix: "Mix", fold1: "Fold 1", fold2: "Fold 2", fold3: "Fold 3", scald: "Scald", end: "End of mix" };
+const cleanWhen = (v) => (WHEN_VALUES.indexOf(v) !== -1 ? v : "");
+
+// deep-copy a recipe with fresh ingredient ids (so slots never share refs)
+const DDT_DEFAULT_C = (76 - 32) * 5 / 9; // 76°F target dough temp, stored internally in °C
+const cloneRecipe = (r) => ({
+  name: r.name, loafWeight: r.loafWeight, shape: r.shape || "round", water: r.water, salt: r.salt, levain: r.levain,
+  levHyd: r.levHyd ?? 80, levInoc: r.levInoc ?? 10, levRefInoc: r.levRefInoc ?? 10, levBuildHrs: r.levBuildHrs ?? 5, levRefTemp: r.levRefTemp ?? 24,
+  levWhole: r.levWhole ?? 0, levExpNote: r.levExpNote || "",
+  levSugar: r.levSugar ?? 0, levSugarName: r.levSugarName || "",
+  ddt: r.ddt ?? DDT_DEFAULT_C,
+  bakeTemp: r.bakeTemp ?? 245, bakeMin: r.bakeMin ?? 45, steamMin: r.steamMin ?? 20,
+  autolyse: r.autolyse ?? 45,
+  calNote: r.calNote || "",
+  bassinage: !!r.bassinage,
+  bassinagePct: r.bassinagePct ?? 8,
+  notes: r.notes || "",
+  price: r.price ?? 0,
+  scald: !!r.scald, scaldFlour: r.scaldFlour || "", scaldPct: r.scaldPct ?? 10, scaldHyd: r.scaldHyd ?? 500, scaldLiquid: r.scaldLiquid || "", scaldMethod: r.scaldMethod === "poured" ? "poured" : "cooked",
+  flours: r.flours.map((f) => mk(f.name, f.pct)),
+  inclusions: r.inclusions.map((f) => ({ ...mk(f.name, f.pct), when: cleanWhen(f.when) })),
+  liquids: (r.liquids || []).map((l) => ({ ...mkL(l.name, l.pct, l.factor ?? 100), when: cleanWhen(l.when) })),
+});
+const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", levSugar: 0, levSugarName: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", price: 0, scald: false, scaldFlour: "", scaldPct: 10, scaldHyd: 500, scaldLiquid: "", scaldMethod: "cooked", inclusions: [], liquids: [] });
+
+// date helpers — defined early because DEFAULT_SLOTS uses them at module-eval time
+const todayISO = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
+const addDaysISO = (iso, n) => { try { const d = new Date((iso || todayISO()) + "T00:00:00"); d.setDate(d.getDate() + n); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); } catch (e) { return todayISO(); } };
+const dateDiffDays = (a, b) => { try { return Math.round((new Date(b + "T00:00:00") - new Date(a + "T00:00:00")) / 86400000); } catch (e) { return 0; } };
+const RUN_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+// Builds "June 19, 20, 21" from a mix day + N bake days (mix+1..mix+N). Re-prefixes month if dates cross a boundary.
+const buildRunName = (mixISO, nBakeDays) => {
+  if (!mixISO) return "New run";
+  const list = [mixISO];
+  for (let i = 1; i <= Math.max(1, nBakeDays); i++) list.push(addDaysISO(mixISO, i));
+  let out = "", lastM = null;
+  list.forEach((iso, idx) => { const p = (iso || "").split("-"); const m = +p[1], d = +p[2]; if (m !== lastM) { out += (idx === 0 ? "" : ", ") + (RUN_MONTHS[m - 1] || "") + " " + d; lastM = m; } else { out += ", " + d; } });
+  return out.trim();
+};
+const sessionLoaves = (slot, si) => { const ss = slot.sessions || []; if (si === 0) return Math.max(0, (slot.loaves || 0) - ss.slice(1).reduce((a, s) => a + Math.max(0, +(s.loaves) || 0), 0)); return Math.max(0, +(ss[si] && ss[si].loaves) || 0); };
+const remixName = (base, iso) => { const [y, m, d] = (iso || todayISO()).split("-"); return `${(base || "Recipe").replace(/\s+/g, "_")}_remix_${d}${m}${y.slice(2)}`; };
+// ===========================================================================
+// Pantry: ingredient prices + stock  ->  cost per loaf, shortage flags, run profit
+// ===========================================================================
+// Everything is converted to a BASE unit: grams (mass and volume, volume via density) or "each".
+// Stock and reorder points are stored in base units and shown in the item's own pack unit.
+// Proofing containers. Stored on the recipe as `shape`; "round" and "oval" keep their old keys so existing recipes are untouched.
+const PROOF_CONTAINERS = [
+  { key: "round", label: "Round", count: "Round bannetons" },
+  { key: "oval", label: "Oval", count: "Oval bannetons" },
+  { key: "pullman1", label: "1 lb Pullman", count: "1 lb Pullman pans" },
+  { key: "pullman2", label: "2 lb Pullman", count: "2 lb Pullman pans" },
+];
+const proofInfo = (k) => PROOF_CONTAINERS.find((c) => c.key === k) || PROOF_CONTAINERS[0];
+// ---- Equipment (shared by every run). A mixer is limited by the GROSS FLOUR in a mix; an oven holds a different number of each pan type. ----
+const DEFAULT_EQUIPMENT = {
+  mixers: [{ id: "mx_spiral", name: "Large spiral mixer", flourKg: 0 }],
+  ovens: [
+    { id: "ov_icombi", name: "Rational iCombi Pro", boule: 12, pullman1: 0, pullman2: 0 },
+    { id: "ov_dutch4", name: "Dutch oven oven (holds 4)", boule: 4, pullman1: 0, pullman2: 0 },
+    { id: "ov_dutch2", name: "Dutch oven oven (holds 2)", boule: 2, pullman1: 0, pullman2: 0 },
+  ],
+};
+const eqNum = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
+const cleanEquipment = (e) => {
+  const mixers = (Array.isArray(e && e.mixers) ? e.mixers : []).filter((x) => x && typeof x === "object" && x.id).map((x) => ({ id: String(x.id), name: String(x.name || "Mixer"), flourKg: eqNum(x.flourKg) }));
+  const ovens = (Array.isArray(e && e.ovens) ? e.ovens : []).filter((x) => x && typeof x === "object" && x.id).map((x) => ({ id: String(x.id), name: String(x.name || "Oven"), boule: Math.floor(eqNum(x.boule)), pullman1: Math.floor(eqNum(x.pullman1)), pullman2: Math.floor(eqNum(x.pullman2)) }));
+  return { mixers, ovens };
+};
+// round and oval share the "boule" number; each Pullman size has its own
+const ovenKey = (shape) => (shape === "pullman1" || shape === "pullman2" ? shape : "boule");
+const ovenShapeCap = (oven, shape) => (oven ? Math.max(0, Math.floor(+oven[ovenKey(shape)] || 0)) : 0);
+// Flour physically in the mixer, in recipe-% units: every flour line (scald flour included) plus the flour inside the levain build (feed flour and the flour in the seed, same maths as costing).
+const grossFlourUnits = (t, refH) => {
+  let f = 0; ingLines(t).forEach((l) => { if (l.key.indexOf("fl_") === 0 || l.key === "scf") f += l.pct; });
+  const lev = +t.levain || 0, H = +t.levHyd || 80, I = Math.max(0.1, +t.levInoc || 10);
+  const den = 1 + H / 100 + I / 100, feed = lev / den;
+  return f + feed + feed * (I / 100) * 100 / (100 + (+refH || 80));
+};
+const MASS_G = { g: 1, kg: 1000, lb: 453.592, oz: 28.3495 };
+const VOL_ML = { mL: 1, L: 1000 };
+const PACK_UNITS = ["kg", "g", "lb", "oz", "L", "mL", "each"];
+const normName = (s) => String(s == null ? "" : s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+// Ingredient groups. Stored on each pantry item as `group` ("" = Ungrouped); the Plan / Recipe dropdowns read the Pantry by group.
+const ING_GROUPS = [
+  { key: "flour", label: "Flour" },
+  { key: "dry", label: "Dry ingredients" },
+  { key: "wet", label: "Wet ingredients" },
+  { key: "dryinc", label: "Dry inclusions" },
+  { key: "freshinc", label: "Fresh inclusions" },
+  { key: "cheese", label: "Cheeses" },
+];
+const groupLabel = (k) => (ING_GROUPS.find((g) => g.key === k) || { label: "Ungrouped" }).label;
+const validGroup = (k) => (ING_GROUPS.some((g) => g.key === k) ? k : "");
+// Which groups each kind of dropdown offers. Inclusions take everything that is not a flour (sugar, butter and cheese are all added post-mix).
+const KIND_GROUPS = { flour: ["flour"], liquid: ["wet"], inclusion: ["dry", "wet", "dryinc", "freshinc", "cheese", ""] };
+// Best-guess grouping by name, first match wins; anything unmatched stays Ungrouped for the baker to sort.
+const GROUP_RULES = [
+  ["cheese", /cheese|cheddar|gruy[eè]re|asiago|parmesan|parmigiano|mozzarella|\bfeta\b|gouda|havarti|\bbrie\b|manchego|pecorino|romano|provolone|monterey|emmental|comt[eé]|fontina|ricotta|mascarpone|gorgonzola|\bswiss\b/],
+  ["flour", /flour|semolina|durum|\bspelt\b|kamut|einkorn|emmer|farina|\batta\b/],
+  ["dry", /powder|powdered/],
+  ["dry", /(dried|dehydrated)\s+(rosemary|thyme|basil|oregano|sage|parsley|dill|chives?|mint|tarragon|marjoram|herbs?)/],
+  ["dryinc", /\bdried\b|dehydrated|freeze.?dried/],
+  ["freshinc", /\bfresh\b|zest|scallion|green onion|\bonions?\b|\bgarlic\b|jalape|bell pepper|tomato|zucchini|carrot|spinach|\bkale\b|mushroom|potato|shallot|\bleeks?\b|cucumber|beet|squash|\bchives?\b/],
+  ["wet", /\bmilk\b|buttermilk|\beggs?\b|molasses|honey|\boil\b|butter|\bcream\b|yogh?urt|kefir|syrup|\bwater\b|vanilla|juice|vinegar|\blard\b|shortening|ghee|brandy|\brum\b|\bbeer\b|\bwine\b|puree|purée|\bmaple\b|agave/],
+  ["dryinc", /raisin|currant|cranberr|cherr|apricot|\bfigs?\b|\bdates?\b|prune|walnut|pecan|almond|hazelnut|pistachio|cashew|peanut|\bnuts?\b|seeds?\b|sunflower|pepita|sesame|poppy|\bflax|\bchia\b|chocolate|\bchips?\b|coconut|\boats?\b|cacao/],
+  ["dry", /\bsalt\b|sugar|spice|pepper|cinnamon|nutmeg|ginger|cumin|paprika|cardamom|cloves?\b|allspice|coriander|turmeric|yeast|baking|\bmalt\b|cornstarch|starch|gluten|lecithin|fennel|caraway|\banise?\b|cayenne|chil[ie]|cocoa|za.?atar/],
+];
+const guessGroup = (name) => { const n = String(name || "").toLowerCase(); if (!n.trim()) return ""; for (const [g, re] of GROUP_RULES) if (re.test(n)) return g; return ""; };
+const blankPantryItem = (name, group) => ({ id: uid(), name: name || "New item", aliases: "", packSize: 0, packUnit: "kg", packPrice: 0, density: 1, onHandBase: 0, reorderBase: 0, leadDays: 0, supplier: "", usage: "recipe", perLoafQty: 0, perRunQty: 0, group: group === undefined ? guessGroup(name) : group });
+const unitBase = (it) => (it.packUnit === "each" ? 1 : MASS_G[it.packUnit] ? MASS_G[it.packUnit] : VOL_ML[it.packUnit] ? VOL_ML[it.packUnit] * (+it.density || 1) : 0);
+const packBase = (it) => (+it.packSize || 0) * unitBase(it);
+const costPerBase = (it) => { const pb = packBase(it); return pb > 0 && +it.packPrice > 0 ? (+it.packPrice) / pb : 0; };
+const pantryFind = (pantry, name) => {
+  const n = normName(name); if (!n) return null;
+  return pantry.find((it) => normName(it.name) === n || String(it.aliases || "").split(/[,;]/).some((a) => normName(a) === n)) || null;
+};
+const money = (x) => { const v = Math.round((+x || 0) * 100) / 100; return (v < 0 ? "−" : "") + "$" + Math.abs(v).toFixed(2); };
+// Show a quantity in the item's pack unit, but drop to the finer unit under one pack unit (0.05 kg of salt is "52 g").
+const qtyText = (base, it) => {
+  if (it.packUnit === "each") return (Math.round(base * 10) / 10) + " ea";
+  const u = unitBase(it) || 1, v = base / u;
+  if (v >= 1 || !(base > 0)) return (v >= 100 ? Math.round(v) : Math.round(v * 100) / 100) + " " + it.packUnit;
+  if (it.packUnit === "kg") return Math.round(base) + " g";
+  if (it.packUnit === "L") return Math.round(v * 1000) + " mL";
+  if (it.packUnit === "lb") return (Math.round(v * 16 * 10) / 10) + " oz";
+  return (Math.round(v * 100) / 100) + " " + it.packUnit;
+};
+
+// Cost + demand for the open run. Pure: everything it needs is an argument.
+//  - dough lines (flours, liquids, salt, inclusions) come from the batch weigh-outs (buffers included, so waste is costed)
+//  - the "Levain" line is NOT an ingredient: the flour in the levain BUILD (plus the starter seed's flour) is, and it is
+//    assigned to the pantry items chosen in settings (white / whole-grain), split across recipes by their levain share
+//  - water is free; packaging is per-loaf or per-run; kitchen rental is spread per loaf
+//  - anything not in the pantry, or without a price, is reported as missing and lowers the coverage figure
+const computeRunCosts = ({ plan, types, builds, pantry, settings, refHyd, rentalHours, rentalRate, sold }) => {
+  const per = types.map(() => ({ use: {}, unmatched: {} }));
+  const loavesOf = (ti) => (plan.summaries[ti] ? plan.summaries[ti].loaves : 0);
+  const byId = {}; pantry.forEach((it) => { byId[it.id] = it; });
+  const addUse = (ti, name, g) => {
+    if (!(g > 0) || normName(name) === "water") return;
+    const it = pantryFind(pantry, name);
+    if (it) per[ti].use[it.id] = (per[ti].use[it.id] || 0) + g;
+    else per[ti].unmatched[name] = (per[ti].unmatched[name] || 0) + g;
+  };
+  plan.list.forEach((b) => {
+    const t = types[b.ti]; if (!t) return;
+    ingLines(t).forEach((l) => {
+      const g = (b.weights[l.key] || 0) * ((l.key === "scf" || l.key === "scl") ? scaldBufFactor(t) : 1);
+      if (l.key.indexOf("fl_") === 0 || l.key.indexOf("in_") === 0 || l.key.indexOf("lq_") === 0 || l.key === "salt" || l.key === "scf" || l.key === "scl" || l.key === "lsg") addUse(b.ti, l.matchName || l.name, g);
+    });
+  });
+  (builds || []).forEach((bd) => {
+    const sumLev = bd.items.reduce((a, x) => a + x.levW, 0);
+    if (!(sumLev > 0)) return;
+    const flour = bd.flourL + bd.seedL * 100 / (100 + (+refHyd || 80));
+    const w = Math.max(0, Math.min(100, +bd.whole || 0)) / 100;
+    bd.items.forEach((x) => {
+      const b = plan.list[x.gi]; if (!b) return;
+      const share = x.levW / sumLev;
+      [[flour * (1 - w) * share, settings.levainWhiteId, "Levain flour"], [flour * w * share, settings.levainWholeId, "Levain flour (whole grain)"]].forEach(([g, id, label]) => {
+        if (!(g > 0)) return;
+        const it = id ? byId[id] : null;
+        if (it) per[b.ti].use[it.id] = (per[b.ti].use[it.id] || 0) + g;
+        else per[b.ti].unmatched[label] = (per[b.ti].unmatched[label] || 0) + g;
+      });
+    });
+  });
+  const totalLoaves = types.reduce((a, _, ti) => a + loavesOf(ti), 0);
+  pantry.forEach((it) => {
+    if (it.usage === "perLoaf" && +it.perLoafQty > 0) types.forEach((_, ti) => { const lv = loavesOf(ti); if (lv > 0) per[ti].use[it.id] = (per[ti].use[it.id] || 0) + it.perLoafQty * lv; });
+    else if (it.usage === "perRun" && +it.perRunQty > 0 && totalLoaves > 0) types.forEach((_, ti) => { const lv = loavesOf(ti); if (lv > 0) per[ti].use[it.id] = (per[ti].use[it.id] || 0) + it.perRunQty * lv / totalLoaves; });
+  });
+  const rate = +rentalRate || 0, hours = +rentalHours || 0, rentalTotal = rate * hours;
+  const items = {}, missing = {}; let totalG = 0, pricedG = 0;
+  const noteMissing = (name, g, reason) => { const m = missing[name] || (missing[name] = { name, grams: 0, reason }); m.grams += g; };
+  const recipes = types.map((t, ti) => {
+    const loaves = loavesOf(ti);
+    let ing = 0, pkg = 0;
+    Object.keys(per[ti].use).forEach((id) => {
+      const it = byId[id], q = per[ti].use[id], cpb = costPerBase(it), c = q * cpb;
+      if (it.usage === "recipe") { ing += c; totalG += q; if (cpb > 0) pricedG += q; else noteMissing(it.name, q, "no price"); }
+      else { pkg += c; if (!(cpb > 0)) noteMissing(it.name, q, "no price"); }
+      const a = items[id] || (items[id] = { id, name: it.name, base: it.packUnit === "each" ? "each" : "g", qty: 0, cost: 0 });
+      a.qty += q; a.cost += c;
+    });
+    Object.keys(per[ti].unmatched).forEach((name) => { const g = per[ti].unmatched[name]; totalG += g; noteMissing(name, g, "not in Pantry"); });
+    const rental = totalLoaves > 0 ? rentalTotal * loaves / totalLoaves : 0;
+    const cost = ing + pkg + rental;
+    const hasSold = sold && sold[ti] !== undefined && sold[ti] !== null && sold[ti] !== "";
+    const soldN = hasSold ? Math.max(0, +sold[ti] || 0) : loaves;
+    const price = +(t && t.price) || 0;
+    const revenue = soldN * price;
+    const pl = loaves > 0 ? loaves : 1;
+    return { ti, name: t.name, loaves, sold: soldN, price, ing, pkg, rental, cost, perLoaf: cost / pl, ingPerLoaf: ing / pl, pkgPerLoaf: pkg / pl, rentalPerLoaf: rental / pl, revenue, margin: revenue - cost };
+  }).filter((r) => r.loaves > 0);
+  const sum = (k) => recipes.reduce((a, r) => a + r[k], 0);
+  const totals = { ing: sum("ing"), pkg: sum("pkg"), rental: sum("rental"), cost: sum("cost"), revenue: sum("revenue"), margin: sum("margin"), loaves: sum("loaves"), sold: sum("sold") };
+  const demand = {}; Object.keys(items).forEach((id) => { demand[id] = items[id].qty; });
+  return { recipes, items: Object.keys(items).map((id) => items[id]), missing: Object.keys(missing).map((k) => missing[k]), coverage: totalG > 0 ? pricedG / totalG : 1, totals, demand, inputs: { rentalHours: hours, rate }, rentalTotal };
+};
+
+// Shortage flags: need (run demand) vs have (counted stock). short = can't cover the run; low = covers it but ends below the
+// reorder point. buy = enough packs to cover the run AND restore the reorder point. orderBy = mix day minus supplier lead time.
+const stockCheck = (demand, pantry, mixISO, nowISO) => {
+  const rows = [];
+  pantry.forEach((it) => {
+    const need = demand[it.id] || 0; if (!(need > 0)) return;
+    const have = +it.onHandBase || 0, reorder = +it.reorderBase || 0, after = have - need;
+    const status = need > have + 1e-9 ? "short" : (after < reorder - 1e-9 ? "low" : "ok");
+    const buyBase = status === "ok" ? 0 : need + reorder - have;
+    const pb = packBase(it);
+    const packs = buyBase > 0 && pb > 0 ? Math.ceil(buyBase / pb - 1e-9) : 0;
+    const orderBy = (status === "ok" || !mixISO) ? "" : addDaysISO(mixISO, -(+it.leadDays || 0));
+    rows.push({ id: it.id, item: it, need, have, after, status, buyBase, packs, orderBy, overdue: !!orderBy && orderBy < nowISO });
+  });
+  const rank = { short: 0, low: 1, ok: 2 };
+  return rows.sort((a, b) => (rank[a.status] - rank[b.status]) || String(a.item.name).localeCompare(String(b.item.name)));
+};
+
+function PantryTab({ pantry, setPantry, costSettings, setCostSettings, coreRecipes }) {
+  const patch = (id, p) => setPantry((ps) => ps.map((it) => (it.id === id ? { ...it, ...p } : it)));
+  const remove = (id) => setPantry((ps) => ps.filter((it) => it.id !== id));
+  const num = (v) => Math.max(0, Number(v) || 0);
+  const sel = (e) => e.target.select();
+  const disp = (base, it) => { const u = unitBase(it) || 1; return Math.round((base / u) * 1000) / 1000; };
+  const recipeItems = pantry.filter((it) => it.usage === "recipe");
+  const [filter, setFilter] = useState("all");
+  const [q, setQ] = useState("");
+  const [pinId, setPinId] = useState(null);
+  const isRecipe = (it) => (it.usage || "recipe") === "recipe";
+  const gOrder = (it) => { if (!isRecipe(it)) return 99; const i = ING_GROUPS.findIndex((g) => g.key === validGroup(it.group)); return i === -1 ? 98 : i; };
+  const counts = useMemo(() => { const c = { all: pantry.length, ungrouped: 0, packaging: 0 }; ING_GROUPS.forEach((g) => { c[g.key] = 0; }); pantry.forEach((it) => { if (!isRecipe(it)) c.packaging++; else if (!validGroup(it.group)) c.ungrouped++; else c[it.group]++; }); return c; }, [pantry]);
+  const matches = (it) => {
+    const t = q.trim().toLowerCase();
+    if (t && !(String(it.name).toLowerCase().includes(t) || String(it.aliases || "").toLowerCase().includes(t))) return false;
+    if (filter === "all") return true;
+    if (filter === "packaging") return !isRecipe(it);
+    if (filter === "ungrouped") return isRecipe(it) && !validGroup(it.group);
+    return isRecipe(it) && validGroup(it.group) === filter;
+  };
+  const shown = pantry.filter(matches).sort((a, b) => gOrder(a) - gOrder(b) || String(a.name).localeCompare(String(b.name), undefined, { sensitivity: "base" }));
+  const list = pinId && pantry.some((it) => it.id === pinId) ? [...pantry.filter((it) => it.id === pinId), ...shown.filter((it) => it.id !== pinId)] : shown;
+  const chips = [{ key: "all", label: "All" }, ...ING_GROUPS, ...(counts.ungrouped > 0 || filter === "ungrouped" ? [{ key: "ungrouped", label: "Ungrouped" }] : []), ...(counts.packaging > 0 || filter === "packaging" ? [{ key: "packaging", label: "Packaging" }] : [])];
+  const fromRecipes = useMemo(() => {
+    const names = {}; const add = (n) => { const k = normName(n); if (k && k !== "water" && !names[k]) names[k] = String(n).trim(); };
+    add("Salt");
+    (coreRecipes || []).forEach((r) => { (r.flours || []).forEach((x) => add(x.name)); (r.inclusions || []).forEach((x) => add(x.name)); (r.liquids || []).forEach((x) => add(x.name)); });
+    return Object.keys(names).filter((k) => !pantryFind(pantry, names[k])).map((k) => names[k]);
+  }, [coreRecipes, pantry]);
+  const setSetting = (p) => setCostSettings((cs) => ({ ...cs, ...p }));
+  return (
+    <div className="bl-panel">
+      <h3>Pantry — ingredient prices &amp; stock</h3>
+      <div className="pt-card">
+        <div className="pt-h">Kitchen &amp; levain</div>
+        <div className="pt-row">
+          <label className="pt-f"><span>Kitchen rental ($ / hour)</span><input data-f="rentalRate" type="number" min="0" step="0.5" value={costSettings.rentalRate ?? 0} onFocus={sel} onChange={(e) => setSetting({ rentalRate: num(e.target.value) })} /></label>
+          <label className="pt-f"><span>Levain fed with (white)</span>
+            <select data-f="levainWhite" value={costSettings.levainWhiteId || ""} onChange={(e) => setSetting({ levainWhiteId: e.target.value })}>
+              <option value="">— not set —</option>{recipeItems.map((it) => <option key={it.id} value={it.id}>{it.name}</option>)}
+            </select></label>
+          <label className="pt-f"><span>Levain fed with (whole grain)</span>
+            <select data-f="levainWhole" value={costSettings.levainWholeId || ""} onChange={(e) => setSetting({ levainWholeId: e.target.value })}>
+              <option value="">— not set —</option>{recipeItems.map((it) => <option key={it.id} value={it.id}>{it.name}</option>)}
+            </select></label>
+        </div>
+        <div className="pt-hint">The levain you build is real flour. Pick what it is fed with so costs and stock include it. Water is treated as free.</div>
+      </div>
+      <div className="pt-bar">
+        <button className="bl-add" data-f="addItem" onClick={() => { const ni = blankPantryItem("New item"); setPantry((ps) => [...ps, ni]); setFilter("all"); setQ(""); setPinId(ni.id); }}>+ Item</button>
+        {fromRecipes.length > 0 && <button className="bl-add" data-f="addFromRecipes" onClick={() => setPantry((ps) => [...ps, ...fromRecipes.map((n) => blankPantryItem(n))])}>Add {fromRecipes.length} from my recipes</button>}
+      </div>
+      {pantry.length > 0 && (<>
+        <div className="pt-groups" data-k="ptGroups">
+          {chips.map((c) => <button key={c.key} data-f={"grp-" + c.key} className={"pt-chip" + (filter === c.key ? " on" : "")} onClick={() => { setFilter(c.key); setPinId(null); }}>{c.label}<em>{counts[c.key]}</em></button>)}
+        </div>
+        <input className="pt-search" data-f="ptSearch" type="search" placeholder="Search ingredients" value={q} onChange={(e) => { setQ(e.target.value); setPinId(null); }} />
+        {list.length === 0 && <div className="pt-empty">Nothing matches{q.trim() ? " “" + q.trim() + "”" : ""}{filter !== "all" ? " in " + (filter === "ungrouped" ? "Ungrouped" : filter === "packaging" ? "Packaging" : groupLabel(filter)) : ""}.</div>}
+      </>)}
+      {pantry.length === 0 && <div className="pt-empty">Nothing here yet. “Add from my recipes” creates an item for every flour, liquid and inclusion you already use. Then fill in pack size and price.</div>}
+      {list.map((it, li) => {
+        const showHd = filter === "all" && !pinId && (li === 0 || gOrder(list[li - 1]) !== gOrder(it));
+        const hdLabel = !isRecipe(it) ? "Packaging & consumables" : groupLabel(validGroup(it.group));
+        const cpb = costPerBase(it);
+        const perTxt = cpb > 0 ? money(cpb * (it.packUnit === "each" ? 1 : 1000)) + (it.packUnit === "each" ? " each" : " / kg") : "no price yet";
+        const isVol = !!VOL_ML[it.packUnit];
+        const bl = it.packUnit === "each" ? "ea" : "g";
+        return (
+          <React.Fragment key={it.id}>
+          {showHd && <div className="pt-grp" data-grp={isRecipe(it) ? (validGroup(it.group) || "ungrouped") : "packaging"}>{hdLabel}</div>}
+          <div className={"pt-card item" + (cpb > 0 || it.usage !== "recipe" ? "" : " nopr")} data-item={it.name}>
+            <div className="pt-top">
+              <BufferedInput className="pt-name" value={it.name} onCommit={(v) => patch(it.id, { name: v })} placeholder="Ingredient name" />
+              <span className={"pt-per" + (cpb > 0 ? "" : " bad")}>{perTxt}</span>
+              <button className="ing-x" title="Remove" onClick={() => remove(it.id)}>×</button>
+            </div>
+            <div className="pt-row">
+              <label className="pt-f sm"><span>Pack size</span><input data-f="packSize" type="number" min="0" step="any" value={it.packSize} onFocus={sel} onChange={(e) => patch(it.id, { packSize: num(e.target.value) })} /></label>
+              <label className="pt-f sm"><span>Unit</span><select data-f="packUnit" value={it.packUnit} onChange={(e) => patch(it.id, { packUnit: e.target.value })}>{PACK_UNITS.map((u) => <option key={u} value={u}>{u}</option>)}</select></label>
+              <label className="pt-f sm"><span>Pack price ($)</span><input data-f="packPrice" type="number" min="0" step="any" value={it.packPrice} onFocus={sel} onChange={(e) => patch(it.id, { packPrice: num(e.target.value) })} /></label>
+              {isVol && <label className="pt-f sm"><span>Density g/mL</span><input data-f="density" type="number" min="0" step="0.01" value={it.density} onFocus={sel} onChange={(e) => patch(it.id, { density: num(e.target.value) })} /></label>}
+            </div>
+            <div className="pt-row">
+              <label className="pt-f sm"><span>On hand ({it.packUnit})</span><input data-f="onHand" type="number" min="0" step="any" value={disp(it.onHandBase, it)} onFocus={sel} onChange={(e) => patch(it.id, { onHandBase: num(e.target.value) * (unitBase(it) || 1) })} /></label>
+              <label className="pt-f sm"><span>Reorder at ({it.packUnit})</span><input data-f="reorder" type="number" min="0" step="any" value={disp(it.reorderBase, it)} onFocus={sel} onChange={(e) => patch(it.id, { reorderBase: num(e.target.value) * (unitBase(it) || 1) })} /></label>
+              <label className="pt-f sm"><span>Lead time (days)</span><input data-f="lead" type="number" min="0" step="1" value={it.leadDays} onFocus={sel} onChange={(e) => patch(it.id, { leadDays: num(e.target.value) })} /></label>
+              <label className="pt-f"><span>Supplier</span><input data-f="supplier" type="text" value={it.supplier || ""} onChange={(e) => patch(it.id, { supplier: e.target.value })} /></label>
+            </div>
+            <div className="pt-row">
+              {isRecipe(it) && <label className="pt-f sm"><span>Group</span><select data-f="group" value={validGroup(it.group)} onChange={(e) => patch(it.id, { group: e.target.value })}><option value="">Ungrouped</option>{ING_GROUPS.map((g) => <option key={g.key} value={g.key}>{g.label}</option>)}</select></label>}
+              <label className="pt-f sm"><span>Used as</span>
+                <select data-f="usage" value={it.usage} onChange={(e) => patch(it.id, { usage: e.target.value })}>
+                  <option value="recipe">Recipe ingredient</option><option value="perLoaf">Per loaf (packaging)</option><option value="perRun">Per run (consumable)</option>
+                </select></label>
+              {it.usage === "perLoaf" && <label className="pt-f sm"><span>Per loaf ({bl})</span><input data-f="perLoaf" type="number" min="0" step="any" value={it.perLoafQty} onFocus={sel} onChange={(e) => patch(it.id, { perLoafQty: num(e.target.value) })} /></label>}
+              {it.usage === "perRun" && <label className="pt-f sm"><span>Per run ({bl})</span><input data-f="perRun" type="number" min="0" step="any" value={it.perRunQty} onFocus={sel} onChange={(e) => patch(it.id, { perRunQty: num(e.target.value) })} /></label>}
+              <label className="pt-f"><span>Also matches (recipe names)</span><input data-f="aliases" type="text" value={it.aliases || ""} placeholder="e.g. AP flour, unbleached" onChange={(e) => patch(it.id, { aliases: e.target.value })} /></label>
+            </div>
+          </div>
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
+function CostsTab({ res, locked, lockedAt, hours, setHours, rate, setRate, defaultRate, setSold, setPrice, onLock, onUnlock, deduction, onDeduct, onUndo, onOpenPantry, pantryCount }) {
+  const [confirm, setConfirm] = useState(false);
+  const T = res.totals, cov = Math.round(res.coverage * 100);
+  const marginPct = T.revenue > 0 ? (T.margin / T.revenue) * 100 : null;
+  const qty = (a) => a.base === "each" ? (Math.round(a.qty * 10) / 10) + " ea" : (a.qty >= 1000 ? (a.qty / 1000).toFixed(2) + " kg" : Math.round(a.qty) + " g");
+  return (
+    <div className="bl-panel">
+      <h3>Run costs &amp; profit</h3>
+      {locked && <div className="cs-lock">Locked {new Date(lockedAt).toLocaleDateString()} — prices and numbers are frozen for this run. <button data-f="unlock" onClick={onUnlock}>Unlock</button></div>}
+      {res.recipes.length === 0 ? <div className="cs-empty">No loaves in this run yet.</div> : (<>
+        <div className="cs-stats">
+          <div className="cs-stat"><div className="v" data-k="revenue">{money(T.revenue)}</div><div className="l">Revenue</div></div>
+          <div className="cs-stat"><div className="v" data-k="cost">{money(T.cost)}</div><div className="l">Total cost</div></div>
+          <div className={"cs-stat" + (T.margin < 0 ? " neg" : "")}><div className="v" data-k="margin">{money(T.margin)}</div><div className="l">Margin</div></div>
+          <div className="cs-stat"><div className="v" data-k="marginPct">{marginPct === null ? "—" : Math.round(marginPct * 10) / 10 + "%"}</div><div className="l">Margin %</div></div>
+        </div>
+        <div className="cs-note">Margin is after kitchen rental, before your own time. Cost per loaf is across all {T.loaves} loaves in the run ({money(T.cost / Math.max(1, T.loaves))} blended).</div>
+        {(res.missing.length > 0 || cov < 100) && (
+          <div className="cs-warn" data-k="coverage">
+            Costs cover {cov}% of ingredient weight. Not counted: {res.missing.map((m) => m.name + " (" + m.reason + ")").join(", ")}.
+            <button onClick={onOpenPantry}>Open Pantry</button>
+          </div>
+        )}
+        <div className="cs-inputs">
+          <label className="pt-f sm"><span>Kitchen hours</span><input data-f="hours" type="number" min="0" step="0.25" value={hours} disabled={locked} onFocus={(e) => e.target.select()} onChange={(e) => setHours(Math.max(0, Number(e.target.value) || 0))} /></label>
+          <label className="pt-f sm"><span>Rate ($/h)</span><input data-f="rate" type="number" min="0" step="0.5" value={rate == null ? "" : rate} placeholder={String(defaultRate || 0)} disabled={locked} onFocus={(e) => e.target.select()} onChange={(e) => setRate(e.target.value === "" ? null : Math.max(0, Number(e.target.value) || 0))} /></label>
+          <div className="cs-rental">Rental {money(res.rentalTotal)}</div>
+        </div>
+        {res.recipes.map((r) => (
+          <div className="cs-recipe" key={r.ti} data-recipe={r.name}>
+            <div className="cs-rhead"><span className="cs-rname">{r.name}</span><span className="cs-rloaves">{r.loaves} loaves</span></div>
+            <div className="cs-rin">
+              <label className="pt-f sm"><span>Sold</span><input data-f="sold" type="number" min="0" value={r.sold} disabled={locked} onFocus={(e) => e.target.select()} onChange={(e) => setSold(r.ti, Math.max(0, Number(e.target.value) || 0))} /></label>
+              <label className="pt-f sm"><span>Wholesale $ / loaf</span><input data-f="price" type="number" min="0" step="0.25" value={r.price} disabled={locked} onFocus={(e) => e.target.select()} onChange={(e) => setPrice(r.ti, Math.max(0, Number(e.target.value) || 0))} /></label>
+            </div>
+            <div className="cs-lines">
+              <div><span>Ingredients</span><b data-k="ingPerLoaf">{money(r.ingPerLoaf)}</b></div>
+              {r.pkg > 0 && <div><span>Packaging</span><b>{money(r.pkgPerLoaf)}</b></div>}
+              {r.rental > 0 && <div><span>Kitchen rental</span><b>{money(r.rentalPerLoaf)}</b></div>}
+              <div className="tot"><span>Cost / loaf</span><b data-k="perLoaf">{money(r.perLoaf)}</b></div>
+              <div className="m"><span>Margin / loaf at this price</span><b>{money(r.price - r.perLoaf)}</b></div>
+            </div>
+            <div className="cs-rfoot">Revenue {money(r.revenue)} · cost {money(r.cost)} · margin <b data-k="rmargin">{money(r.margin)}</b></div>
+          </div>
+        ))}
+        {res.items.length > 0 && (
+          <details className="cs-items"><summary>Where the cost goes</summary>
+            {res.items.slice().sort((a, b) => b.cost - a.cost).map((a) => <div className="cs-item" key={a.id}><span>{a.name}</span><span>{qty(a)}</span><b>{money(a.cost)}</b></div>)}
+          </details>
+        )}
+      </>)}
+      <div className="cs-actions">
+        {!locked ? <button className="cs-btn" data-f="lock" onClick={onLock}>Lock this analysis</button> : null}
+        {!deduction ? (
+          confirm
+            ? <><span className="cs-confirm">Subtract this run’s ingredients from your counts?</span><button className="cs-btn" data-f="deductYes" onClick={() => { onDeduct(); setConfirm(false); }}>Yes, deduct</button><button className="cs-btn ghost" onClick={() => setConfirm(false)}>Cancel</button></>
+            : <button className="cs-btn alt" data-f="deduct" disabled={pantryCount === 0 || res.recipes.length === 0} onClick={() => setConfirm(true)}>Deduct this run from stock</button>
+        ) : <span className="cs-deducted" data-k="deducted">Deducted from stock {new Date(deduction.at).toLocaleDateString()} <button data-f="undo" onClick={onUndo}>Undo</button></span>}
+      </div>
+    </div>
+  );
+}
+
+// Scald editor, shared by the recipe editor and each Plan card. `onPatch(partial)` writes recipe fields.
+function ScaldEditor({ t, onPatch, buf }) {
+  const sc = scaldInfo(t);
+  const on = !!t.scald;
+  const flours = t.flours || [], liquids = t.liquids || [];
+  const num = (v) => Math.max(0, Number(v) || 0);
+  const rd = (x) => Math.round(x * 10) / 10;
+  const flourVal = t.scaldFlour || (flours[0] ? flours[0].name : "");
+  const flourKnown = flours.some((f) => normName(f.name) === normName(flourVal));
+  const liquidVal = t.scaldLiquid || "water";
+  const liquidKnown = normName(liquidVal) === "water" || liquids.some((l) => normName(l.name) === normName(liquidVal));
+  return (
+    <div className="sd-box" data-k="scaldbox">
+      <label className="sd-tog"><input data-f="scaldOn" type="checkbox" checked={on} onChange={(e) => onPatch({ scald: e.target.checked })} /><span>Scald / tangzhong — cook part of the flour first</span></label>
+      {on && (<>
+        <div className="sd-presets">
+          {(() => {
+            // the preset that matches the current ratio + method is highlighted; anything else is "custom"
+            const hyd = +t.scaldHyd, poured = t.scaldMethod === "poured";
+            const isTz = hyd === 500 && !poured, isYu = hyd === 200 && poured;
+            return (<>
+              <button data-f="presetTz" className={isTz ? "on" : ""} aria-pressed={isTz} onClick={() => onPatch({ scaldHyd: 500, scaldMethod: "cooked" })}>Tangzhong 1:5</button>
+              <button data-f="presetYu" className={isYu ? "on" : ""} aria-pressed={isYu} onClick={() => onPatch({ scaldHyd: 200, scaldMethod: "poured" })}>Yudane 1:2</button>
+              {!isTz && !isYu && <span className="sd-custom" data-k="scaldcustom">Custom ratio</span>}
+            </>);
+          })()}
+        </div>
+        <div className="sd-row">
+          <label className="sd-f"><span>Scald flour (% of total flour)</span><input data-f="scaldPct" type="number" min="0" step="0.5" value={t.scaldPct ?? 10} onFocus={(e) => e.target.select()} onChange={(e) => onPatch({ scaldPct: num(e.target.value) })} /></label>
+          <label className="sd-f"><span>Taken from</span>
+            <select data-f="scaldFlour" value={flourVal} onChange={(e) => onPatch({ scaldFlour: e.target.value })}>
+              {flours.map((f) => <option key={f.id} value={f.name}>{f.name}</option>)}
+              {!flourKnown && <option value={flourVal}>{flourVal} (missing)</option>}
+            </select></label>
+          <label className="sd-f"><span>Liquid per 100 flour (%)</span><input data-f="scaldHyd" type="number" min="0" step="10" value={t.scaldHyd ?? 500} onFocus={(e) => e.target.select()} onChange={(e) => onPatch({ scaldHyd: num(e.target.value) })} /></label>
+          <label className="sd-f"><span>Liquid</span>
+            <select data-f="scaldLiquid" value={liquidVal} onChange={(e) => onPatch({ scaldLiquid: e.target.value === "water" ? "" : e.target.value })}>
+              <option value="water">Water</option>
+              {liquids.map((l) => <option key={l.id} value={l.name}>{l.name}</option>)}
+              {!liquidKnown && <option value={liquidVal}>{liquidVal} (missing)</option>}
+            </select></label>
+          <label className="sd-f"><span>Method</span>
+            <select data-f="scaldMethod" value={t.scaldMethod === "poured" ? "poured" : "cooked"} onChange={(e) => onPatch({ scaldMethod: e.target.value })}>
+              <option value="cooked">Cooked paste (tangzhong)</option><option value="poured">Poured boiling (yudane)</option>
+            </select></label>
+        </div>
+        {sc.on && <div className="sd-read" data-k="scaldRead">Scald = {rd(sc.sf)}% flour + {rd(sc.S)}% {sc.liquidName.toLowerCase()}. Main mix keeps {rd(sc.flourPct - sc.sf)}% {sc.flourName} and {rd(sc.avail - sc.S)}% {sc.liquidName.toLowerCase()}. Total flour and hydration are unchanged.</div>}
+        {buf && sc.on && (
+          <label className="sc-buf sd-buf" data-k="scaldbufplan">
+            <input type="checkbox" data-f="scaldBufPlan" checked={!!buf.on} onChange={buf.onToggle} />
+            <span>Buffer — pot loss (cook extra; the dough still gets the exact amount)</span>
+            {buf.on && <span className="lbuffer-pct"><input type="number" data-f="scaldBufPctPlan" min="0" step="0.5" value={buf.pct} onChange={(e) => buf.onPct(e.target.value)} /><span>%</span></span>}
+          </label>
+        )}
+        {sc.warns.map((w, i) => <div className="sd-warn" key={i}>{w}</div>)}
+      </>)}
+    </div>
+  );
+}
+
+function HapLogo({ className }) {
+  return (
+    <svg className={className} viewBox="0 0 632.42 166.2" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="House au Pain" fill="currentColor">
+      <path d="M31.74,77.5l14.15-7.67,17.59,32.46,8.42-4.57-17.59-32.46,14.15-7.67,42.61,78.61-14.15,7.67-18.2-33.58-8.42,4.57,18.2,33.58-14.15,7.67L31.74,77.5Z"/>
+      <path d="M113.05,115.51l-20.33-49.79c-4.35-10.64.51-21.04,12.1-25.78,11.59-4.73,22.34-.71,26.69,9.94l20.33,49.79c4.39,10.76-.46,21.16-12.05,25.9-11.59,4.73-22.34.71-26.73-10.05ZM136.94,105.75l-20.28-49.67c-1.11-2.72-3.56-3.65-6.28-2.54-2.72,1.11-3.82,3.49-2.71,6.21l20.28,49.67c1.11,2.72,3.56,3.65,6.28,2.54,2.72-1.11,3.82-3.49,2.71-6.21Z"/>
+      <path d="M163.17,95.75l-19.6-68.8,15.48-4.41,19.6,68.8c.81,2.83,3.14,4.02,5.84,3.25,2.83-.81,4.18-3.05,3.37-5.88l-19.6-68.8,15.48-4.41,19.6,68.8c3.19,11.18-2.79,20.98-14.83,24.42-12.04,3.43-22.16-1.79-25.35-12.97Z"/>
+      <path d="M214.18,81.84l-2.24-13.09,15.87-2.72,2.24,13.09c.5,2.9,2.69,4.34,5.46,3.86,2.9-.5,4.48-2.58,3.99-5.48l-1.75-10.2c-1.79-10.45-27.1-7.67-30.58-27.94l-1.81-10.58c-1.96-11.46,4.8-20.39,17.02-22.48,12.21-2.09,21.69,4.06,23.65,15.52l2,11.71-15.86,2.72-2.03-11.84c-.45-2.64-2.52-4.1-5.29-3.63-2.64.45-4.13,2.39-3.65,5.16l1.51,8.81c1.81,10.58,27.1,7.67,30.58,27.94l2.07,12.09c1.96,11.46-5.03,20.56-17.37,22.67-12.34,2.11-21.84-4.17-23.8-15.62Z"/>
+      <path d="M263.52,2.16l30.33-2.16,1.04,14.65-14.27,1.02,1.58,22.17,12.87-.92,1.02,14.27-12.87.92,1.67,23.45,14.27-1.02,1.04,14.65-30.33,2.16-6.35-89.2Z"/>
+      <path d="M329.94,17.05l15,.52,4.63,54.33-10.28-.35-.63-13.1-5.8-.2-1.53,13.03-9.82-.34,8.43-53.88ZM333.83,50.23l4.48.15-.97-18.92.15-4.48-1.32-.04-.15,4.48-2.19,18.81Z"/>
+      <path d="M358.62,61.72l4.5-43.07,9.69,1.01-4.5,43.07c-.19,1.77.86,2.97,2.55,3.14,1.77.18,3.03-.77,3.22-2.54l4.5-43.08,9.69,1.01-4.5,43.07c-.73,7-6.3,11.16-13.83,10.38-7.54-.79-12.05-6-11.32-13Z"/>
+      <path d="M415.29,7.65l21.38,4.49c11.75,2.47,17.98,11.34,15.73,22.1l-4.33,20.63c-2.26,10.75-11.53,16.38-23.28,13.91l-5.62-1.18-6.48,30.88-15.75-3.31,18.37-87.52ZM428.03,25.33l-5.85,27.88,4.63.97c2.88.6,5.12-.75,5.72-3.63l3.91-18.63c.6-2.88-.9-5.02-3.78-5.62l-4.62-.97Z"/>
+      <path d="M478.16,22.55l23.61,7.54-16.98,88.44-16.18-5.17,4.86-21.11-9.12-2.91-8.27,20.02-15.45-4.93,37.54-81.88ZM469.48,77.03l7.06,2.25,6.92-30.51,2.25-7.06-2.07-.66-2.25,7.06-11.91,28.91Z"/>
+      <path d="M528.46,40.11l14.85,6.21-34.51,82.49-14.85-6.21,34.51-82.49Z"/>
+      <path d="M562.82,54.82l16.35,8.71-11.82,41.75-4.16,10.52,1.92,1.02,4.04-10.58,19.94-37.43,14.21,7.57-42.03,78.92-16.24-8.65,11.82-41.75,4.04-10.58-1.92-1.02-4.04,10.58-19.94,37.43-14.21-7.57,42.04-78.92Z"/>
+      <path d="M8.59,127.07l1.28,8.45,2.2,3.03-2.23,1.62-2.2-3.03-7.63-3.84,2.53-1.84,4.57,2.55-1.02-5.12,2.51-1.82Z"/>
+      <path d="M18.44,120.23l1.09,8.47,2.13,3.08-2.27,1.57-2.13-3.08-7.55-4.01,2.58-1.78,4.51,2.65-.91-5.14,2.55-1.76Z"/>
+      <path d="M21.06,121.66c-.08-1,.11-1.94.56-2.83.45-.89,1.14-1.63,2.05-2.24,1.12-.74,2.28-1.08,3.47-1.02,1.19.06,2.26.52,3.21,1.37l-2.53,1.67c-.45-.27-.92-.4-1.4-.37-.48.02-.94.18-1.38.47-.71.47-1.12,1.1-1.23,1.88-.11.79.1,1.59.65,2.42.55.83,1.2,1.34,1.97,1.54.77.2,1.5.07,2.21-.4.44-.29.77-.65.97-1.09.21-.44.28-.91.21-1.43l2.53-1.67c.41,1.2.4,2.36,0,3.48-.41,1.12-1.18,2.05-2.3,2.79-.92.61-1.87.94-2.86,1.01s-1.93-.13-2.82-.59c-.88-.46-1.64-1.16-2.25-2.09-.62-.93-.96-1.9-1.04-2.9Z"/>
+      <path d="M12.38,149.41l6.86,9.03-2.2,1.67-4.11-5.41,2.09,6.95-1.78,1.35-6.15-3.88,4.12,5.43-2.2,1.67-6.86-9.03,2.6-1.97,7.28,4.33-2.24-8.15,2.58-1.96Z"/>
+      <path d="M25.59,151.39l-3.44,2.47.62,2.02-2.35,1.69-3.28-11.6,2.6-1.86,9.94,6.82-2.38,1.7-1.72-1.23ZM23.77,150.08l-3.56-2.55,1.29,4.18,2.27-1.63Z"/>
+      <path d="M30.76,137.32c1-.11,1.95.05,2.84.48.89.43,1.65,1.11,2.28,2.03.62.92.98,1.87,1.06,2.85.08.99-.12,1.93-.59,2.83-.47.9-1.2,1.68-2.18,2.35l-3.51,2.4-6.4-9.36,3.51-2.4c.99-.67,1.98-1.07,2.99-1.18ZM34.2,143.9c.16-.8-.06-1.63-.65-2.49-.59-.86-1.29-1.37-2.1-1.52-.81-.15-1.64.07-2.51.66l-1.08.74,3.72,5.44,1.08-.74c.86-.59,1.37-1.28,1.53-2.08Z"/>
+      <path d="M37.38,134.72l1.26,1.92,3.09-2.03,1.17,1.78-3.09,2.03,1.36,2.08,3.5-2.29,1.21,1.85-5.81,3.81-6.21-9.48,5.81-3.8,1.21,1.85-3.5,2.29Z"/>
+      <path d="M610.56,117.55l-1.26,1.92,3.09,2.03-1.17,1.78-3.09-2.03-1.36,2.08,3.5,2.29-1.21,1.85-5.81-3.81,6.22-9.48,5.8,3.81-1.21,1.85-3.5-2.29Z"/>
+      <path d="M612.5,129.45c-.39-.59-.6-1.22-.62-1.87-.03-.66.16-1.3.56-1.92l2.43,1.66c-.2.37-.26.72-.18,1.04.08.32.28.6.61.82.34.23.66.33.96.31.3-.02.55-.17.74-.45.16-.23.21-.47.16-.73-.05-.26-.16-.51-.32-.76-.16-.25-.41-.58-.74-.99-.48-.6-.84-1.12-1.1-1.57-.26-.45-.4-.95-.42-1.5s.16-1.12.56-1.71c.59-.87,1.38-1.34,2.34-1.4.97-.06,1.96.25,2.97.94,1.03.7,1.69,1.52,1.99,2.44s.16,1.84-.39,2.75l-2.47-1.68c.19-.31.24-.63.15-.94-.09-.31-.29-.58-.61-.8-.28-.19-.55-.27-.82-.24-.27.03-.5.18-.69.46-.21.3-.22.63-.06,1,.17.36.49.85.96,1.46.46.62.82,1.15,1.07,1.59s.39.94.42,1.48c.03.54-.14,1.1-.52,1.66-.37.53-.83.93-1.4,1.18-.57.25-1.2.33-1.89.23-.69-.09-1.39-.38-2.09-.86-.68-.47-1.22-1-1.61-1.59Z"/>
+      <path d="M632.42,129.9l-1.28,1.8-2.45-1.74-5.29,7.44-2.25-1.6,5.29-7.44-2.45-1.74,1.28-1.8,7.15,5.08Z"/>
+      <path d="M594.37,139.2c1.36-.15,2.45-.29,3.27-.42.82-.13,1.57-.34,2.26-.62.69-.28,1.19-.66,1.51-1.15.24-.37.35-.71.31-1.03-.04-.32-.22-.59-.56-.82-.34-.23-.69-.27-1.06-.15-.36.13-.7.43-1.01.89l-2.22-1.47c.52-.75,1.11-1.28,1.75-1.59.65-.31,1.3-.42,1.97-.32.67.09,1.31.34,1.93.75,1.07.71,1.69,1.51,1.88,2.42.18.91-.02,1.8-.6,2.68-.63.96-1.55,1.64-2.75,2.03-1.2.39-2.56.64-4.09.75l3.64,2.4-1.24,1.87-6.76-4.47,1.13-1.71c.47-.04.68-.06.64-.06Z"/>
+      <path d="M608.38,139.15c1.2-.47,2.45-.25,3.76.66s1.96,2,1.94,3.29c-.02,1.28-.56,2.69-1.61,4.21-1.07,1.54-2.2,2.54-3.39,3.01-1.2.47-2.45.25-3.76-.66-1.31-.91-1.96-2-1.94-3.29.02-1.28.56-2.7,1.63-4.24,1.05-1.52,2.18-2.52,3.38-2.98ZM611.38,143.5c.14-.62-.1-1.14-.71-1.56-.61-.42-1.18-.46-1.71-.11-.53.35-1.1.97-1.72,1.86-.42.6-.73,1.12-.93,1.57-.2.44-.28.86-.23,1.25.05.39.29.74.71,1.03.42.29.83.4,1.21.3.39-.09.75-.31,1.09-.66.34-.35.72-.82,1.14-1.42.62-.89,1-1.65,1.14-2.27Z"/>
+      <path d="M612.54,151.58c1.37-.09,2.46-.18,3.28-.28.82-.1,1.58-.27,2.28-.52.7-.25,1.22-.61,1.56-1.08.26-.36.38-.7.36-1.02-.02-.32-.2-.6-.53-.84-.33-.24-.68-.3-1.05-.19-.37.11-.72.4-1.04.85l-2.16-1.56c.55-.73,1.16-1.23,1.82-1.51s1.32-.36,1.99-.24c.66.12,1.29.4,1.9.83,1.04.75,1.63,1.58,1.77,2.5.14.91-.1,1.8-.72,2.65-.67.93-1.62,1.57-2.83,1.91-1.21.34-2.59.53-4.12.57l3.53,2.56-1.31,1.82-6.57-4.75,1.2-1.66c.47-.02.68-.03.64-.03Z"/>
+      <path d="M626.03,151.76c1.21-.42,2.46-.15,3.73.82s1.87,2.08,1.8,3.37c-.07,1.28-.67,2.66-1.79,4.14-1.13,1.49-2.3,2.45-3.52,2.87-1.21.42-2.46.15-3.73-.82-1.27-.96-1.87-2.08-1.8-3.37s.67-2.67,1.8-4.16c1.12-1.48,2.28-2.42,3.5-2.84ZM628.83,156.22c.17-.61-.05-1.14-.64-1.59-.59-.45-1.16-.51-1.7-.19-.54.32-1.14.92-1.8,1.79-.44.58-.77,1.09-.99,1.53-.22.43-.32.85-.28,1.24.03.4.25.75.67,1.06.41.31.81.43,1.2.35.39-.08.76-.28,1.12-.61.36-.33.76-.79,1.2-1.37.66-.87,1.07-1.61,1.23-2.22Z"/>
+      <path d="M188.76,152.31c-1.12-3.41.95-8.3.28-10.34-.23-.71-.7-1.09-1.46-.85-3.58,1.18-3.86,11.22-3.7,16.62l-4.47,1.47c.21-9.78.39-12.39-.14-13.98-.23-.71-.81-1.11-1.47-.89-3.58,1.18-3.78,10.71-3.66,16.6l-4.51,1.49c.07-6.5.1-12.98.17-19.47l4.42-1.46-.12,4.11c1.15-3.37,2.89-5.51,5.02-6.21,2.17-.71,4,.55,4.44,3.05.75-3.24,2.82-5.44,4.99-6.15,2.08-.68,4.08.33,4.76,2.4,1.14,3.16-.9,8.88-.28,10.78.19.58.66.81,1.23.62,1.77-.58,3.32-4.97,4.09-10.22l2.6,1.5c-.4,4.3-2.46,12.04-6.89,13.5-2.66.87-4.57-.31-5.31-2.57Z"/>
+      <path d="M211.34,139c-.6,4.28-3.02,11.91-7.38,13.12-6.96,1.93-6.07-7.74-5.15-18.19l4.67-1.3c-.71,8.41-1.7,15.46.72,14.78,1.75-.49,3.63-4.68,4.61-10.03l2.53,1.62ZM198.52,128.88c-.59-2.11.63-4.52,2.56-5.06,1.35-.37,2.61.34,2.98,1.69.55,1.97-.66,4.58-2.54,5.11-1.48.41-2.62-.38-3-1.73Z"/>
+      <path d="M227.94,135.07c-1.36,5.84-2.9,11.69-10.82,13.62-4.16,1.02-8.02-.83-9.15-5.49-1.49-6.11,1.58-12.61,6.83-13.89,4.75-1.16,7.61,2.89,7.19,7.45l-4.75,1.16c.27-2.85-.59-4.79-2.09-4.43-2.08.51-3.33,4.65-2.51,8,.62,2.53,2.28,3.66,4.55,3.11,4.39-1.07,6.54-4.04,8.19-11.25l2.58,1.72Z"/>
+      <path d="M244.72,131.88c-.91,4.18-3.91,11.67-8.25,12.55-2.78.56-4.65-1.15-5.12-3.48-.57-2.83.25-6.04,1.26-10.19-.92.14-2.05.22-3.15.16-.97,4.85-2.55,8.74-4.36,12.05-1.7,3.1-3.95.7-2.44-1.98,2.47-4.45,3.19-10.29,3.43-15.43l4.15-.84c-.04.72-.1,1.4-.19,2.13,2.32-.04,6.15-.63,7.87-1.02-.97,4.14-2.47,10.81-2.04,12.91.15.73.61,1.11,1.25.98,1.73-.35,4.01-4.85,5.13-9.64l2.45,1.78Z"/>
+      <path d="M241.07,136.62c-1.06-6.39,2.22-13.12,8.33-14.13,4.04-.67,6.71,2.34,7.28,5.74,1.01,6.11-1.95,13.02-8.2,14.06-3.91.65-6.77-1.81-7.41-5.67ZM251.96,129.39c-.3-1.79-1.24-2.96-2.67-2.72-2.48.41-4.15,5.17-3.6,8.53.34,2.07,1.39,2.98,2.72,2.76,2.39-.4,4.12-5.07,3.54-8.57Z"/>
+      <path d="M259.06,130.53l.92-4.01,11.79-1.44-.92,4.01-11.79,1.44Z"/>
+      <path d="M298.41,124.77c-.91,2.08-4.21,4.59-7.83,4.24-1.3,4.64-4.7,8.89-9.15,9.25-3.2.26-8.87-1.61-6.33-11.73,1.47-6.05,3.13-11.98,4.7-18.05l4.97-.4c-1.33,4.36-2.76,9.15-3.95,13.5,1.12-1.68,3.17-3.02,5.12-3.17,2.92-.24,4.92,1.89,5.21,5.46.04.46.03.89.02,1.35,1.98.26,3.88-.6,4.88-2.64l2.38,2.19ZM286.22,124.82c-.12-1.49-1.02-2.21-2.09-2.12-1.72.14-3.61,2.16-4.54,5.6-.94,3.91.13,5.6,1.8,5.46,2.65-.22,5.13-5.28,4.83-8.94Z"/>
+      <path d="M317.72,124.34c-.95,1.99-4.32,4.35-7.88,3.92-1.18,4.61-4.58,8.51-9.47,8.69-3.96.14-6.48-2.65-6.62-6.56-.24-6.47,3.87-12.73,10.06-12.95,4.1-.15,6.36,3.17,6.49,6.62v.37c2.03.44,4.01-.33,5.15-2.38l2.27,2.29ZM305.47,124.6c-.07-1.82-.86-3.09-2.3-3.04-2.51.09-4.77,4.6-4.65,8,.08,2.09,1,3.13,2.35,3.08,2.42-.09,4.73-4.51,4.6-8.05Z"/>
+      <path d="M337.64,126.18c-1.83,3.93-6.32,10.57-10.79,10.49-2-.03-3.52-1.45-3.57-3.83-1.38,2.07-3.51,3.72-6.11,3.67-4.94-.08-6.01-5.5.02-18.91l4.89.08c-4.49,9.99-5.4,14.4-2.98,14.44,2.61.04,4.35-3.94,8.15-14.36l4.94.08c-4.13,10.88-5.63,14.35-3.77,14.38,1.82.03,4.81-3.46,7.21-8.32l2.01,2.27Z"/>
+      <path d="M347.94,126.76c-1.89,3.88-6.55,10.4-11.06,10.21-4.56-.19-5.01-3.85-2.11-11.84,1.68-4.5,4.59-11.37,7.19-17.69l4.93.21c-3.31,7.6-6.07,14.52-7.55,18.42-1.94,5-2.19,6.43-.79,6.49,1.81.08,4.9-3.33,7.48-8.12l1.91,2.32Z"/>
+      <path d="M368.45,128.46c-2.07,3.81-6.96,10.16-11.42,9.81-2.23-.17-3.36-1.8-3.52-3.4-1.15,1.55-2.94,2.9-5.54,2.7-3.2-.25-5.04-3.06-4.72-7.14.48-6.22,5.3-12.25,10.54-11.84,1.86.14,3.58,1.45,4.18,2.75l.8-1.9,4.74.37c-4.95,10.83-6.41,13.98-4.65,14.12,1.81.14,4.96-3.16,7.71-7.85l1.87,2.39ZM356.6,124.6c-.54-.93-1.51-1.66-2.67-1.75-3.07-.24-5.44,3.92-5.72,7.5-.12,1.49.44,2.79,1.92,2.91,2.04.16,4.13-2.67,6.47-8.65Z"/>
+      <path d="M372.43,135.83c.44-3.56,4.35-7.06,4.62-9.23.09-.74-.12-1.28-.95-1.39-3.7-.46-8.52,8.51-10.54,13.43l-4.81-.6c2.84-5.84,5.63-11.69,8.52-17.53l4.67.58-1.77,3.63c2.01-2.61,4.69-3.73,6.95-3.45,2.17.27,3.55,1.99,3.27,4.26-.33,3.43-4.65,7.59-4.9,9.58-.08.6.25,1.02.85,1.09,1.8.22,5.12-3.07,8.02-7.5l1.76,2.47c-2.25,3.71-7.37,9.83-11.99,9.25-2.77-.34-3.99-2.23-3.7-4.59Z"/>
+      <path d="M408.25,134.85c-3.42,5.04-7.91,8.9-14.2,10.04l-.15.31c-3.46,6.4-8.39,8.68-12.7,7.94-3.4-.58-5.53-2.74-5.04-5.64.89-5.19,8.03-6.61,14.85-5.82l1.92-3.45c-1.34,1.19-3.29,1.56-4.9,1.29-3.08-.53-5.02-3.22-4.43-6.71.95-5.56,5.74-10.03,10.65-9.19,2.25.39,3.79,1.6,4.5,2.95l.83-1.56,4.68.8-7.99,14.89c3.8-1.24,6.86-3.6,10.28-8.4l1.69,2.56ZM389.33,144.84c-3.54-.32-8.17.54-8.57,2.83-.17.96.4,1.53,1.59,1.74,2.2.38,4.84-1.2,6.98-4.57ZM397.01,129.57c-.44-.74-1.65-1.7-2.89-1.91-3.21-.55-5.24,2.46-5.71,5.17-.3,1.74.45,2.91,1.96,3.17,2.75.47,4.86-3.23,6.63-6.42Z"/>
+      <path d="M425.46,138.86c-3.78,4.66-7.72,9.24-15.69,7.51-4.51-.98-7.46-4.29-6.43-9.02,1.29-5.96,6.53-10.78,12.45-9.5,3.6.78,4.93,3.83,4.34,6.57-1.17,5.42-7.8,6.51-12.17,4.46-.08,1.89,1.01,3.27,3.65,3.84,4.42.96,7.6-.78,12.24-6.54l1.61,2.68ZM408.68,136.03c2.84.95,6.55.13,7.14-2.36.27-1.04-.16-1.89-1.16-2.11-2.28-.49-4.72,1.55-5.97,4.47Z"/>
+      <path d="M441.91,143.35c-2.65,3.36-8.63,8.78-12.91,7.67-2.75-.71-3.68-3.07-3.08-5.37.72-2.79,2.87-5.32,5.6-8.6-.89-.28-1.94-.69-2.9-1.23-2.99,3.94-6.13,6.74-9.2,8.93-2.89,2.04-3.85-1.1-1.33-2.85,4.17-2.91,7.38-7.86,9.85-12.36l4.1,1.06c-.36.63-.7,1.21-1.1,1.83,2.1.98,5.8,2.13,7.53,2.53-2.68,3.3-6.96,8.64-7.49,10.71-.19.72.06,1.27.69,1.43,1.71.44,5.73-2.61,8.83-6.42l1.42,2.68Z"/>
+      <path d="M451.98,146.53c-2.77,3.31-8.86,8.52-13.19,7.25-6.93-2.03-1.06-9.78,5.23-18.17l4.65,1.36c-5.04,6.77-9.61,12.23-7.19,12.94,1.74.51,5.55-2.06,9.21-6.08l1.29,2.71ZM446.43,131.17c.62-2.1,2.92-3.51,4.84-2.95,1.34.39,2.04,1.66,1.64,3.01-.58,1.97-2.98,3.54-4.86,2.99-1.47-.43-2.02-1.71-1.63-3.05Z"/>
+      <path d="M463.43,156.78c-2.83,1.62-7.06,2.54-11.13,1.21-4.38-1.43-6.98-5.03-5.47-9.63,1.9-5.8,7.61-10.06,13.36-8.17,3.5,1.15,4.52,4.32,3.65,6.98-1.7,5.18-8.42,5.67-12.56,3.19-.27,1.87.67,3.35,3.23,4.2,2.52.83,6.02-.43,8.08-1.47l.84,3.71ZM452.29,147.54c2.72,1.28,6.51.76,7.33-1.57.38-1,.03-1.9-.94-2.22-2.21-.73-4.86,1.06-6.39,3.79Z"/>
+    </svg>
+  );
+}
+// Where an ingredient goes in the mix. Fixed rules first (flours and water in the autolyse, salt and levain in the mix, bassinage at the very end of the mix,
+// scald ingredients in the scald), then the ingredient's own "When added" setting, then the defaults: liquids with the autolyse, dry-group inclusions
+// (sugar, spices) in the mix, every other inclusion at fold 2. A fold the run does not have goes to the last fold (or the end of the mix when there are none).
+const isScaldLiquid = (t, l) => !!t && !!t.scald && !!t.scaldLiquid && normName(t.scaldLiquid) !== "water" && normName(t.scaldLiquid) === normName(l.name);
+const defaultWhen = (kind, name, groupOf) => (kind === "liquid" ? "autolyse" : (groupOf(name) === "dry" ? "mix" : "fold2"));
+const placeLine = (t, l, groupOf, nF) => {
+  const k = l.key;
+  if (k === "scf" || k === "scw" || k === "scl" || k === "scald") return { w: "scald", asked: "scald" };
+  if (k === "bassinage") return { w: "end", asked: "end" };
+  if (k === "salt" || k === "levain") return { w: "mix", asked: "mix" };
+  if (k.indexOf("fl_") === 0 || k === "water") return { w: "autolyse", asked: "autolyse" };
+  let item = null, kind = "inclusion";
+  if (k.indexOf("lq_") === 0) { kind = "liquid"; item = (t.liquids || []).find((x) => "lq_" + x.id === k); }
+  else if (k.indexOf("in_") === 0) item = (t.inclusions || []).find((x) => "in_" + x.id === k);
+  const asked = cleanWhen(item && item.when) || defaultWhen(kind, l.name, groupOf);
+  const fm = /^fold(\d)$/.exec(asked);
+  const w = fm ? (nF <= 0 ? "mix" : "fold" + Math.min(+fm[1], nF)) : asked;
+  return { w, asked };
+};
+// Choosing "Scald" on a liquid makes it the scald's liquid (amounts stay in the scald editor); choosing anything else on that liquid hands the scald back to water.
+const applyLiqWhen = (d, idx, v) => {
+  const liq = (d.liquids || [])[idx]; if (!liq) return d;
+  const wasScald = isScaldLiquid(d, liq);
+  let next = { ...d, liquids: d.liquids.map((l, j) => (j === idx ? { ...l, when: v === "scald" ? "" : cleanWhen(v) } : l)) };
+  if (v === "scald") next = { ...next, scald: true, scaldLiquid: liq.name, scaldPct: +d.scaldPct > 0 ? d.scaldPct : 10, scaldHyd: +d.scaldHyd > 0 ? d.scaldHyd : 500 };
+  else if (wasScald) next = { ...next, scaldLiquid: "" };
+  return next;
+};
+function WhenSelect({ kind, value, def, folds, onChange }) {
+  return (
+    <select className="when-sel" data-f="when" title="When this goes in" value={value} onChange={(e) => onChange(e.target.value)}>
+      <option value="">Auto ({WHEN_LABEL[def]})</option>
+      {WHEN_VALUES.map((v) => { const n = /^fold(\d)$/.exec(v); const over = n && folds != null && +n[1] > folds; return <option key={v} value={v}>{WHEN_LABEL[v]}{over ? " (run has " + folds + ")" : ""}</option>; })}
+      {kind === "liquid" && <option value="scald">Scald</option>}
+    </select>
+  );
+}
+
+// ---- Mix sheets: 4" x 6.5" portrait bench sheet per batch, one per Letter page with crop marks ----
+const MS_FORM = { w: 4, h: 6.5 }, MS_PAGE = { w: 8.5, h: 11 };
+// Eight hairline ticks that sit just OUTSIDE the form's four corners, each extending an edge line, so cutting through matching ticks gives exactly 4" x 6.5".
+const cropMarkRects = (x, y, w, h, gap = 0.07, len = 0.28, th = 0.011) => {
+  const r = [];
+  [[x, y, -1, -1], [x + w, y, 1, -1], [x, y + h, -1, 1], [x + w, y + h, 1, 1]].forEach(([cx, cy, sx, sy]) => {
+    r.push({ left: sx < 0 ? cx - gap - len : cx + gap, top: cy - th / 2, width: len, height: th });
+    r.push({ left: cx - th / 2, top: sy < 0 ? cy - gap - len : cy + gap, width: th, height: len });
+  });
+  return r;
+};
+const joinAnd = (xs) => (xs.length <= 1 ? (xs[0] || "") : xs.slice(0, -1).join(", ") + " and " + xs[xs.length - 1]);
+// What goes on a mix sheet for one batch. Each line is placed by placeLine(): scald ingredients in a make-ahead scald band, flours and water in the autolyse,
+// salt and levain (plus anything set to Mix) in the final mix, bassinage last in the mix, and anything set to a fold in a band for that fold.
+function mixSheetData({ b, i, total, t, params, groupOf, showTemp, waterTemp }) {
+  const sc = scaldInfo(t);
+  const aMin = Math.max(0, Math.round((t && t.autolyse != null ? +t.autolyse : +params.autolyse) || 0));
+  const nF = Math.max(0, Math.floor(+params.folds || 0));
+  const rest = Math.round(+params.restBetween || 0);
+  const lines = benchLines(t, b);
+  const oneFlour = (t.flours || []).length === 1; // with a single flour, "Scald flour" is unambiguous
+  const slots = { scald: [], autolyse: [], mix: [], fold1: [], fold2: [], fold3: [], end: [] };
+  const warns = [];
+  lines.forEach((l) => {
+    const isSc = l.key === "scf" || l.key === "scw" || l.key === "scl";
+    const sk = isSc ? scaldBufFactor(t) : 1;
+    const row = { key: l.key, name: oneFlour && l.key === "scf" ? "Scald flour" : l.name, g: l.g * sk, note: l.key === "water" && waterTemp != null ? showTemp(waterTemp) : "", sub: l.sugarG ? "incl. " + fmtG(l.sugarG) + " g sugar" : (isSc && sk > 1 ? "incl. " + Math.round((sk - 1) * 1000) / 10 + "% buffer" : "") };
+    const pl = placeLine(t, l, groupOf, nF);
+    slots[pl.w].push(row);
+    if (pl.asked !== pl.w && /^fold/.test(pl.asked)) warns.push(l.name + ": " + WHEN_LABEL[pl.asked] + " is more folds than this run has (" + nF + "), so it goes in " + (nF > 0 ? "at " + WHEN_LABEL[pl.w] : "at the end of the mix") + ".");
+  });
+  { const sa = scaldAmounts(t, b); if (sa && slots.scald.length) slots.autolyse.push({ key: "scald", name: "Scald (cooked)", g: sa.dough, note: "", sub: "pre-made" }); }
+  const mixRows = [...slots.mix, ...slots.end];
+  const bands = [];
+  if (slots.scald.length) bands.push({ label: "Scald · cook first", rows: slots.scald });
+  if (aMin > 0) { if (slots.autolyse.length) bands.push({ label: "Autolyse · " + aMin + " min", rows: slots.autolyse }); if (mixRows.length) bands.push({ label: "Final mix", rows: mixRows }); }
+  else bands.push({ label: "Main mix", rows: [...slots.autolyse, ...mixRows] });
+  [1, 2, 3].forEach((k) => { if (slots["fold" + k].length) bands.push({ label: "Fold " + k, rows: slots["fold" + k] }); });
+  const ddt = showTemp(t.ddt ?? DDT_DEFAULT_C);
+  const bassTxt = slots.end.length ? " At the end of the mix, work in the bassinage water a little at a time until absorbed." : "";
+  const scAdd = slots.scald.length ? " and the cooled scald" : "";
+  const steps = [];
+  if (slots.scald.length) steps.push(sc.method === "poured" ? "Scald (make ahead): pour the just-boiled liquid over the scald flour and mix to a paste. Cool fully." : "Scald (make ahead): whisk the scald flour and liquid over medium heat to " + showTemp(65) + " until it thickens like pudding. Cool fully.");
+  if (aMin > 0) {
+    steps.push("Autolyse: combine the autolyse ingredients" + scAdd + " and mix until no dry flour remains. Rest " + aMin + " min.");
+    const mixNames = slots.mix.map((r) => r.name);
+    steps.push("Final mix: " + (mixNames.length ? "add " + joinAnd(mixNames) + ", then mix" : "mix") + " to " + ddt + "." + bassTxt);
+  } else {
+    steps.push("Mix: combine everything under Main mix" + scAdd + " and mix to " + ddt + "." + bassTxt);
+  }
+  if (nF > 0) {
+    steps.push("Stretch & folds × " + nF + (rest ? ", " + rest + " min apart" : "") + ".");
+    [1, 2, 3].forEach((k) => { const rows = slots["fold" + k]; if (rows.length) steps.push("Fold " + k + ": add " + joinAnd(rows.map((r) => r.name)) + " and fold gently to distribute."); });
+  }
+  // Fit: estimate the title, the ingredient column and the step list, and shrink the type for this sheet when the content would not
+  // fit the top half (heights scale with the type; characters per line scale the other way). Nothing is ever clipped silently.
+  const nl = String(t.name || "").length, nSize = nl > 44 ? 10.8 : nl > 27 ? 12.6 : 14.4, nPer = nl > 44 ? 36 : nl > 27 ? 31 : 27;
+  const hdr = Math.ceil(nl / nPer) * nSize * 1.05 / 72 + 0.18;
+  const avail = 2.95 - 0.1 - 0.06 - 0.06 - hdr;
+  const ROW = 0.16, BAND = 0.175, NCH = 18, SH = 0.161, SG = 0.035, SCH = 27, DDT = 0.36;
+  const ingAt = (sc2) => 1.04 * (bands.reduce((a2, bd) => a2 + BAND * sc2 + bd.rows.reduce((x, r) => x + (Math.max(1, Math.ceil(r.name.length / (NCH / sc2))) + (r.sub ? 0.8 : 0)) * ROW * sc2, 0), 0));
+  const stepAt = (sc2) => DDT * sc2 + steps.reduce((a2, st) => a2 + Math.ceil(st.length / (SCH / sc2)) * SH * sc2 + SG * sc2, 0);
+  const fitDown = (need) => { let v = 1; while (v > 0.5 && need(v) > 0.93 * avail) v = Math.round((v - 0.02) * 100) / 100; return v; };
+  const scale = fitDown(ingAt), tscale = fitDown(stepAt);
+  return { n: i + 1, total, name: t.name, size: b.size, dough: b.dough, totalFlour: b.totalFlour, totalWater: b.totalWater, shape: proofInfo(t.shape).label, ddt, bands, steps, scale, tscale, warns };
+}
+function MixSheetForm({ L, tempUnit, onFit }) {
+  const ref = useRef(null);
+  const sig = JSON.stringify([L.name, L.bands, L.steps, L.size, L.ddt, tempUnit]);
+  // Fit: where the browser can lay the sheet out, measure it. The ingredient table and the steps are fitted separately: each starts at full
+  // size and shrinks until its content clears the box with a little room to spare. Without layout (tests) the estimated scales stay in force.
+  useLayoutEffect(() => {
+    const f = ref.current; if (!f) return;
+    let dead = false;
+    const q = (c) => f.querySelector("." + c);
+    const bb = (el) => el.getBoundingClientRect();
+    const ingFits = () => { const ing = q("ms-ing"), bands = ing.querySelectorAll(".ms-band"); if (!bands.length) return true; return bb(bands[bands.length - 1]).bottom - bb(ing).top <= bb(ing).height - 3; };
+    const stepsFit = () => bb(q("ms-steps")).bottom <= bb(q("ms-right")).bottom - 3;
+    const botOver = () => { const e = q("ms-bot"); return e.scrollHeight > e.clientHeight + 1; };
+    const run = () => {
+      if (dead || !f.clientHeight) return;
+      const down = (fits, prop) => { let v = 1; f.style.setProperty(prop, v); while (!fits() && v > 0.5) { v = Math.round((v - 0.02) * 100) / 100; f.style.setProperty(prop, v); } return v; };
+      const si = down(ingFits, "--ms-s"), st = down(stepsFit, "--ms-t");
+      f.setAttribute("data-fit", String(si)); f.setAttribute("data-fit-t", String(st));
+      if (onFit) onFit(L.n, !ingFits() || !stepsFit() || botOver());
+    };
+    run();
+    if (typeof document !== "undefined" && document.fonts && document.fonts.ready) document.fonts.ready.then(run);
+    return () => { dead = true; };
+  }, [sig]);
+  const field = (label) => <div className="ms-f"><span>{label}</span><i /></div>;
+  return (
+    <div className="ms-form" ref={ref} data-k="msform" data-scale={L.scale} data-scale-t={L.tscale} style={{ "--ms-s": L.scale, "--ms-t": L.tscale }}>
+      <div className="ms-clip" data-k="msclip" />
+      <div className="ms-top">
+        <div className="ms-hd">
+          <span className="ms-n">B{L.n}</span>
+          <div className="ms-title">
+            <div className={"ms-name" + (L.name.length > 44 ? " xs" : L.name.length > 27 ? " sm" : "")}>{L.name}</div>
+            <div className="ms-sub">Mix <span className="pnum">{L.n}</span> of <span className="pnum">{L.total}</span> · <span className="pnum">{L.size}</span> loaves · <span className="pnum">{fmtG(L.dough)}</span> g dough · {L.shape}</div>
+          </div>
+        </div>
+        <div className="ms-cols">
+          <div className="ms-ing">
+            {L.bands.map((bd, bi) => (
+              <div className="ms-band" key={bi}>
+                <div className="ms-bh">{bd.label}</div>
+                {bd.rows.map((r, ri) => <div className={"ms-row" + (r.sub ? " has-sub" : "")} key={ri}><span className="ms-rn">{r.name}</span><span className="ms-rg">{fmtG(r.g)} g{r.note ? <em>{r.note}</em> : null}</span>{r.sub ? <span className="ms-rsub">{r.sub}</span> : null}</div>)}
+              </div>
+            ))}
+          </div>
+          <div className="ms-right">
+            <div className="ms-ddt"><span>Target dough temp</span><b>{L.ddt}</b></div>
+            <ol className="ms-steps">{L.steps.map((st, si) => <li key={si}>{st}</li>)}</ol>
+          </div>
+        </div>
+      </div>
+      <div className="ms-bot">
+        <div className="ms-fr">{field("Date")}{field("Autolyse mixed (time)")}{field("Final mix (time)")}</div>
+        <div className="ms-fr">{field("Actual dough temp (°" + tempUnit + ")")}{field("pH after mix")}</div>
+        <table className="ms-prog">
+          <colgroup><col /><col style={{ width: "0.7in" }} /><col style={{ width: "0.7in" }} /><col style={{ width: "0.72in" }} /></colgroup>
+          <thead><tr><th>Progress notes</th><th>Time</th><th>% rise</th><th>pH (if used)</th></tr></thead>
+          <tbody>{["", "", "", "Shaping", "Cold Retard"].map((lab, r) => <tr key={r}><td className={lab ? "lbl" : undefined}>{lab}</td><td /><td /><td /></tr>)}</tbody>
+        </table>
+        <div className="ms-notes"><span>Bake notes</span><div className="ms-rules">{[0, 1, 2].map((r) => <i key={r} />)}</div></div>
+      </div>
+    </div>
+  );
+}
+
+// ---- Equipment tab: mixers (gross flour capacity) and ovens (loaves per load, by pan type) ----
+function EquipmentTab({ equipment, setEquipment }) {
+  const [arm, setArm] = useState(null); // two taps to delete
+  const upd = (kind, id, patch) => setEquipment((e) => ({ ...e, [kind]: e[kind].map((x) => (x.id === id ? { ...x, ...patch } : x)) }));
+  const add = (kind) => setEquipment((e) => ({ ...e, [kind]: [...e[kind], kind === "mixers" ? { id: uid(), name: "New mixer", flourKg: 0 } : { id: uid(), name: "New oven", boule: 0, pullman1: 0, pullman2: 0 }] }));
+  const del = (kind, id) => { if (arm !== id) { setArm(id); return; } setArm(null); setEquipment((e) => ({ ...e, [kind]: e[kind].filter((x) => x.id !== id) })); };
+  const num = (v, set, step) => <input type="number" min="0" step={step || 1} placeholder="0" value={v || ""} onChange={(e) => set(e.target.value === "" ? 0 : Math.max(0, Number(e.target.value) || 0))} />;
+  return (
+    <div className="eq-wrap" data-k="equipmenttab">
+      <h3 className="eq-h">Equipment</h3>
+      <p className="eq-intro">Set these once; each run picks its mixer and oven on the Plan tab. A mixer is limited by the gross flour in a mix (your flours, scald flour and the levain's own flour). An oven holds a different number of each pan type.</p>
+      <h4 className="eq-sub">Mixers</h4>
+      {equipment.mixers.map((m) => (
+        <div className="eq-card" key={m.id} data-k="mixercard">
+          <div className="bl-field eq-name"><label>Name</label><input data-f="mxName" value={m.name} onChange={(e) => upd("mixers", m.id, { name: e.target.value })} /></div>
+          <div className="bl-field"><label>Max gross flour per mix (kg)</label>{num(m.flourKg, (v) => upd("mixers", m.id, { flourKg: v }), 0.5)}</div>
+          <button className={"eq-del" + (arm === m.id ? " armed" : "")} data-f="mxDel" onClick={() => del("mixers", m.id)}>{arm === m.id ? "Tap again to delete" : "Delete"}</button>
+        </div>
+      ))}
+      <button className="bl-add" data-f="mxAdd" onClick={() => add("mixers")}>+ Add mixer</button>
+      <h4 className="eq-sub">Ovens</h4>
+      {equipment.ovens.map((o) => (
+        <div className="eq-card" key={o.id} data-k="ovencard">
+          <div className="bl-field eq-name"><label>Name</label><input data-f="ovName" value={o.name} onChange={(e) => upd("ovens", o.id, { name: e.target.value })} /></div>
+          <div className="bl-field"><label>Boules / ovals per load</label>{num(o.boule, (v) => upd("ovens", o.id, { boule: Math.floor(v) }))}</div>
+          <div className="bl-field"><label>1 lb Pullmans per load</label>{num(o.pullman1, (v) => upd("ovens", o.id, { pullman1: Math.floor(v) }))}</div>
+          <div className="bl-field"><label>2 lb Pullmans per load</label>{num(o.pullman2, (v) => upd("ovens", o.id, { pullman2: Math.floor(v) }))}</div>
+          <button className={"eq-del" + (arm === o.id ? " armed" : "")} data-f="ovDel" onClick={() => del("ovens", o.id)}>{arm === o.id ? "Tap again to delete" : "Delete"}</button>
+        </div>
+      ))}
+      <button className="bl-add" data-f="ovAdd" onClick={() => add("ovens")}>+ Add oven</button>
+      <p className="eq-intro">A Pullman number left at 0 falls back to the boule number. Different pan types can share a load: a load is full when their shares add up to one oven.</p>
+    </div>
+  );
+}
+
+// ---- Help chat on each mix card: Claude answers with the context of that exact mix ----
+const HELP_MAX_MSGS = 40;
+const helpKey = (plan, i) => { const b = plan.list[i]; if (!b) return ""; return b.ti + ":" + plan.list.slice(0, i).filter((x) => x.ti === b.ti).length; };
+const HELP_CHIPS = [
+  ["Dough too slack", "The dough feels too slack. What should I do, and what do you think caused it?"],
+  ["Dough too stiff", "The dough feels too stiff. What should I do, and what do you think caused it?"],
+  ["Running late", "I'm running behind the schedule on this mix. What can I safely adjust?"],
+  ["Swap an ingredient", "I want to swap an ingredient in this mix. What would you change, and by how much?"],
+  ["Check my numbers", "Look over the numbers for this mix. Does anything look off or risky?"],
+];
+// Everything Claude is told about this mix. Temperatures arrive already in the baker's unit.
+function mixHelpContext(o) {
+  const { b, i, total, t, params, groupOf, showTemp, waterTemp, startMin, base, nowClock, runName, runDate, tempUnit, starterName, ambientTemp, starterTemp, lev, done, active } = o;
+  const rd = (x) => Math.round(x * 10) / 10;
+  const nF = Math.max(0, Math.floor(+params.folds || 0));
+  const aMin = Math.max(0, Math.round((t.autolyse != null ? +t.autolyse : +params.autolyse) || 0));
+  const sc = scaldInfo(t);
+  const weighed = benchLines(t, b).map((l) => { const pl = placeLine(t, l, groupOf, nF); return { name: l.name, grams: Math.round(l.g), addedAt: WHEN_LABEL[pl.w] || pl.w, ...(l.sugarG ? { includesSugarGrams: Math.round(l.sugarG) } : {}) }; });
+  return {
+    now: nowClock, runName, runDate,
+    units: { temperature: "°" + tempUnit, weight: "grams" },
+    batch: { number: "B" + (i + 1), of: total, loaves: b.size, doughGrams: Math.round(b.dough), pan: proofInfo(t.shape).label, status: done ? "marked built" : active ? "in progress" : "not started", totalFlourGrams: Math.round(b.totalFlour), waterLineGrams: Math.round(b.totalWater) },
+    weighedForThisBatch: weighed,
+    recipe: {
+      name: t.name,
+      flours: (t.flours || []).map((f, idx) => ({ name: f.name, pct: rd(flourPctOf(t, idx)) })),
+      waterPct: rd(+t.water || 0), saltPct: rd(+t.salt || 0), trueHydrationPct: rd(trueHydration(t)),
+      levain: { pctOfFlour: rd(+t.levain || 0), hydrationPct: +t.levHyd || 80, inoculationPct: +t.levInoc || 10, wholeGrainPct: +t.levWhole || 0, ...(levSugarPct(t) > 0 ? { sugar: levSugarName(t), sugarPctOfLevainFlour: +t.levSugar } : {}), note: t.levExpNote || "" },
+      bassinagePctOfWater: t.bassinage ? rd(+t.bassinagePct || 0) : 0,
+      scald: sc.on ? { flour: sc.flourName, flourPctOfTotal: rd(sc.sf), liquid: sc.liquidName, liquidPct: rd(sc.S), method: sc.method, bufferPct: t.scaldBuf ? (+t.scaldBufPct || 0) : 0 } : null,
+      liquids: (t.liquids || []).map((l) => ({ name: l.name, pct: rd(+l.pct || 0), waterContentPct: +l.factor || 100 })),
+      inclusions: (t.inclusions || []).map((f) => ({ name: f.name, pct: rd(+f.pct || 0) })),
+      bake: { temp: showTemp(t.bakeTemp ?? 245), minutes: +t.bakeMin || 45, steamMinutes: t.steamMin ?? 20 },
+      notesFromLastBakes: String(t.notes || "").slice(0, 600),
+    },
+    targets: { doughTemp: showTemp(t.ddt ?? DDT_DEFAULT_C), mixWaterTemp: waterTemp != null ? showTemp(waterTemp) : "not set", autolyseMinutes: aMin },
+    schedule: { autolyseStarts: fmtClock(startMin + base), finalMixStarts: fmtClock(startMin + base + aMin), mixMinutes: +params.mix || 15, stretchAndFolds: nF, restBetweenFoldsMinutes: +params.restBetween || 0, mixDay: runDate },
+    levain: { starter: starterName, ...(lev || {}) },
+    kitchen: { roomTemp: showTemp(ambientTemp), starterTemp: showTemp(starterTemp) },
+  };
+}
+// Shrinks a photo in the browser so it uploads quickly; falls back to the original when it cannot.
+async function helpPhoto(file) {
+  const url = await new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result)); fr.onerror = () => rej(new Error("Could not read that photo.")); fr.readAsDataURL(file); });
+  let small = null;
+  try {
+    small = await new Promise((res) => {
+      const img = new Image(); const tm = setTimeout(() => res(null), 4000);
+      img.onload = () => { clearTimeout(tm); try { const k = Math.min(1, 1280 / Math.max(img.width || 1, img.height || 1)); const c = document.createElement("canvas"); c.width = Math.max(1, Math.round((img.width || 1) * k)); c.height = Math.max(1, Math.round((img.height || 1) * k)); const g = c.getContext && c.getContext("2d"); if (!g) return res(null); g.drawImage(img, 0, 0, c.width, c.height); res(c.toDataURL("image/jpeg", 0.82)); } catch (e) { res(null); } };
+      img.onerror = () => { clearTimeout(tm); res(null); };
+      img.src = url;
+    });
+  } catch (e) { small = null; }
+  const use = small || url;
+  const m = /^data:(image\/[a-z+.-]+);base64,(.*)$/i.exec(use);
+  if (!m || m[2].length > 1300000) throw new Error("That photo is too large. Try a smaller one.");
+  return { type: m[1].toLowerCase(), data: m[2], url: use };
+}
+// Plain-text answers: paragraphs, "- " lists and **bold**; nothing is ever treated as HTML.
+function renderHelpText(str) {
+  const isLi = (l) => /^\s*[-•*]\s+/.test(l);
+  const bold = (txt, k) => txt.split(/(\*\*[^*]+\*\*)/g).map((p, j) => (/^\*\*[^*]+\*\*$/.test(p) ? <b key={k + "-" + j}>{p.slice(2, -2)}</b> : p));
+  const out = [];
+  String(str).split(/\n{2,}/).forEach((blk, bi) => {
+    // inside one block, a run of "- " lines becomes a list and any other lines stay a paragraph (so "Do this:" followed by bullets works)
+    let run = [], kind = null, n = 0;
+    const flush = () => {
+      if (!run.length) return;
+      const k = bi + "-" + n++;
+      if (kind === "li") out.push(<ul key={k}>{run.map((l, li) => <li key={li}>{bold(l.replace(/^\s*[-•*]\s+/, ""), k + "-" + li)}</li>)}</ul>);
+      else out.push(<p key={k}>{run.map((l, li) => <React.Fragment key={li}>{li > 0 && <br />}{bold(l, k + "-" + li)}</React.Fragment>)}</p>);
+      run = [];
+    };
+    blk.split("\n").forEach((l) => { const kd = isLi(l) ? "li" : "p"; if (kd !== kind) { flush(); kind = kd; } run.push(l); });
+    flush();
+  });
+  return out;
+}
+function MixHelpPanel({ title, ctx, messages, onMessages, onClose }) {
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [live, setLive] = useState("");
+  const [error, setError] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const listRef = useRef(null), alive = useRef(true), abortRef = useRef(null), lastPhoto = useRef(null);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; if (abortRef.current) { try { abortRef.current.abort(); } catch (e) {} } }; }, []);
+  useEffect(() => { const k = (e) => { if (e.key === "Escape") onClose(); }; document.addEventListener("keydown", k); return () => document.removeEventListener("keydown", k); }, [onClose]);
+  useEffect(() => { const el = listRef.current; if (el) el.scrollTop = el.scrollHeight; }, [messages, live, busy, error]);
+  const ask = async (msgs, ph) => {
+    setBusy(true); setError(""); setLive("");
+    const ac = typeof AbortController !== "undefined" ? new AbortController() : null; abortRef.current = ac;
+    const api = msgs.map((m, idx) => {
+      const last = idx === msgs.length - 1;
+      if (last && ph) return { role: "user", content: [{ type: "image", source: { type: "base64", media_type: ph.type, data: ph.data } }, { type: "text", text: m.content }] };
+      return { role: m.role, content: m.photo ? m.content + " [a photo was attached]" : m.content };
+    });
+    try {
+      const resp = await fetch("/api/mix-help", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: api, context: ctx }), ...(ac ? { signal: ac.signal } : {}) });
+      if (!resp.ok) { let msg = "Request failed (" + resp.status + ")"; try { const j = await resp.json(); msg = j.error || msg; } catch (e) {} throw new Error(msg); }
+      let acc = "";
+      if (resp.body && resp.body.getReader) {
+        const reader = resp.body.getReader(), dec = new TextDecoder();
+        for (;;) { const { done, value } = await reader.read(); if (done) break; acc += dec.decode(value, { stream: true }); if (alive.current) setLive(acc); }
+        acc += dec.decode();
+      } else acc = await resp.text();
+      if (!alive.current) return;
+      if (!acc.trim()) throw new Error("Claude sent back nothing. Try again.");
+      onMessages([...msgs, { role: "assistant", content: acc, ts: Date.now() }]);
+    } catch (e) {
+      if (alive.current && !(e && e.name === "AbortError")) setError((e && e.message) || "Something went wrong talking to Claude.");
+    } finally { if (alive.current) { setBusy(false); setLive(""); } }
+  };
+  const send = (text) => {
+    const q = String(text == null ? input : text).trim();
+    if ((!q && !photo) || busy) return;
+    const um = { role: "user", content: q || "What do you make of my dough in this photo?", ts: Date.now(), ...(photo ? { photo: true } : {}) };
+    const next = [...messages, um];
+    lastPhoto.current = photo; onMessages(next); setInput(""); setPhoto(null);
+    ask(next, photo);
+  };
+  const canRetry = !busy && error && messages.length > 0 && messages[messages.length - 1].role === "user";
+  const onFile = async (e) => { const f = e.target.files && e.target.files[0]; e.target.value = ""; if (!f) return; try { setError(""); setPhoto(await helpPhoto(f)); } catch (er) { setError(er.message); } };
+  return (
+    <div className="help-overlay" data-k="help" role="dialog" aria-modal="true" aria-label={"Help: " + title} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="help-sheet">
+        <div className="help-hd">
+          <div className="help-title"><b>Help</b><span>{title}</span></div>
+          {messages.length > 0 && <button className="help-clear" data-f="help-clear" disabled={busy} onClick={() => onMessages([])}>Clear</button>}
+          <button className="help-x" data-f="help-close" aria-label="Close" onClick={onClose}>×</button>
+        </div>
+        <div className="help-list" ref={listRef} data-k="helplist">
+          {messages.length === 0 && !busy && (
+            <div className="help-empty">
+              <p>Ask anything about this mix. I can see the recipe, this batch's weights, your temperatures and your schedule.</p>
+              <div className="help-chips">{HELP_CHIPS.map(([label, q]) => <button key={label} data-f="help-chip" onClick={() => send(q)}>{label}</button>)}</div>
+            </div>
+          )}
+          {messages.map((m, i) => <div className={"help-msg " + m.role} key={i} data-k={"help-" + m.role}>{m.role === "assistant" ? renderHelpText(m.content) : <p>{m.content}{m.photo ? " 📷" : ""}</p>}</div>)}
+          {busy && <div className="help-msg assistant live" data-k="help-live">{live ? renderHelpText(live) : <p className="help-think">Thinking…</p>}</div>}
+          {error && <div className="help-err" data-k="help-err"><span>{error}</span>{canRetry && <button data-f="help-retry" onClick={() => ask(messages, lastPhoto.current)}>Retry</button>}</div>}
+        </div>
+        <div className="help-foot">
+          <div className="help-note">Suggestions only. It can't change your recipe or the app.</div>
+          {photo && <div className="help-photochip" data-k="help-photochip"><img src={photo.url} alt="Attached dough" /><button aria-label="Remove photo" onClick={() => setPhoto(null)}>×</button></div>}
+          <div className="help-row">
+            <label className="help-photo" title="Attach a photo"><input type="file" accept="image/*" data-f="help-photo" onChange={onFile} />📷</label>
+            <textarea className="help-input" data-f="help-input" rows={2} placeholder="Ask about this mix…" value={input} disabled={busy} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") send(); }} />
+            <button className="help-send" data-f="help-send" disabled={busy || (!input.trim() && !photo)} onClick={() => send()}>Send</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DoughTempCalc({ tempUnit, uToC, cToU, initial, current, onApply, onClose }) {
+  const seed = tempUnit === "F"
+    ? { ddt: 75, lev: 75, flour: 71, room: 75, fric: 2 }
+    : { ddt: 24, lev: 24, flour: 22, room: 24, fric: 1 };
+  const r1 = (x) => Math.round(x * 10) / 10;
+  const start = initial ? {
+    ddt: r1(cToU(initial.ddtC)), lev: r1(cToU(initial.levC)), flour: r1(cToU(initial.flourC)),
+    room: r1(cToU(initial.roomC)), fric: r1(tempUnit === "F" ? initial.fricC * 9 / 5 : initial.fricC),
+  } : seed;
+  const [ddt, setDdt] = useState(start.ddt);
+  const [lev, setLev] = useState(start.lev);
+  const [flour, setFlour] = useState(start.flour);
+  const [room, setRoom] = useState(start.room);
+  const [fric, setFric] = useState(start.fric);
+  const n = (x) => (x === "" || x == null || isNaN(+x) ? 0 : +x);
+  const water = n(ddt) * 4 - (n(lev) + n(flour) + n(room) + n(fric));
+  const u = "°" + tempUnit;
+  const apply = () => {
+    const inputsC = {
+      ddtC: uToC(n(ddt)), levC: uToC(n(lev)), flourC: uToC(n(flour)), roomC: uToC(n(room)),
+      fricC: tempUnit === "F" ? n(fric) * 5 / 9 : n(fric),
+    };
+    onApply(uToC(water), inputsC); onClose();
+  };
+  const Field = (label, val, set, hint) => (
+    <label className="dtc-field">
+      <span className="dtc-lbl">{label}</span>
+      <div className="dtc-inwrap"><input type="number" value={val} onChange={(e) => set(e.target.value)} /><em>{u}</em></div>
+      {hint ? <small className="dtc-hint">{hint}</small> : null}
+    </label>
+  );
+  return (
+    <div className="bl-modal-overlay" onClick={onClose}>
+      <div className="bl-modal dtc" onClick={(e) => e.stopPropagation()}>
+        <div className="dtc-head">
+          <div><h3>Dough temperature</h3><p>Measured day-of — solves the water temp to hit your target.</p></div>
+          <button className="dtc-close" onClick={onClose} aria-label="Close">×</button>
+        </div>
+        <div className="dtc-grid">
+          {Field("Desired dough temp", ddt, setDdt)}
+          {Field("Levain temp", lev, setLev)}
+          {Field("Flour temp", flour, setFlour)}
+          {Field("Room temp", room, setRoom)}
+          {Field("Friction factor", fric, setFric, "Heat added by mixing — 0 if you mix quickly")}
+        </div>
+        <div className="dtc-result">
+          <span className="dtc-rlabel">Mix water temperature</span>
+          <span className="dtc-rval">{Math.round(water * 10) / 10}{u}</span>
+          <span className="dtc-rformula">(desired × 4) − (levain + flour + room + friction)</span>
+        </div>
+        <button className="dtc-apply" onClick={apply}>{current != null ? "Update mix cards" : "Add to mix cards"} →</button>
+      </div>
+    </div>
+  );
+}
+
+const DEFAULT_LIBRARY = [
+  { id: uid(), name: "Country", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 90), mk("Whole wheat", 10)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, inclusions: [] },
+  { id: uid(), name: "Seeded", loafWeight: 850, shape: "oval", flours: [mk("Bread flour", 80), mk("Whole wheat", 15), mk("Rye", 5)], water: 78, salt: 2.2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 4.5, levRefTemp: 24, levWhole: 5, levExpNote: "5% rye pre-ferment — testing for flavour depth", bakeTemp: 235, bakeMin: 42, steamMin: 18, autolyse: 60, inclusions: [mk("Mixed seeds", 12)] },
+];
+const DEFAULT_SLOTS = [
+  { loaves: 50, mixOrder: 1, bakeOrder: 1, coreRecipeId: DEFAULT_LIBRARY[0].id, sessions: [{ id: uid(), date: addDaysISO(todayISO(), 1), loaves: 0 }], draft: cloneRecipe(DEFAULT_LIBRARY[0]) },
+  { loaves: 50, mixOrder: 2, bakeOrder: 2, coreRecipeId: DEFAULT_LIBRARY[1].id, sessions: [{ id: uid(), date: addDaysISO(todayISO(), 1), loaves: 0 }], draft: cloneRecipe(DEFAULT_LIBRARY[1]) },
+];
+
+const DEFAULTS = { autolyse: 45, mix: 15, folds: 3, fold: 5, restBetween: 50, bulkRest: 40, preShape: 10, benchRest: 25, shape: 15, ovenCap: 15, preheatMin: 45, recoverMin: 7, bakeStart: "08:00" };
+const GLOBALS_KEY = "bakelab-globals";
+
+// ---- starter profile: named culture with maintenance protocol + fermentation calibration ----
+const DEFAULT_STARTER = {
+  name: "Thelma", est: "2020", notes: "After my late grandmother.",
+  mFlour: [ { id: uid(), name: "Bread flour", pct: 80 }, { id: uid(), name: "Whole wheat", pct: 10 }, { id: uid(), name: "Rye", pct: 10 } ],
+  mSeed: 50, mFlourRatio: 10, mHyd: 80, mWaterTemp: 33, mFridgeAt: 80, mIntervalDays: 7, mStorage: "fridge",
+  lastFed: todayISO(),
+  refTemp: 24, refInoc: 10, refHyd: 80, refBuildHrs: 5,
+  q10: 2, hydDoubleHrs: 1.2, wholeAccelHrs: 1.5,
+  hydCal: [ { hyd: 80, hrs: 5 }, { hyd: 100, hrs: 4.2 } ],
+  wholeCal: [ { whole: 0, hrs: 5 }, { whole: 25, hrs: 3.5 } ],
+};
+const DAYS_KEY = "bakelab-days-v1";
+const LASTLOC_KEY = "bakelab-lastloc-v1"; // per-DEVICE (localStorage): where this device was last, so a home-screen launch reopens there
+const TAB_KEYS = ["plan", "prep", "levain", "safety", "build", "fold", "bake", "timers", "costs"];
+const HOME_TAB_KEYS = ["bakedays", "recipes", "pantry", "equipment", "starter"];
+
+// ---- stay awake -----------------------------------------------------------
+// Keep-awake video adapted from NoSleep.js (MIT, © Rich Tibbett). Used only where the Screen Wake Lock API can't be trusted.
+const NOSLEEP_MP4 = "data:video/mp4;base64,AAAAHGZ0eXBNNFYgAAACAGlzb21pc28yYXZjMQAAAAhmcmVlAAAGF21kYXTeBAAAbGliZmFhYyAxLjI4AABCAJMgBDIARwAAArEGBf//rdxF6b3m2Ui3lizYINkj7u94MjY0IC0gY29yZSAxNDIgcjIgOTU2YzhkOCAtIEguMjY0L01QRUctNCBBVkMgY29kZWMgLSBDb3B5bGVmdCAyMDAzLTIwMTQgLSBodHRwOi8vd3d3LnZpZGVvbGFuLm9yZy94MjY0Lmh0bWwgLSBvcHRpb25zOiBjYWJhYz0wIHJlZj0zIGRlYmxvY2s9MTowOjAgYW5hbHlzZT0weDE6MHgxMTEgbWU9aGV4IHN1Ym1lPTcgcHN5PTEgcHN5X3JkPTEuMDA6MC4wMCBtaXhlZF9yZWY9MSBtZV9yYW5nZT0xNiBjaHJvbWFfbWU9MSB0cmVsbGlzPTEgOHg4ZGN0PTAgY3FtPTAgZGVhZHpvbmU9MjEsMTEgZmFzdF9wc2tpcD0xIGNocm9tYV9xcF9vZmZzZXQ9LTIgdGhyZWFkcz02IGxvb2thaGVhZF90aHJlYWRzPTEgc2xpY2VkX3RocmVhZHM9MCBucj0wIGRlY2ltYXRlPTEgaW50ZXJsYWNlZD0wIGJsdXJheV9jb21wYXQ9MCBjb25zdHJhaW5lZF9pbnRyYT0wIGJmcmFtZXM9MCB3ZWlnaHRwPTAga2V5aW50PTI1MCBrZXlpbnRfbWluPTI1IHNjZW5lY3V0PTQwIGludHJhX3JlZnJlc2g9MCByY19sb29rYWhlYWQ9NDAgcmM9Y3JmIG1idHJlZT0xIGNyZj0yMy4wIHFjb21wPTAuNjAgcXBtaW49MCBxcG1heD02OSBxcHN0ZXA9NCB2YnZfbWF4cmF0ZT03NjggdmJ2X2J1ZnNpemU9MzAwMCBjcmZfbWF4PTAuMCBuYWxfaHJkPW5vbmUgZmlsbGVyPTAgaXBfcmF0aW89MS40MCBhcT0xOjEuMDAAgAAAAFZliIQL8mKAAKvMnJycnJycnJycnXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXiEASZACGQAjgCEASZACGQAjgAAAAAdBmjgX4GSAIQBJkAIZACOAAAAAB0GaVAX4GSAhAEmQAhkAI4AhAEmQAhkAI4AAAAAGQZpgL8DJIQBJkAIZACOAIQBJkAIZACOAAAAABkGagC/AySEASZACGQAjgAAAAAZBmqAvwMkhAEmQAhkAI4AhAEmQAhkAI4AAAAAGQZrAL8DJIQBJkAIZACOAAAAABkGa4C/AySEASZACGQAjgCEASZACGQAjgAAAAAZBmwAvwMkhAEmQAhkAI4AAAAAGQZsgL8DJIQBJkAIZACOAIQBJkAIZACOAAAAABkGbQC/AySEASZACGQAjgCEASZACGQAjgAAAAAZBm2AvwMkhAEmQAhkAI4AAAAAGQZuAL8DJIQBJkAIZACOAIQBJkAIZACOAAAAABkGboC/AySEASZACGQAjgAAAAAZBm8AvwMkhAEmQAhkAI4AhAEmQAhkAI4AAAAAGQZvgL8DJIQBJkAIZACOAAAAABkGaAC/AySEASZACGQAjgCEASZACGQAjgAAAAAZBmiAvwMkhAEmQAhkAI4AhAEmQAhkAI4AAAAAGQZpAL8DJIQBJkAIZACOAAAAABkGaYC/AySEASZACGQAjgCEASZACGQAjgAAAAAZBmoAvwMkhAEmQAhkAI4AAAAAGQZqgL8DJIQBJkAIZACOAIQBJkAIZACOAAAAABkGawC/AySEASZACGQAjgAAAAAZBmuAvwMkhAEmQAhkAI4AhAEmQAhkAI4AAAAAGQZsAL8DJIQBJkAIZACOAAAAABkGbIC/AySEASZACGQAjgCEASZACGQAjgAAAAAZBm0AvwMkhAEmQAhkAI4AhAEmQAhkAI4AAAAAGQZtgL8DJIQBJkAIZACOAAAAABkGbgCvAySEASZACGQAjgCEASZACGQAjgAAAAAZBm6AnwMkhAEmQAhkAI4AhAEmQAhkAI4AhAEmQAhkAI4AhAEmQAhkAI4AAAAhubW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAABDcAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAzB0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAA+kAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAALAAAACQAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPpAAAAAAABAAAAAAKobWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAB1MAAAdU5VxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAACU21pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAhNzdGJsAAAAr3N0c2QAAAAAAAAAAQAAAJ9hdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAALAAkABIAAAASAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGP//AAAALWF2Y0MBQsAN/+EAFWdCwA3ZAsTsBEAAAPpAADqYA8UKkgEABWjLg8sgAAAAHHV1aWRraEDyXyRPxbo5pRvPAyPzAAAAAAAAABhzdHRzAAAAAAAAAAEAAAAeAAAD6QAAABRzdHNzAAAAAAAAAAEAAAABAAAAHHN0c2MAAAAAAAAAAQAAAAEAAAABAAAAAQAAAIxzdHN6AAAAAAAAAAAAAAAeAAADDwAAAAsAAAALAAAACgAAAAoAAAAKAAAACgAAAAoAAAAKAAAACgAAAAoAAAAKAAAACgAAAAoAAAAKAAAACgAAAAoAAAAKAAAACgAAAAoAAAAKAAAACgAAAAoAAAAKAAAACgAAAAoAAAAKAAAACgAAAAoAAAAKAAAAiHN0Y28AAAAAAAAAHgAAAEYAAANnAAADewAAA5gAAAO0AAADxwAAA+MAAAP2AAAEEgAABCUAAARBAAAEXQAABHAAAASMAAAEnwAABLsAAATOAAAE6gAABQYAAAUZAAAFNQAABUgAAAVkAAAFdwAABZMAAAWmAAAFwgAABd4AAAXxAAAGDQAABGh0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAACAAAAAAAABDcAAAAAAAAAAAAAAAEBAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAQkAAADcAABAAAAAAPgbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAC7gAAAykBVxAAAAAAALWhkbHIAAAAAAAAAAHNvdW4AAAAAAAAAAAAAAABTb3VuZEhhbmRsZXIAAAADi21pbmYAAAAQc21oZAAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAADT3N0YmwAAABnc3RzZAAAAAAAAAABAAAAV21wNGEAAAAAAAAAAQAAAAAAAAAAAAIAEAAAAAC7gAAAAAAAM2VzZHMAAAAAA4CAgCIAAgAEgICAFEAVBbjYAAu4AAAADcoFgICAAhGQBoCAgAECAAAAIHN0dHMAAAAAAAAAAgAAADIAAAQAAAAAAQAAAkAAAAFUc3RzYwAAAAAAAAAbAAAAAQAAAAEAAAABAAAAAgAAAAIAAAABAAAAAwAAAAEAAAABAAAABAAAAAIAAAABAAAABgAAAAEAAAABAAAABwAAAAIAAAABAAAACAAAAAEAAAABAAAACQAAAAIAAAABAAAACgAAAAEAAAABAAAACwAAAAIAAAABAAAADQAAAAEAAAABAAAADgAAAAIAAAABAAAADwAAAAEAAAABAAAAEAAAAAIAAAABAAAAEQAAAAEAAAABAAAAEgAAAAIAAAABAAAAFAAAAAEAAAABAAAAFQAAAAIAAAABAAAAFgAAAAEAAAABAAAAFwAAAAIAAAABAAAAGAAAAAEAAAABAAAAGQAAAAIAAAABAAAAGgAAAAEAAAABAAAAGwAAAAIAAAABAAAAHQAAAAEAAAABAAAAHgAAAAIAAAABAAAAHwAAAAQAAAABAAAA4HN0c3oAAAAAAAAAAAAAADMAAAAaAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAAAJAAAACQAAAAkAAACMc3RjbwAAAAAAAAAfAAAALAAAA1UAAANyAAADhgAAA6IAAAO+AAAD0QAAA+0AAAQAAAAEHAAABC8AAARLAAAEZwAABHoAAASWAAAEqQAABMUAAATYAAAE9AAABRAAAAUjAAAFPwAABVIAAAVuAAAFgQAABZ0AAAWwAAAFzAAABegAAAX7AAAGFwAAAGJ1ZHRhAAAAWm1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAALWlsc3QAAAAlqXRvbwAAAB1kYXRhAAAAAQAAAABMYXZmNTUuMzMuMTAw";
+const makeNoSleepVideo = () => {
+  const v = document.createElement("video");
+  v.setAttribute("title", "No Sleep"); v.setAttribute("playsinline", ""); v.muted = true;
+  const src = document.createElement("source"); src.src = NOSLEEP_MP4; src.type = "video/mp4"; v.appendChild(src);
+  v.addEventListener("loadedmetadata", () => {
+    if (v.duration <= 1) v.setAttribute("loop", "");
+    else v.addEventListener("timeupdate", () => { if (v.currentTime > 0.5) v.currentTime = Math.random(); });
+  });
+  return v;
+};
+// iOS home-screen web apps before iOS 18.4: navigator.wakeLock exists and even resolves, but doesn't actually hold the screen.
+// (Can't detect that from the result, so detect the situation and go straight to the video.) Unknown version => assume legacy.
+const iosStandaloneLegacy = () => {
+  try {
+    const ua = navigator.userAgent || "";
+    const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    if (!isIOS || !navigator.standalone) return false;
+    const m = ua.match(/OS (\d+)[_.](\d+)/);
+    if (!m) return true;
+    return +m[1] < 18 || (+m[1] === 18 && +m[2] < 4);
+  } catch (e) { return false; }
+};
+// Avery 6468 — 2" × 4" ID labels, 10 per sheet (US Letter, portrait). Exact published geometry.
+const AVERY_6468 = { pageW: 8.5, pageH: 11, cols: 2, rows: 5, labelW: 4, labelH: 2, top: 0.5, left: 0.15625, hGut: 0.1875, vGut: 0 };
+const normalizeSlots = (sl) => (Array.isArray(sl) && sl.length && sl.every((s) => s && s.draft && Array.isArray(s.draft.flours)))
+  ? sl.map((s, i) => ({ ...s, mixOrder: s.mixOrder ?? i + 1, bakeOrder: s.bakeOrder ?? i + 1, coreRecipeId: s.coreRecipeId || null, sessions: Array.isArray(s.sessions) && s.sessions.length ? s.sessions.map((sess) => ({ id: sess.id || uid(), date: sess.date || todayISO(), loaves: +(sess.loaves) || 0 })) : [{ id: uid(), date: addDaysISO(todayISO(), 1), loaves: 0 }] }))
+  : DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) }));
+const nowHM = () => { const d = new Date(); return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); };
+const newTempReading = () => ({ id: uid(), temp: null, date: "", time: "" });
+const newSaniReading = () => ({ id: uid(), ppm: null, date: "", time: "" });
+const newFridge = (n) => ({ id: uid(), name: n, readings: [newTempReading(), newTempReading(), newTempReading()] });
+const newSaniStation = (n) => ({ id: uid(), name: n, kind: "Chlorine", min: 100, max: 200, readings: [newSaniReading(), newSaniReading(), newSaniReading()] });
+const defaultFoodSafety = () => ({
+  fridges: [ newFridge("Fridge 1") ],
+  sanitizers: [ newSaniStation("Dishwasher"), newSaniStation("Sani Spray #1"), newSaniStation("Sani Spray #2") ],
+});
+const padTo3 = (arr, mk) => { const a = Array.isArray(arr) ? arr.slice(0, 3) : []; while (a.length < 3) a.push(mk()); return a; };
+const normalizeFoodSafety = (fs) => {
+  if (!fs || !Array.isArray(fs.fridges)) return defaultFoodSafety();
+  return {
+    fridges: fs.fridges.map((f) => ({ id: f.id || uid(), name: f.name || "Fridge", readings: padTo3(f.readings, newTempReading).map((r) => ({ id: r.id || uid(), temp: r.temp ?? null, date: r.date || "", time: r.time || "" })) })),
+    sanitizers: (Array.isArray(fs.sanitizers) ? fs.sanitizers : []).map((s) => ({
+      id: s.id || uid(), name: s.name || "Station", kind: "Chlorine", min: 100, max: 200,
+      readings: Array.isArray(s.readings)
+        ? padTo3(s.readings, newSaniReading).map((r) => ({ id: r.id || uid(), ppm: r.ppm ?? null, date: r.date || "", time: r.time || "" }))
+        : padTo3([{ id: uid(), ppm: s.ppm ?? null, date: s.date || "", time: s.time || "" }], newSaniReading),
+    })),
+  };
+};
+const defaultDay = () => ({ params: DEFAULTS, slots: DEFAULT_SLOTS.map((s) => ({ ...s, draft: cloneRecipe(s.draft) })), maxBatch: 19000, ambientTemp: 21, starterTemp: 21, feedMode: "auto", feedTime: "21:00", stagger: 45, offsets: [0, 45, 90, 135], startTime: "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, rentalHours: 0, rentalRate: null, soldLoaves: {}, costLock: null, deduction: null, doneBatches: [], foodSafety: defaultFoodSafety(), mixWaterTemp: null, calcInputs: null, helpChats: {}, mixerId: null, ovenId: null });
+const newDayEntry = (name, day) => ({ id: uid(), name: name || "New run", date: todayISO(), updatedAt: Date.now(), complete: false, day: day || defaultDay() });
+
+// Buffered text field: keeps a local value so the cursor/focus survives the
+// big parent re-render that each keystroke triggers; still commits upward live.
+function RecipeAssistPanel({ draft, hasExisting, onApplyFull, onApplyPatch }) {
+  const [instruction, setInstruction] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState(null); // { mode, recipe?, changes?, rationale }
+  const [open, setOpen] = useState(false);
+
+  const run = async () => {
+    const text = instruction.trim();
+    if (!text || busy) return;
+    setBusy(true); setError(""); setResult(null);
+    try {
+      const mode = hasExisting ? "edit" : "create";
+      const body = mode === "edit" ? { mode, instruction: text, recipe: draft } : { mode, instruction: text };
+      const resp = await fetch("/api/recipe-assist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await resp.json();
+      if (!resp.ok || data.error) { setError(data.error || ("Request failed (" + resp.status + ")")); setBusy(false); return; }
+      setResult(data);
+    } catch (e) {
+      setError(e && e.message ? e.message : "Something went wrong talking to Claude.");
+    }
+    setBusy(false);
+  };
+
+  const apply = () => {
+    if (!result) return;
+    if (result.mode === "create" && result.recipe) onApplyFull(result.recipe);
+    else if (result.mode === "edit" && result.changes) onApplyPatch(result.changes);
+    setResult(null); setInstruction("");
+  };
+  const discard = () => { setResult(null); };
+
+  // readable diff rows for edit mode: field -> before / after
+  const diffRows = (result && result.mode === "edit" && result.changes)
+    ? Object.keys(result.changes).map((k) => ({
+        key: k,
+        before: JSON.stringify(draft ? draft[k] : undefined),
+        after: JSON.stringify(result.changes[k]),
+      }))
+    : null;
+
+  return (
+    <div className="bl-ai-recipe">
+      <button className="bl-ai-recipe-toggle" onClick={() => setOpen((o) => !o)} type="button">
+        <span className="bl-ai-dot" aria-hidden="true" />
+        {open ? "Hide Claude" : (hasExisting ? "Ask Claude to change this recipe" : "Ask Claude to draft this recipe")}
+      </button>
+      {open && (
+        <div className="bl-ai-recipe-body">
+          <textarea
+            className="bl-ai-recipe-input"
+            rows={2}
+            placeholder={hasExisting
+              ? "e.g. raise hydration to 80% and add 5% rye to the levain"
+              : "e.g. 850g country sourdough, 78% hydration, 20% levain, bakes at 475°F for 40 min with steam"}
+            value={instruction}
+            onChange={(e) => setInstruction(e.target.value)}
+            disabled={busy}
+          />
+          <div className="bl-ai-recipe-actions">
+            <button className="bl-newday" disabled={busy || !instruction.trim()} onClick={run}>
+              {busy ? "Thinking…" : (hasExisting ? "Suggest changes" : "Draft recipe")}
+            </button>
+            {error && <span className="bl-ai-recipe-error">{error}</span>}
+          </div>
+
+          {result && result.mode === "create" && result.recipe && (
+            <div className="bl-ai-recipe-preview">
+              <div className="bl-ai-recipe-rationale">{result.rationale}</div>
+              <div className="bl-ai-recipe-summary">
+                {result.recipe.name} · {result.recipe.loafWeight}g · {result.recipe.water}% water · {result.recipe.levain}% levain
+                {result.recipe.flours && result.recipe.flours.length > 1 ? (" · " + result.recipe.flours.length + " flours") : ""}
+                {result.recipe.scald ? " · scald" : ""}{result.recipe.bassinage ? " · bassinage" : ""}
+              </div>
+              <div className="bl-ai-recipe-note">This replaces every field below with Claude's draft. Review it after applying — nothing saves to your library until you hit Save.</div>
+              <div className="bl-ai-recipe-confirm">
+                <button className="bl-newday" onClick={apply}>Apply to form</button>
+                <button className="bl-back-txt" onClick={discard}>Discard</button>
+              </div>
+            </div>
+          )}
+
+          {result && result.mode === "edit" && diffRows && (
+            <div className="bl-ai-recipe-preview">
+              <div className="bl-ai-recipe-rationale">{result.rationale}</div>
+              <div className="bl-ai-recipe-diff">
+                {diffRows.map((row) => (
+                  <div className="bl-ai-diff-row" key={row.key}>
+                    <span className="bl-ai-diff-field">{row.key}</span>
+                    <span className="bl-ai-diff-before">{row.before}</span>
+                    <span className="bl-ai-diff-arrow">→</span>
+                    <span className="bl-ai-diff-after">{row.after}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="bl-ai-recipe-note">Only the fields above change. Nothing saves to your library until you hit Save.</div>
+              <div className="bl-ai-recipe-confirm">
+                <button className="bl-newday" onClick={apply}>Apply changes</button>
+                <button className="bl-back-txt" onClick={discard}>Discard</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BufferedInput({ value, onCommit, className, placeholder, rows }) {
+  const [v, setV] = useState(value == null ? "" : value);
+  const last = useRef(value == null ? "" : value);
+  useEffect(() => { const nv = value == null ? "" : value; if (nv !== last.current) { last.current = nv; setV(nv); } }, [value]);
+  const handle = (e) => { const nv = e.target.value; last.current = nv; setV(nv); onCommit(nv); };
+  return rows
+    ? <textarea className={className} rows={rows} placeholder={placeholder} value={v} onChange={handle} />
+    : <input className={className} placeholder={placeholder} value={v} onChange={handle} />;
+}
+
+// IngredientInput: clears on focus for typing; the dropdown lists pantry ingredients for this kind of field, A to Z.
+// `ingredients` is a list of { id, name, group }. Inclusion fields show group headings. A name the baker actually typed
+// (not one picked, not a default like "Flour 2") is handed to onNewName when the field loses focus.
+function IngredientInput({ value, onCommit, className, placeholder, ingredients, kind = "flour", onNewName }) {
+  const [v, setV] = useState(value == null ? "" : value);
+  const [open, setOpen] = useState(false);
+  const [browse, setBrowse] = useState(false);
+  const last = useRef(value == null ? "" : value);
+  const dirty = useRef(false);
+  const wrapRef = useRef(null);
+  useEffect(() => { const nv = value == null ? "" : value; if (nv !== last.current) { last.current = nv; setV(nv); } }, [value]);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", close); return () => document.removeEventListener("mousedown", close);
+  }, [open]);
+  const commit = (nv) => { last.current = nv; dirty.current = false; setV(nv); onCommit(nv); setOpen(false); };
+  const groups = KIND_GROUPS[kind] || KIND_GROUPS.flour;
+  const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+  const pool = (ingredients || []).filter((i) => i.name && groups.indexOf(validGroup(i.group)) !== -1).sort(byName);
+  const filtered = (browse || !v) ? pool : pool.filter((i) => i.name.toLowerCase().includes(v.toLowerCase()));
+  const noun = kind === "inclusion" ? "inclusions" : kind === "liquid" ? "liquids" : "flours";
+  const row = (i) => <div key={i.id} className="bl-ingdrop-item" onMouseDown={(e) => e.preventDefault()} onClick={() => commit(i.name)}>{i.name}</div>;
+  return (
+    <div className="bl-ingwrap" ref={wrapRef}>
+      <input className={className} value={v} placeholder={placeholder}
+        onFocus={(e) => { setBrowse(true); e.target.select(); }}
+        onBlur={() => {
+          setTimeout(() => { if (document.activeElement !== wrapRef.current) setOpen(false); }, 150);
+          if (!v.trim()) { setV(last.current); return; }
+          if (dirty.current && onNewName && !/^(flour|inclusion|liquid)\s*\d*$/i.test(v.trim())) onNewName(v.trim(), kind);
+          dirty.current = false;
+        }}
+        onChange={(e) => { dirty.current = true; setV(e.target.value); setBrowse(false); onCommit(e.target.value); }} />
+      <button className="bl-ingdrop-btn" type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => { setBrowse(true); setOpen((o) => !o); }}>▾</button>
+      {open && (
+        <div className="bl-ingdrop">
+          {filtered.length === 0 ? <div className="bl-ingdrop-empty">No saved {noun}{(v && !browse) ? " matching" : " yet"} — add them in the Pantry tab</div>
+            : groups.length === 1 ? filtered.map(row)
+            : groups.map((g) => { const items = filtered.filter((i) => validGroup(i.group) === g); return items.length === 0 ? null : <React.Fragment key={g || "none"}><div className="bl-ingdrop-grp">{groupLabel(g)}</div>{items.map(row)}</React.Fragment>; })}
+        </div>
+      )}
+    </div>
+  );
+}
+const otherFlourSum = (t) => t.flours.slice(1).reduce((a, f) => a + (+f.pct || 0), 0);
+const mainPct = (t) => Math.max(0, 100 - otherFlourSum(t));
+const trueHydration = (t) => {
+  const liq = (t.liquids || []).reduce((a, l) => a + (+l.pct || 0) * ((+l.factor || 100) / 100), 0);
+  const lev = +t.levain || 0, lh = +t.levHyd || 80, den = 100 + lh;
+  const levFlour = den > 0 ? lev * 100 / den : 0;
+  const levWater = den > 0 ? lev * lh / den : 0;
+  const totalFlour = 100 + levFlour;
+  const totalWater = (+t.water || 0) + liq + levWater;
+  return totalFlour > 0 ? (totalWater / totalFlour) * 100 : 0;
+};
+// Exact inverse of trueHydration: the water % (of flour) that makes the dough land on `target` true hydration,
+// given this recipe's levain % / levain hydration / liquids. Rounded to 0.1. Negative = target unreachable
+// (levain + liquids alone already exceed it).
+const waterForTargetHydration = (t, target) => {
+  const liq = (t.liquids || []).reduce((a, l) => a + (+l.pct || 0) * ((+l.factor || 100) / 100), 0);
+  const lev = +t.levain || 0, lh = +t.levHyd || 80, den = 100 + lh;
+  const levFlour = den > 0 ? lev * 100 / den : 0;
+  const levWater = den > 0 ? lev * lh / den : 0;
+  return Math.round((target * (100 + levFlour) / 100 - liq - levWater) * 10) / 10;
+};
+// Readout + "solve water for a target" control. Used in the recipe editor and on each Plan card.
+function HydrationLine({ t, onSetWater }) {
+  const [target, setTarget] = useState("");
+  const hyd = Math.round(trueHydration(t) * 10) / 10;
+  const tg = parseFloat(target);
+  const need = isFinite(tg) && tg > 0 ? waterForTargetHydration(t, tg) : null;
+  const unreachable = need !== null && need < 0;
+  const same = need !== null && Math.abs(need - (+t.water || 0)) < 0.05;
+  return (
+    <div className="bl-hyd-readout">
+      <span>True hydration <b>{hyd}%</b><span className="bl-hyd-note">incl. levain @ {+t.levHyd || 80}%</span></span>
+      <span className="bl-hyd-solve">
+        <input type="number" min="0" step="0.5" value={target} placeholder="target %" onChange={(e) => setTarget(e.target.value)} />
+        {need !== null && (unreachable ? <span className="bl-hyd-need bad">unreachable — levain alone is over</span> : <span className="bl-hyd-need">→ water {need}%</span>)}
+        <button disabled={need === null || unreachable || same} onClick={() => { onSetWater(need); setTarget(""); }}>Set water</button>
+      </span>
+    </div>
+  );
+}
+const RECIPE_FORMULA_KEYS = ["name","loafWeight","shape","water","salt","levain","levHyd","levInoc","levRefInoc","levBuildHrs","levRefTemp","levWhole","levExpNote","ddt","bakeTemp","bakeMin","steamMin","autolyse","calNote","bassinage","bassinagePct"];
+const sameIngList = (x, y, skipFirstPct) => {
+  const xs = x || [], ys = y || [];
+  if (xs.length !== ys.length) return false;
+  for (let i = 0; i < xs.length; i++) {
+    if ((xs[i].name || "") !== (ys[i].name || "")) return false;
+    if (!(skipFirstPct && i === 0) && (+xs[i].pct || 0) !== (+ys[i].pct || 0)) return false;
+    if (cleanWhen(xs[i].when) !== cleanWhen(ys[i].when)) return false;
+  }
+  return true;
+};
+const sameLiqList = (xs, ys) => {
+  xs = xs || []; ys = ys || [];
+  if (xs.length !== ys.length) return false;
+  for (let i = 0; i < xs.length; i++) {
+    if ((xs[i].name || "") !== (ys[i].name || "")) return false;
+    if ((+xs[i].pct || 0) !== (+ys[i].pct || 0) || (+xs[i].factor || 0) !== (+ys[i].factor || 0)) return false;
+    if (cleanWhen(xs[i].when) !== cleanWhen(ys[i].when)) return false;
+  }
+  return true;
+};
+const sameFormula = (a, b) => {
+  if (!a || !b) return false;
+  for (const k of RECIPE_FORMULA_KEYS) { if (String(a[k] ?? "") !== String(b[k] ?? "")) return false; }
+  if ((+a.levSugar || 0) !== (+b.levSugar || 0)) return false;
+  if ((+a.levSugar || 0) > 0 && normName(levSugarName(a)) !== normName(levSugarName(b))) return false;
+  return sameIngList(a.flours, b.flours, true) && sameIngList(a.inclusions, b.inclusions, false) && sameLiqList(a.liquids, b.liquids) && JSON.stringify(scaldKeyPart(a)) === JSON.stringify(scaldKeyPart(b));
+};
+const flourPctOf = (t, idx) => (idx === 0 ? mainPct(t) : (+t.flours[idx].pct || 0));
+
+// ---- scald / tangzhong / yudane ------------------------------------------
+// A scald is CARVED OUT of the recipe's existing flour and water (like bassinage): total flour and total hydration are
+// exactly what the recipe says, only how it is mixed changes. Scald flour comes from one flour line; scald liquid from
+// the water (or one liquid line). Values are clamped to what the recipe actually has, with a warning.
+const scaldKeyPart = (r) => (r && r.scald) ? [normName(r.scaldFlour), +r.scaldPct || 0, +r.scaldHyd || 0, normName(r.scaldLiquid) || "water", r.scaldMethod === "poured" ? "poured" : "cooked"] : null;
+const scaldInfo = (t) => {
+  const none = { enabled: false, on: false, warns: [] };
+  if (!t || !t.scald || !(t.flours && t.flours.length)) return none;
+  const rd = (x) => Math.round(x * 10) / 10;
+  const flours = t.flours, liquids = t.liquids || [], warns = [];
+  let flourIdx = 0;
+  if (t.scaldFlour) {
+    const k = flours.findIndex((f) => normName(f.name) === normName(t.scaldFlour));
+    if (k >= 0) flourIdx = k; else warns.push("“" + t.scaldFlour + "” isn’t a flour in this recipe, so " + flours[0].name + " is used.");
+  }
+  const flourName = flours[flourIdx].name, flourPct = flourPctOf(t, flourIdx);
+  const wantSf = Math.max(0, +t.scaldPct || 0), sf = Math.min(wantSf, flourPct);
+  if (wantSf > flourPct + 1e-9) warns.push("Only " + rd(flourPct) + "% " + flourName + " in the recipe — scald flour limited to that.");
+  const hyd = Math.max(0, +t.scaldHyd || 0), wantS = sf * hyd / 100;
+  let liqIdx = -1;
+  if (t.scaldLiquid && normName(t.scaldLiquid) !== "water") {
+    liqIdx = liquids.findIndex((l) => normName(l.name) === normName(t.scaldLiquid));
+    if (liqIdx < 0) warns.push("“" + t.scaldLiquid + "” isn’t a liquid in this recipe, so water is used.");
+  }
+  const isWater = liqIdx < 0, liquidName = isWater ? "Water" : liquids[liqIdx].name;
+  const avail = isWater ? (+t.water || 0) : (+liquids[liqIdx].pct || 0);
+  const S = Math.min(wantS, avail);
+  if (wantS > avail + 1e-9) warns.push("The scald needs " + rd(wantS) + "% " + liquidName.toLowerCase() + " but the recipe only has " + rd(avail) + "% — limited to that. Lower the scald % or its water ratio.");
+  const on = sf > 0 && S > 0;
+  if (!on && !warns.length) warns.push("Set the scald flour % and the water ratio above 0.");
+  return { enabled: true, on, flourIdx, flourName, flourPct, sf, hyd, wantS, avail, S, liqIdx, isWater, liquidName, method: t.scaldMethod === "poured" ? "poured" : "cooked", warns };
+};
+
+// Sugar added to the levain build (e.g. a sweet stiff levain): % of the levain's feed flour, ON TOP of any sugar in the dough. It becomes its own line
+// ("lsg") so dough weight, costing and the shopping list count it, but at the bench it is weighed as part of the levain (see benchLines).
+const levSugarName = (t) => (String(t.levSugarName || "").trim() || "Granulated sugar");
+const levSugarPct = (t) => {
+  const S = Math.max(0, +t.levSugar || 0), lev = +t.levain || 0;
+  if (!(S > 0) || !(lev > 0)) return 0;
+  const H = +t.levHyd || 80, I = Math.max(0.1, +t.levInoc || 10);
+  return lev * (S / 100) / (1 + H / 100 + I / 100);
+};
+const ingLines = (t) => {
+  const sc = scaldInfo(t);
+  const L = [];
+  t.flours.forEach((f, i) => L.push({ key: "fl_" + f.id, name: f.name, pct: Math.max(0, flourPctOf(t, i) - (sc.on && i === sc.flourIdx ? sc.sf : 0)) }));
+  if (sc.on) L.push({ key: "scf", name: "Scald flour (" + sc.flourName + ")", matchName: sc.flourName, pct: sc.sf });
+  const wTot = Math.max(0, (+t.water || 0) - (sc.on && sc.isWater ? sc.S : 0)); // water that goes into the MAIN mix
+  const bPct = t.bassinage ? Math.max(0, Math.min(50, +t.bassinagePct || 0)) : 0;
+  if (bPct > 0) {
+    const bW = wTot * bPct / 100;
+    L.push({ key: "water", name: "Water (main)", pct: wTot - bW });
+    L.push({ key: "bassinage", name: "Bassinage water", pct: bW });
+  } else {
+    L.push({ key: "water", name: "Water", pct: wTot });
+  }
+  if (sc.on && sc.isWater) L.push({ key: "scw", name: "Scald water", pct: sc.S });
+  (t.liquids || []).forEach((l, i) => L.push({ key: "lq_" + l.id, name: l.name, pct: Math.max(0, (+l.pct || 0) - (sc.on && !sc.isWater && i === sc.liqIdx ? sc.S : 0)) }));
+  if (sc.on && !sc.isWater) L.push({ key: "scl", name: "Scald " + sc.liquidName, matchName: sc.liquidName, pct: sc.S });
+  L.push({ key: "salt", name: "Salt", pct: +t.salt || 0 });
+  L.push({ key: "levain", name: "Levain", pct: +t.levain || 0 });
+  { const ls = levSugarPct(t); if (ls > 0) L.push({ key: "lsg", name: "Sugar (in levain)", matchName: levSugarName(t), pct: ls }); }
+  t.inclusions.forEach((f) => L.push({ key: "in_" + f.id, name: f.name, pct: +f.pct || 0 }));
+  return L;
+};
+// Lines as they are weighed at the bench: the levain's sugar goes into the levain you build, so it shows inside the Levain line ("incl. X g sugar"), not on its own.
+const benchLines = (t, b) => ingLines(t).filter((l) => l.pct > 0 && l.key !== "lsg").map((l) => (l.key === "levain" && (b.weights.lsg || 0) > 0 ? { ...l, g: (b.weights.levain || 0) + b.weights.lsg, sugarG: b.weights.lsg } : { ...l, g: b.weights[l.key] }));
+// Scald buffer: cook a little extra so pot loss can't leave the dough short. The dough still takes the exact amount.
+const SCALD_BUF_DEFAULT = 5;
+const BUILD_ID = "2026-11-05 b"; // bump on every delivery: it is shown in the header so the running build is never a guess
+const scaldBufFactor = (t) => (t && t.scaldBuf ? 1 + Math.max(0, +t.scaldBufPct || 0) / 100 : 1);
+// The scald as the baker handles it for one batch: what goes into the dough (flour + liquid, already prepped) and what to cook (that plus the buffer).
+const scaldAmounts = (t, b) => {
+  const sc = scaldInfo(t); if (!sc.on) return null;
+  const fl = b.weights.scf || 0, lq = (sc.isWater ? b.weights.scw : b.weights.scl) || 0, k = scaldBufFactor(t);
+  return { sc, fl, lq, dough: fl + lq, cookFl: fl * k, cookLq: lq * k, buf: k > 1 ? Math.round((k - 1) * 1000) / 10 : 0 };
+};
+
+// id-independent signature of a formula, with main flour normalized
+const formulaKey = (r) => JSON.stringify({
+  lw: +r.loafWeight, sh: r.shape || "round", w: +r.water, s: +r.salt, lv: +r.levain,
+  lh: +r.levHyd || 80, li: +r.levInoc || 10, ri: +r.levRefInoc || 10, lb: +r.levBuildHrs || 5, lr: +r.levRefTemp || 24, lwh: +r.levWhole || 0, ls: +r.levSugar || 0, ln: (+r.levSugar || 0) > 0 ? normName(levSugarName(r)) : "", lxn: r.levExpNote || "", bt: +r.bakeTemp || 245, bm: +r.bakeMin || 45, sm: +r.steamMin || 20, au: +r.autolyse || 45, cn: r.calNote || "",
+  fl: r.flours.map((f, i) => [f.name, i === 0 ? mainPct(r) : +f.pct || 0]),
+  inc: r.inclusions.map((f) => [f.name, +f.pct || 0]),
+  lq: (r.liquids || []).map((l) => [l.name, +l.pct || 0, +l.factor || 100]),
+  bs: !!r.bassinage, bp: +r.bassinagePct || 0, sd: scaldKeyPart(r),
+});
+
+// signature of the base dough only (flours + hydration + salt + levain build + autolyse + DDT); inclusions / loaf weight / shape / bake ignored
+const baseDoughKey = (r) => JSON.stringify({
+  w: +r.water || 0, s: +r.salt || 0, lv: +r.levain || 0,
+  lh: +r.levHyd || 80, li: +r.levInoc || 10, ri: +r.levRefInoc || 10, lb: +r.levBuildHrs || 5, lr: +r.levRefTemp || 24, lwh: +r.levWhole || 0, ls: +r.levSugar || 0, ln: (+r.levSugar || 0) > 0 ? normName(levSugarName(r)) : "",
+  au: +r.autolyse || 45, dt: Math.round((+r.ddt || DDT_DEFAULT_C) * 10) / 10,
+  fl: r.flours.map((f, i) => [f.name, i === 0 ? mainPct(r) : +f.pct || 0]),
+  lq: (r.liquids || []).map((l) => [l.name, +l.pct || 0, +l.factor || 100]),
+  bs: !!r.bassinage, bp: +r.bassinagePct || 0, sd: scaldKeyPart(r),
+});
+
+const buildStages = (p) => {
+  const s = [];
+  s.push({ name: "Autolyse", min: +p.autolyse, active: false });
+  s.push({ name: "Mix", min: +p.mix, active: true });
+  for (let i = 1; i <= +p.folds; i++) { s.push({ name: "Rest", min: +p.restBetween, active: false }); s.push({ name: `Fold ${i}`, min: +p.fold, active: true }); }
+  s.push({ name: "Bulk rest", min: +p.bulkRest, active: false });
+  s.push({ name: "Pre-shape", min: +p.preShape, active: true });
+  s.push({ name: "Bench rest", min: +p.benchRest, active: false });
+  s.push({ name: "Shape", min: +p.shape, active: true });
+  return s;
+};
+
+const parseTime = (hhmm) => { const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; };
+const fmtClock = (t) => { const x = ((Math.round(t) % 1440) + 1440) % 1440; let h = Math.floor(x / 60); const m = x % 60; const ap = h >= 12 ? "p" : "a"; h = h % 12; if (h === 0) h = 12; return `${h}:${String(m).padStart(2, "0")}${ap}`; };
+const fmtDur = (min) => { const t = Math.round(+min || 0); if (t < 60) return `${t}m`; const h = Math.floor(t / 60), m = t % 60; return m ? `${h}h ${m}m` : `${h}h`; };
+const fmtG = (x) => { if (!x) return "—"; const v = Math.round(x * 10) / 10; return v >= 10 ? String(Math.round(v)) : String(v); };
+const fmtKg = (g) => (g / 1000).toFixed(2) + "kg";
+const fmtTemp = (c) => (Math.round(c * 10) / 10) + "°C";
+const fmtWt = (g) => (g >= 1000 ? (g / 1000).toFixed(2) + " kg" : Math.round(g) + " g");
+// Egg conversions: grams of shelled egg per unit (large whole egg 50 g, yolk 18 g, white 33 g). Shell colour does not change the weight.
+const EGG_G = { whole: 50, yolk: 18, white: 33 };
+const eggCount = (name, g) => {
+  const n = String(name || "").toLowerCase();
+  if (!(g > 0) || !/\beggs?\b|\byolks?\b/.test(n) || /eggplant|egg wash/.test(n)) return "";
+  const kind = /\byolks?\b/.test(n) ? "yolk" : /\bwhites?\b/.test(n) ? "white" : "whole";
+  const q = g / EGG_G[kind];
+  const txt = q >= 10 ? String(Math.round(q)) : (Math.round(q * 10) / 10).toString();
+  const one = Math.abs(q - 1) < 0.05;
+  return "\u2248 " + txt + " " + (kind === "whole" ? (one ? "large egg" : "large eggs") : kind === "yolk" ? (one ? "yolk" : "yolks") : (one ? "white" : "whites"));
+};
+const fmtDelta = (m) => (m <= 0 ? "now" : m < 60 ? m + " min" : fmtDur(m));
+const DOUGH_DENSITY = 1.1; // g/mL
+const BULK_HEADROOM = 2.2; // vessel volume vs dough volume
+const vesselLiters = (g) => Math.ceil((g / DOUGH_DENSITY) * BULK_HEADROOM / 1000);
+const CAT_ORDER = { flour: 0, liquid: 1, inc: 2 };
+const LIVE_PX = 4, LIVE_LABEL = 96, LIVE_ROW = 46, LIVE_AXIS = 22;
+
+const TIMER_PHASES = [
+  { key: "autolyse", label: "Autolyse", short: "Autolyse" },
+  { key: "postmix", label: "Post-mix Rest", short: "Rest" },
+  { key: "sf1", label: "Stretch & Fold 1", short: "S&F 1" },
+  { key: "sf2", label: "Stretch & Fold 2", short: "S&F 2" },
+  { key: "sf3", label: "Stretch & Fold 3", short: "S&F 3" },
+  { key: "sf4", label: "Stretch & Fold 4", short: "S&F 4" },
+  { key: "bulk", label: "Bulk Ferment", short: "Bulk" },
+];
+const phLabel = (ph) => { const p = TIMER_PHASES.find((x) => x.key === ph); return p ? p.label : ph; };
+const fmtMMSS = (ms) => { if (ms < 0) ms = 0; const t = Math.round(ms / 1000); const m = Math.floor(t / 60), ss = t % 60; return m + ":" + String(ss).padStart(2, "0"); };
+
+function TimerTab({ batches, types, params, dayId }) {
+  const SKEY = "bakelab-timers-v1:" + (dayId || "none");
+  const [timers, setTimers] = useState({});
+  const [durs, setDurs] = useState(() => ({ postmix: +params.restBetween || 50, sf1: +params.restBetween || 50, sf2: +params.restBetween || 50, sf3: +params.restBetween || 50, sf4: +params.restBetween || 50, bulk: +params.bulkRest || 90 }));
+  const [custom, setCustom] = useState([]);
+  const [, setTick] = useState(0);
+  const acRef = useRef(null), beepRef = useRef(null), wakeRef = useRef(null);
+
+  useEffect(() => { try { const raw = localStorage.getItem(SKEY); if (raw) { const o = JSON.parse(raw); setTimers(o && o.timers ? o.timers : {}); if (o && o.durs) setDurs((d) => ({ ...d, ...o.durs })); setCustom(o && Array.isArray(o.custom) ? o.custom : []); } else { setTimers({}); setCustom([]); } } catch (e) { setTimers({}); } }, [SKEY]);
+  useEffect(() => { try { localStorage.setItem(SKEY, JSON.stringify({ timers, durs, custom })); } catch (e) {} }, [SKEY, timers, durs, custom]);
+
+  const hasTimers = Object.keys(timers).length > 0;
+  useEffect(() => { if (!hasTimers) return; const id = setInterval(() => setTick((t) => t + 1), 1000); return () => clearInterval(id); }, [hasTimers]);
+
+  const ensureAudio = () => { try { if (!acRef.current) acRef.current = new (window.AudioContext || window.webkitAudioContext)(); if (acRef.current.state === "suspended") acRef.current.resume(); } catch (e) {} };
+  const beep = () => { const ac = acRef.current; if (!ac) return; try { const o = ac.createOscillator(), g = ac.createGain(); o.type = "square"; o.frequency.value = 880; o.connect(g); g.connect(ac.destination); const t = ac.currentTime; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.32, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.34); o.start(t); o.stop(t + 0.36); } catch (e) {} };
+
+  const now = Date.now();
+  const entries = Object.entries(timers).map(([k, v]) => { const p = k.split(":"); return { k, bi: +p[0], ph: p[1], end: v.end, dur: v.dur, remaining: v.end - now, done: now >= v.end }; });
+  const ringing = entries.some((e) => e.done);
+  useEffect(() => { if (!ringing) { if (beepRef.current) { clearInterval(beepRef.current); beepRef.current = null; } return; } beep(); const id = setInterval(beep, 1100); beepRef.current = id; return () => { clearInterval(id); beepRef.current = null; }; }, [ringing]);
+
+  useEffect(() => {
+    const acquire = async () => { try { if (hasTimers && "wakeLock" in navigator && document.visibilityState === "visible") wakeRef.current = await navigator.wakeLock.request("screen"); } catch (e) {} };
+    const onVis = () => { if (document.visibilityState === "visible" && hasTimers) acquire(); };
+    if (hasTimers) acquire();
+    document.addEventListener("visibilitychange", onVis);
+    return () => { document.removeEventListener("visibilitychange", onVis); try { if (wakeRef.current) { wakeRef.current.release(); wakeRef.current = null; } } catch (e) {} };
+  }, [hasTimers]);
+
+  const allPhases = TIMER_PHASES.concat(custom.map((c) => ({ key: c.key, label: c.label, short: c.label })));
+  const labelOf = (ph) => { const p = allPhases.find((x) => x.key === ph); return p ? p.label : ph; };
+  const phaseDur = (ph) => { if (ph in durs) return durs[ph] || 0; const c = custom.find((x) => x.key === ph); return c ? (+c.dur || 0) : 0; };
+  const durFor = (b, ph) => ph === "autolyse" ? (+((types[b.ti] && types[b.ti].autolyse)) || +params.autolyse || 45) : phaseDur(ph);
+  const addCustom = () => setCustom((c) => [...c, { key: "c" + Date.now(), label: "Custom " + (c.length + 1), dur: 20 }]);
+  const removeCustom = (key) => { setCustom((c) => c.filter((x) => x.key !== key)); setTimers((t) => { const n = {}; for (const k in t) { if (!k.endsWith(":" + key)) n[k] = t[k]; } return n; }); };
+  const setCustomLabel = (key, label) => setCustom((c) => c.map((x) => x.key === key ? { ...x, label } : x));
+  const setCustomDur = (key, dur) => setCustom((c) => c.map((x) => x.key === key ? { ...x, dur } : x));
+  const start = (bi, ph) => { ensureAudio(); const m = durFor(batches[bi], ph); if (m <= 0) return; setTimers((t) => { const n = {}; for (const k in t) { if (!k.startsWith(bi + ":")) n[k] = t[k]; } n[bi + ":" + ph] = { end: Date.now() + m * 60000, dur: m * 60000 }; return n; }); };
+  const cancel = (k) => setTimers((t) => { const n = { ...t }; delete n[k]; return n; });
+  const nextPhase = (ph) => { const nF = +params.folds || 4; let ni = allPhases.findIndex((p) => p.key === ph) + 1; while (ni < allPhases.length) { const p = allPhases[ni]; const mm = p.key.match(/^sf(\d)$/); if ((mm && +mm[1] > nF) || phaseDur(p.key) <= 0) { ni++; continue; } return p; } return null; };
+
+  const active = entries.filter((e) => !e.done).sort((a, b) => a.remaining - b.remaining);
+  const done = entries.filter((e) => e.done);
+
+  if (!batches.length) return <div className="bl-panel"><div className="bl-timer-empty">No batches yet — set loaves on the Plan tab first.</div></div>;
+
+  return (<>
+    {done.length > 0 && (
+      <div className="bl-panel bl-timer-done">
+        {done.map((e) => { const np = nextPhase(e.ph); return (
+          <div className="td-row" key={e.k}>
+            <div className="td-info"><span className="td-b">B{e.bi + 1}</span><span className="td-ph">{labelOf(e.ph)}</span><span className="td-done">DONE</span></div>
+            <div className="td-acts">
+              {np && <button className="td-next" onClick={() => { start(e.bi, np.key); cancel(e.k); }}>Start {np.label} ▶</button>}
+              <button className="td-stop" onClick={() => cancel(e.k)}>{np ? "Stop" : "Stop ✓"}</button>
+            </div>
+          </div>
+        ); })}
+      </div>
+    )}
+    <div className="bl-panel">
+      <h3>Active timers</h3>
+      {active.length === 0 ? <div className="bl-timer-empty">No timers running. Start one below.</div> : (
+        <div className="bl-timer-active">
+          {active.map((e) => { const pct = Math.max(0, Math.min(100, 100 * (1 - e.remaining / e.dur))); return (
+            <div className="ta-card" key={e.k}>
+              <div className="ta-top"><span className="ta-b">B{e.bi + 1}</span><span className="ta-ph">{labelOf(e.ph)}</span></div>
+              <div className="ta-time">{fmtMMSS(e.remaining)}</div>
+              <div className="ta-bar"><div className="ta-fill" style={{ width: pct + "%" }} /></div>
+              <button className="ta-cancel" onClick={() => cancel(e.k)}>Cancel</button>
+            </div>
+          ); })}
+        </div>
+      )}
+    </div>
+    <div className="bl-panel">
+      <h3>Start a timer</h3>
+      <div className="bl-timer-durnote">Autolyse pulls from each recipe. Set the rest here — they apply to every batch. Set any phase to <b>0</b> to skip it (Next jumps past it).</div>
+      <div className="bl-timer-durs">
+        {["postmix", "sf1", "sf2", "sf3", "sf4", "bulk"].map((ph) => (
+          <label key={ph} className="dur-cell"><span>{labelOf(ph)}</span><input type="number" min="0" value={durs[ph]} onChange={(e) => setDurs((d) => ({ ...d, [ph]: Math.max(0, Math.floor(Number(e.target.value) || 0)) }))} /></label>
+        ))}
+        {custom.map((c) => (
+          <div key={c.key} className="dur-cell dur-custom">
+            <input className="dur-label" value={c.label} placeholder="Phase name" onChange={(e) => setCustomLabel(c.key, e.target.value)} />
+            <div className="dur-cw"><input type="number" min="0" value={c.dur} onChange={(e) => setCustomDur(c.key, Math.max(0, Math.floor(Number(e.target.value) || 0)))} /><button className="dur-x" title="Remove phase" onClick={() => removeCustom(c.key)}>×</button></div>
+          </div>
+        ))}
+      </div>
+      <button className="bl-addphase" onClick={addCustom}>+ Add phase timer</button>
+      <div className="bl-timer-grid">
+        {batches.map((b, bi) => (
+          <div className="tg-row" key={bi}>
+            <div className="tg-bn"><span className="tg-b">B{bi + 1}</span><span className="tg-nm">{b.name}</span></div>
+            <div className="tg-cells">
+              {allPhases.map((p) => { const k = bi + ":" + p.key; const tm = timers[k]; const run = tm && Date.now() < tm.end; const rng = tm && Date.now() >= tm.end; const m = durFor(b, p.key); return (
+                <button key={p.key} className={"tg-cell" + (run ? " running" : "") + (rng ? " ringing" : "")} onClick={() => (run ? cancel(k) : start(bi, p.key))} disabled={m <= 0}>
+                  <span className="tg-ph">{p.short}</span>
+                  <span className="tg-d">{run ? fmtMMSS(tm.end - Date.now()) : rng ? "done" : m <= 0 ? "skip" : m + "m"}</span>
+                </button>
+              ); })}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="bl-note">Tap a phase to start its countdown; tap a running phase to cancel it. Timers run off the clock, so they stay accurate through a screen-off or tab switch, and the screen is held awake while any timer is running. The alarm sounds while BakeLab is open on this device.</div>
+    </div>
+  </>);
+}
+
+export default function App() {
+  const [params, setParams] = useState(DEFAULTS);
+  const [library, setLibrary] = useState(DEFAULT_LIBRARY); // kept for migration compat in globals load only
+  const [coreRecipes, setCoreRecipes] = useState(DEFAULT_LIBRARY);
+  const [remixes, setRemixes] = useState([]);
+  const [ingredients, setIngredients] = useState([]);
+  const [starter, setStarter] = useState(DEFAULT_STARTER);
+  const patchStarter = (patch) => setStarter((s) => ({ ...s, ...patch }));
+  const patchStarterMFlour = (idx, patch) => setStarter((s) => { const f = [...(s.mFlour || [])]; f[idx] = { ...f[idx], ...patch }; return { ...s, mFlour: f }; });
+  const addStarterMFlour = () => setStarter((s) => ({ ...s, mFlour: [...(s.mFlour || []), { id: uid(), name: "Flour", pct: 0 }] }));
+  const removeStarterMFlour = (idx) => setStarter((s) => ({ ...s, mFlour: (s.mFlour || []).filter((_, i) => i !== idx) }));
+  const patchStarterHydCal = (idx, patch) => setStarter((s) => { const c = [...(s.hydCal || [])]; c[idx] = { ...c[idx], ...patch }; return { ...s, hydCal: c }; });
+  const patchStarterWholeCal = (idx, patch) => setStarter((s) => { const c = [...(s.wholeCal || [])]; c[idx] = { ...c[idx], ...patch }; return { ...s, wholeCal: c }; });
+  const markFedToday = () => setStarter((s) => ({ ...s, lastFed: todayISO() }));
+  const [homeTab, setHomeTab] = useState("bakedays");
+  const [builderView, setBuilderView] = useState("list"); // "list" | "edit"
+  const [editingRecipeId, setEditingRecipeId] = useState(null);
+  const [editingIsRemix, setEditingIsRemix] = useState(false);
+  const [editingDraft, setEditingDraft] = useState(null);
+  const [slots, setSlots] = useState(DEFAULT_SLOTS);
+  const [maxBatch, setMaxBatch] = useState(19000);
+  const [equipment, setEquipment] = useState(DEFAULT_EQUIPMENT); // shared across runs
+  const [mixerId, setMixerId] = useState(null); // this run's mixer / oven (null = type the numbers by hand, as before)
+  const [ovenId, setOvenId] = useState(null);
+  const mixer = equipment.mixers.find((x) => x.id === mixerId) || null;
+  const oven = equipment.ovens.find((x) => x.id === ovenId) || null;
+  const mixerFlourCapG = mixer ? eqNum(mixer.flourKg) * 1000 : 0;
+  const [ambientTemp, setAmbientTemp] = useState(21);
+  const [starterTemp, setStarterTemp] = useState(21);
+  const [inocCal, setInocCal] = useState([{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 6.5 }]);
+  const setCal = (idx, key, v) => setInocCal((c) => c.map((p, i) => (i === idx ? { ...p, [key]: Math.max(0, Number(v) || 0) } : p)));
+  const inocResp = useMemo(() => {
+    const a = inocCal[0] || {}, b = inocCal[1] || {};
+    const i1 = +a.inoc, t1 = +a.hrs, i2 = +b.inoc, t2 = +b.hrs;
+    if (i1 > 0 && i2 > 0 && t1 > 0 && t2 > 0 && i1 !== i2) {
+      const slope = (t2 - t1) / Math.log2(i1 / i2);
+      if (isFinite(slope)) return { hrs: Math.max(0, slope), valid: true };
+    }
+    return { hrs: 1.5, valid: false };
+  }, [inocCal]);
+  const inocDoubleHrs = inocResp.hrs;
+  const hydResp = useMemo(() => {
+    const c = (starter.hydCal || []); const a = c[0] || {}, b = c[1] || {};
+    const h1 = +a.hyd, t1 = +a.hrs, h2 = +b.hyd, t2 = +b.hrs;
+    if (h1 > 0 && h2 > 0 && t1 > 0 && t2 > 0 && h1 !== h2) {
+      const slope = (t1 - t2) / Math.log2(h2 / h1);
+      if (isFinite(slope)) return { hrs: Math.max(0, slope), valid: true };
+    }
+    return { hrs: +starter.hydDoubleHrs || 1.2, valid: false };
+  }, [starter.hydCal, starter.hydDoubleHrs]);
+  const wholeResp = useMemo(() => {
+    const c = (starter.wholeCal || []); const a = c[0] || {}, b = c[1] || {};
+    const w1 = +a.whole, t1 = +a.hrs, w2 = +b.whole, t2 = +b.hrs;
+    if (t1 > 0 && t2 > 0 && w1 !== w2) {
+      const slope = (t1 - t2) / ((w2 - w1) / 25);
+      if (isFinite(slope)) return { hrs: Math.max(0, slope), valid: true };
+    }
+    return { hrs: +starter.wholeAccelHrs || 1.5, valid: false };
+  }, [starter.wholeCal, starter.wholeAccelHrs]);
+  const q10 = Math.max(1.05, +starter.q10 || 2);
+  const [tempUnit, setTempUnit] = useState("C");
+  const [feedMode, setFeedMode] = useState("auto");
+  const [levCombine, setLevCombine] = useState(false);
+  const [feedTime, setFeedTime] = useState("21:00");
+  const [stagger, setStagger] = useState(45);
+  const [offsets, setOffsets] = useState([0, 45, 90, 135]);
+  const [startTime, setStartTime] = useState("07:00");
+  const [bakeDateTimes, setBakeDateTimes] = useState({});
+  const [retard, setRetard] = useState({});
+  const [levBuffer, setLevBuffer] = useState({});
+  const [levBufferPct, setLevBufferPct] = useState({});
+  const [doughBuffer, setDoughBuffer] = useState(false);
+  const [doughBufferPct, setDoughBufferPct] = useState(4);
+  const [pantry, setPantry] = useState([]);
+  const [costSettings, setCostSettings] = useState({ rentalRate: 0, levainWhiteId: "", levainWholeId: "" });
+  const [rentalHours, setRentalHours] = useState(0);
+  const [rentalRate, setRentalRate] = useState(null); // null = use the Pantry default rate
+  const [soldLoaves, setSoldLoaves] = useState({});
+  const [costLock, setCostLock] = useState(null);     // { at, result } — frozen analysis for this run
+  const [deduction, setDeduction] = useState(null);   // { at, lines:[{id, qty}] } — what this run took out of stock
+  const [foodSafety, setFoodSafety] = useState(defaultFoodSafety());
+  const addFridge = () => setFoodSafety((fs) => ({ ...fs, fridges: [...fs.fridges, newFridge("Fridge " + (fs.fridges.length + 1))] }));
+  const removeFridge = (fi) => setFoodSafety((fs) => ({ ...fs, fridges: fs.fridges.filter((_, i) => i !== fi) }));
+  const setFridgeName = (fi, name) => setFoodSafety((fs) => ({ ...fs, fridges: fs.fridges.map((f, i) => i === fi ? { ...f, name } : f) }));
+  const setTempVal = (fi, ri, v) => setFoodSafety((fs) => ({ ...fs, fridges: fs.fridges.map((f, i) => i !== fi ? f : { ...f, readings: f.readings.map((r, j) => {
+    if (j !== ri) return r;
+    const empty = v === "" || v == null;
+    const stamp = (!empty && !r.time) ? { date: todayISO(), time: nowHM() } : (empty ? { date: "", time: "" } : {});
+    return { ...r, temp: empty ? null : uToC(Number(v)), ...stamp };
+  }) }) }));
+  const restampTemp = (fi, ri) => setFoodSafety((fs) => ({ ...fs, fridges: fs.fridges.map((f, i) => i !== fi ? f : { ...f, readings: f.readings.map((r, j) => j === ri ? { ...r, date: todayISO(), time: nowHM() } : r) }) }));
+  const setSaniName = (si, name) => setFoodSafety((fs) => ({ ...fs, sanitizers: fs.sanitizers.map((s, i) => i === si ? { ...s, name } : s) }));
+  const setSaniVal = (si, ri, v) => setFoodSafety((fs) => ({ ...fs, sanitizers: fs.sanitizers.map((s, i) => i !== si ? s : { ...s, readings: s.readings.map((r, j) => {
+    if (j !== ri) return r;
+    const empty = v === "" || v == null;
+    const stamp = (!empty && !r.time) ? { date: todayISO(), time: nowHM() } : (empty ? { date: "", time: "" } : {});
+    return { ...r, ppm: empty ? null : Math.max(0, Number(v)), ...stamp };
+  }) }) }));
+  const restampSani = (si, ri) => setFoodSafety((fs) => ({ ...fs, sanitizers: fs.sanitizers.map((s, i) => i !== si ? s : { ...s, readings: s.readings.map((r, j) => j === ri ? { ...r, date: todayISO(), time: nowHM() } : r) }) }));
+  const addSanitizer = () => setFoodSafety((fs) => ({ ...fs, sanitizers: [...fs.sanitizers, newSaniStation("Sani Spray #" + (fs.sanitizers.length))] }));
+  const removeSanitizer = (si) => setFoodSafety((fs) => ({ ...fs, sanitizers: fs.sanitizers.filter((_, i) => i !== si) }));
+  const toggleRetard = (key) => setRetard((r) => ({ ...r, [key]: !r[key] }));
+  const toggleLevBuffer = (key) => setLevBuffer((r) => ({ ...r, [key]: !r[key] }));
+  const setOvenTime = (date, v) => setBakeDateTimes((t) => ({ ...t, [date]: v }));
+  const addSlotSession = (ti) => setSlots((ss) => {
+    const slot = ss[ti]; const last = (slot.sessions || []).slice(-1)[0];
+    const date = last ? addDaysISO(last.date, 1) : addDaysISO(todayISO(), 1);
+    const newLv = Math.max(0, Math.floor(sessionLoaves(slot, 0) / 2));
+    return ss.map((s, i) => (i === ti ? { ...s, sessions: [...(s.sessions || []), { id: uid(), date, loaves: newLv }] } : s));
+  });
+  const removeSlotSession = (ti, si) => setSlots((ss) => ss.map((s, i) => i !== ti ? s : { ...s, sessions: (s.sessions || []).filter((_, j) => j !== si) }));
+  const setSlotSessionDate = (ti, si, date) => setSlots((ss) => ss.map((s, i) => i !== ti ? s : { ...s, sessions: (s.sessions || []).map((sess, j) => j === si ? { ...sess, date } : sess) }));
+  const setSlotSessionLoaves = (ti, si, v) => setSlots((ss) => ss.map((s, i) => i !== ti ? s : { ...s, sessions: (s.sessions || []).map((sess, j) => j === si ? { ...sess, loaves: Math.max(0, Math.floor(Number(v) || 0)) } : sess) }));
+  const handleDayDateChange = (nv) => {
+    if (!nv) return;
+    // mix day drives everything: bake session i lands at mix + (i+1) days
+    const nBake = slots.length ? Math.max(1, ...slots.map((s) => (s.sessions || []).length || 1)) : 1;
+    setSlots((ss) => ss.map((s) => {
+      const sess = (s.sessions && s.sessions.length) ? s.sessions : [{ id: uid(), date: addDaysISO(nv, 1), loaves: 0 }];
+      return { ...s, sessions: sess.map((x, i) => ({ ...x, date: addDaysISO(nv, i + 1) })) };
+    }));
+    setDayDate(nv);
+    setDayName(buildRunName(nv, nBake));
+  };
+  const [drag, setDrag] = useState(null);
+  const [hover, setHover] = useState(null);
+  const [tab, setTab] = useState("plan");
+  const [navShow, setNavShow] = useState(false);
+  const [showCal, setShowCal] = useState(false);
+  const [activeBatch, setActiveBatch] = useState(null);
+  const [doneBatches, setDoneBatches] = useState([]);
+  const [calcOpen, setCalcOpen] = useState(false);
+  const [mixWaterTemp, setMixWaterTemp] = useState(null); // internal °C, null = unset
+  const [aiState, setAiState] = useState({});
+  const [aiLoaves, setAiLoaves] = useState({});
+  const [calcInputs, setCalcInputs] = useState(null); // last calculator inputs, internal °C
+  const [delTarget, setDelTarget] = useState(null); // {id,name,kind} recipe pending delete confirmation
+  const [labelOpen, setLabelOpen] = useState(false);
+  const [mixSheetOpen, setMixSheetOpen] = useState(false);
+  const [mixSheetOff, setMixSheetOff] = useState([]);
+  const [mixSheetOver, setMixSheetOver] = useState({});
+  const [helpChats, setHelpChats] = useState({}); // per batch: [{ role, content, ts, photo? }]
+  const [helpOpen, setHelpOpen] = useState(null);
+  const onMixFit = useCallback((n, over) => setMixSheetOver((st) => (!!st[n] === !!over ? st : { ...st, [n]: !!over })), []);
+  const [labelOffX, setLabelOffX] = useState(0); // calibration nudge, mm
+  const [labelSkip, setLabelSkip] = useState([]); // positions already peeled off sheet 1
+  const [labelCopies, setLabelCopies] = useState({}); // batch index -> copy count (default 1)
+  const [labelOffY, setLabelOffY] = useState(0);
+  const [nowMin, setNowMin] = useState(() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); });
+  useEffect(() => { const id = setInterval(() => { const d = new Date(); setNowMin(d.getHours() * 60 + d.getMinutes()); }, 20000); return () => clearInterval(id); }, []);
+  const tabsRef = useRef(null);
+  const lastScrollY = useRef(0);
+  const [navHidden, setNavHidden] = useState(false);
+  // hide the sticky nav when scrolling down, reveal when scrolling up (mobile)
+  useEffect(() => {
+    const onScroll = () => {
+      const y = window.scrollY || 0;
+      if (y < 150) setNavHidden(false);
+      else if (y > lastScrollY.current + 6) setNavHidden(true);
+      else if (y < lastScrollY.current - 6) setNavHidden(false);
+      lastScrollY.current = y;
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+  // keep the active tab pill centered in the scrolling nav
+  useEffect(() => {
+    const c = tabsRef.current; if (!c) return;
+    const el = c.querySelector(".bl-tab.on"); if (!el) return;
+    const target = el.offsetLeft - (c.clientWidth - el.clientWidth) / 2;
+    c.scrollTo({ left: Math.max(0, target), behavior: "smooth" });
+  }, [tab]);
+  const goTab = (k) => { setTab(k); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
+  const [loaded, setLoaded] = useState(false);
+  const [view, setView] = useState("home");
+  const [days, setDays] = useState([]);
+  const [currentDayId, setCurrentDayId] = useState(null);
+  const [dayName, setDayName] = useState("New run");
+  const [dayDate, setDayDate] = useState(todayISO());
+  const persist = (k, v) => { try { if (typeof window !== "undefined" && window.storage) window.storage.set(k, JSON.stringify(v)); } catch (e) {} };
+  const loadDayVars = (d) => {
+    setParams({ ...DEFAULTS, ...(d.params || {}) });
+    setSlots(normalizeSlots(d.slots));
+    setMaxBatch(typeof d.maxBatch === "number" ? d.maxBatch : 19000);
+    setMixerId(typeof d.mixerId === "string" ? d.mixerId : null); setOvenId(typeof d.ovenId === "string" ? d.ovenId : null);
+    setAmbientTemp(typeof d.ambientTemp === "number" ? d.ambientTemp : 21);
+    setStarterTemp(typeof d.starterTemp === "number" ? d.starterTemp : 21);
+    setFeedMode(d.feedMode === "manual" ? "manual" : "auto");
+    setLevCombine(!!d.levCombine);
+    setFeedTime(typeof d.feedTime === "string" ? d.feedTime : "21:00");
+    setStagger(typeof d.stagger === "number" ? d.stagger : 45);
+    setOffsets(Array.isArray(d.offsets) ? d.offsets : [0, 45, 90, 135]);
+    setStartTime(d.startTime || "07:00");
+    setBakeDateTimes(d.bakeDateTimes && typeof d.bakeDateTimes === "object" ? d.bakeDateTimes : {});
+    // migrate old bakeSessions oven times into bakeDateTimes if present
+    if (!d.bakeDateTimes && Array.isArray(d.bakeSessions)) {
+      const dt = {}; d.bakeSessions.forEach((s) => { if (s.date && s.startTime) dt[s.date] = s.startTime; }); setBakeDateTimes(dt);
+    }
+    const sl = normalizeSlots(d.slots); void sl; // ensure normalizeSlots runs; sessions already applied in setSlots above
+    setRetard(d.retard && typeof d.retard === "object" ? d.retard : {});
+    setLevBuffer(d.levBuffer && typeof d.levBuffer === "object" ? d.levBuffer : {});
+    setLevBufferPct(d.levBufferPct && typeof d.levBufferPct === "object" ? d.levBufferPct : {});
+    setDoughBuffer(!!d.doughBuffer);
+    setDoughBufferPct(typeof d.doughBufferPct === "number" ? d.doughBufferPct : 4);
+    setRentalHours(typeof d.rentalHours === "number" ? d.rentalHours : 0);
+    setRentalRate(typeof d.rentalRate === "number" ? d.rentalRate : null);
+    setSoldLoaves(d.soldLoaves && typeof d.soldLoaves === "object" ? d.soldLoaves : {});
+    setCostLock(d.costLock && typeof d.costLock === "object" ? d.costLock : null);
+    setDeduction(d.deduction && typeof d.deduction === "object" ? d.deduction : null);
+    setDoneBatches(Array.isArray(d.doneBatches) ? d.doneBatches : []);
+    setFoodSafety(normalizeFoodSafety(d.foodSafety));
+    setMixWaterTemp(typeof d.mixWaterTemp === "number" ? d.mixWaterTemp : null);
+    setHelpChats(d.helpChats && typeof d.helpChats === "object" ? d.helpChats : {}); setHelpOpen(null);
+    setCalcInputs(d.calcInputs && typeof d.calcInputs === "object" ? d.calcInputs : null);
+  };
+  const openDay = (id) => { const e = days.find((x) => x.id === id); if (!e) return; loadDayVars(e.day || {}); setDayName(e.name || "Untitled"); setDayDate(e.date || todayISO()); setCurrentDayId(id); setTab("plan"); setActiveBatch(null); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
+  const newDay = () => { const e = newDayEntry("New run", defaultDay()); setDays((ds) => { const nd = [e, ...ds]; persist(DAYS_KEY, nd); return nd; }); loadDayVars(e.day); setDayName(e.name); setDayDate(e.date); setCurrentDayId(e.id); setTab("plan"); setActiveBatch(null); setDoneBatches([]); setView("editor"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
+  const dupDay = (id) => setDays((ds) => { const src = ds.find((d) => d.id === id); if (!src) return ds; const copy = { ...src, id: uid(), name: (src.name || "Run") + " (copy)", updatedAt: Date.now(), complete: false, day: (() => { const dd = JSON.parse(JSON.stringify(src.day || defaultDay())); dd.costLock = null; dd.deduction = null; dd.soldLoaves = {}; return dd; })() }; const nd = [copy, ...ds]; persist(DAYS_KEY, nd); return nd; });
+  const delDay = (id) => { setDays((ds) => { const nd = ds.filter((d) => d.id !== id); persist(DAYS_KEY, nd); return nd; }); if (currentDayId === id) { setCurrentDayId(null); setView("home"); } };
+  const toggleComplete = (id) => setDays((ds) => { const nd = ds.map((d) => d.id === id ? { ...d, complete: !d.complete, updatedAt: Date.now() } : d); persist(DAYS_KEY, nd); return nd; });
+  const backHome = () => { setView("home"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
+  const goHomeTab = (key) => { setHomeTab(key); if (key === "recipes") setBuilderView("list"); setView("home"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
+  const stages = useMemo(() => buildStages(params), [params]);
+  const cycleMin = useMemo(() => stages.reduce((s, x) => s + x.min, 0), [stages]);
+  const startMin = parseTime(startTime);
+
+  // production "types" derived from slots (formula + day quantity)
+  const types = useMemo(() => slots.map((s, i) => ({ ...s.draft, loaves: s.loaves, mixOrder: s.mixOrder ?? i + 1, bakeOrder: s.bakeOrder ?? i + 1, scaldBuf: !!s.scaldBuf, scaldBufPct: s.scaldBufPct ?? SCALD_BUF_DEFAULT })), [slots]);
+
+  // ---- batch planner -------------------------------------------------------
+  const plan = useMemo(() => {
+    const dbF = 1 + (doughBuffer ? Math.max(0, Math.min(25, +doughBufferPct || 0)) : 0) / 100;
+    const summaries = [], perType = [];
+    types.forEach((t, ti) => {
+      const lines = ingLines(t);
+      const pctSum = lines.reduce((a, l) => a + l.pct, 0);
+      const loaves = Math.max(0, Math.floor(+t.loaves || 0));
+      const W = Math.max(0, +t.loafWeight || 0);
+      const totalDough = loaves * W;
+      // gross flour one loaf puts in the mixer (buffer included); with a mixer that has a flour capacity, that is what limits a mix
+      const fplG = (W > 0 && pctSum > 0) ? (W / pctSum) * grossFlourUnits(t, starter.refHyd) * dbF : 0;
+      const byFlour = mixerFlourCapG > 0 && fplG > 0;
+      const maxLPB = byFlour ? Math.floor(mixerFlourCapG / fplG) : ((maxBatch > 0 && W > 0) ? Math.floor(maxBatch / W) : 0);
+      let batchCount = 0, sizes = [];
+      if (loaves > 0 && maxLPB > 0) { batchCount = Math.ceil(loaves / maxLPB); const base = Math.floor(loaves / batchCount), rem = loaves % batchCount; sizes = Array.from({ length: batchCount }, (_, i) => base + (i < rem ? 1 : 0)); }
+      else if (loaves > 0) { batchCount = loaves; sizes = Array(loaves).fill(1); }
+      const unit = pctSum > 0 ? totalDough / pctSum : 0;
+      const perLoaf = {}; lines.forEach((l) => { perLoaf[l.key] = loaves > 0 ? (unit * l.pct) / loaves : 0; });
+      perType[ti] = sizes.map((sz) => {
+        const weights = {}; lines.forEach((l) => { weights[l.key] = perLoaf[l.key] * sz * dbF; });
+        // weigh-out totals: exactly what goes on the scale as flour and as water.
+        // levain is its own line and is deliberately NOT counted here; nor are milk/egg/other liquids.
+        let tf = 0, tw = 0;
+        lines.forEach((l) => {
+          const g = weights[l.key] || 0;
+          if (l.key.indexOf("fl_") === 0 || l.key === "scf") tf += g;
+          else if (l.key === "water" || l.key === "bassinage" || l.key === "scw") tw += g;
+        });
+        return { ti, name: t.name, size: sz, dough: sz * W * dbF, grossFlour: sz * fplG, weights, totalFlour: tf, totalWater: tw };
+      });
+      summaries[ti] = { ti, name: t.name, loaves, W, totalDough, batchCount, sizes, maxLPB, byFlour, fplG, impossible: loaves > 0 && maxLPB <= 0, floursOver: otherFlourSum(t) > 100 };
+    });
+    // batch list ordered by each recipe's chosen mix order (recipe blocks stay contiguous)
+    const order = [...types.keys()].sort((a, b) => ((types[a].mixOrder || 99) - (types[b].mixOrder || 99)) || (a - b));
+    const list = [];
+    order.forEach((ti) => { (perType[ti] || []).forEach((b) => list.push(b)); });
+    return { list, summaries };
+  }, [types, maxBatch, doughBuffer, doughBufferPct, mixerFlourCapG, starter.refHyd]);
+
+  // recipes that share a base dough -> combined mix guidance (additive; does not touch the batch/levain engine)
+  const baseDoughGroups = useMemo(() => {
+    const dbF = 1 + (doughBuffer ? Math.max(0, Math.min(25, +doughBufferPct || 0)) : 0) / 100;
+    const groups = {};
+    types.forEach((t, ti) => {
+      const loaves = Math.max(0, Math.floor(+t.loaves || 0));
+      if (loaves <= 0) return;
+      const lines = ingLines(t);
+      const TP = lines.reduce((a, l) => a + l.pct, 0);
+      const W = Math.max(0, +t.loafWeight || 0);
+      const unitPerLoaf = TP > 0 ? W / TP : 0;
+      let BP = 0; const basePcts = {}; const inc = [];
+      lines.forEach((l) => {
+        if (l.key.indexOf("in_") === 0) { if (l.pct > 0) inc.push({ name: l.name, g: unitPerLoaf * l.pct * loaves }); }
+        else { BP += l.pct; basePcts[l.name] = (basePcts[l.name] || 0) + l.pct; }
+      });
+      const baseDoughPerLoaf = unitPerLoaf * BP;
+      const k = baseDoughKey(t);
+      if (!groups[k]) groups[k] = { key: k, BP, basePcts, members: [], totalBase: 0, mixOrder: t.mixOrder || 99, flourPerG: BP > 0 ? grossFlourUnits(t, starter.refHyd) / BP : 0 };
+      groups[k].members.push({ ti, name: t.name, loaves, inc });
+      groups[k].totalBase += baseDoughPerLoaf * loaves * dbF;
+      groups[k].mixOrder = Math.min(groups[k].mixOrder, t.mixOrder || 99);
+    });
+    const cap = maxBatch > 0 ? maxBatch : 0;
+    return Object.values(groups).filter((g) => g.members.length >= 2).sort((a, b) => a.mixOrder - b.mixOrder).map((g) => {
+      const byFlour = mixerFlourCapG > 0 && g.flourPerG > 0;
+      const nBatches = byFlour ? Math.max(1, Math.ceil(g.totalBase * g.flourPerG / mixerFlourCapG)) : (cap > 0 ? Math.max(1, Math.ceil(g.totalBase / cap)) : 1);
+      const weighOut = Object.keys(g.basePcts).map((name) => ({ name, g: g.BP > 0 ? g.totalBase * g.basePcts[name] / g.BP : 0 }));
+      return { key: g.key, members: g.members, totalBase: g.totalBase, nBatches, weighOut, cap, byFlour, flourCapKg: mixerFlourCapG / 1000 };
+    });
+  }, [types, maxBatch, doughBuffer, doughBufferPct, mixerFlourCapG, starter.refHyd]);
+
+  const totalBatches = Math.max(1, plan.list.length);
+
+  useEffect(() => { setOffsets((o) => { const n = [...o]; while (n.length < totalBatches) n.push(n.length * stagger); n.length = totalBatches; return n; }); }, [totalBatches]); // eslint-disable-line
+
+  // ---- persistence: globals (shared library/settings) + days (per-day snapshots) ----
+  const bootRef = useRef(false);
+  useEffect(() => {
+    if (bootRef.current) return; bootRef.current = true;
+    (async () => {
+      try {
+        if (typeof window !== "undefined" && window.storage) {
+          const g = await window.storage.get(GLOBALS_KEY);
+          if (g && g.value) {
+            const gc = JSON.parse(g.value);
+            if (Array.isArray(gc.coreRecipes) && gc.coreRecipes.every((x) => Array.isArray(x.flours))) setCoreRecipes(gc.coreRecipes);
+            else if (Array.isArray(gc.library) && gc.library.every((x) => Array.isArray(x.flours))) setCoreRecipes(gc.library); // migrate
+            if (Array.isArray(gc.remixes)) setRemixes(gc.remixes);
+            if (gc.starter && typeof gc.starter === "object") setStarter({ ...DEFAULT_STARTER, ...gc.starter });
+            if (Array.isArray(gc.inocCal) && gc.inocCal.length === 2) setInocCal(gc.inocCal);
+            else if (typeof gc.inocDoubleHrs === "number") setInocCal([{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + gc.inocDoubleHrs }]);
+            if (gc.tempUnit === "C" || gc.tempUnit === "F") setTempUnit(gc.tempUnit);
+            {
+              // Existing items get a best-guess group once (a missing field means "never looked at"; "" is a deliberate Ungrouped).
+              const basePantry = Array.isArray(gc.pantry) ? gc.pantry.filter((x) => x && typeof x === "object" && x.id).map((it) => (it.group === undefined ? { ...it, group: (it.usage || "recipe") === "recipe" ? guessGroup(it.name) : "" } : it)) : [];
+              // The old "Saved ingredients" list is folded into the pantry once, then emptied on the next save.
+              const extra = [];
+              (Array.isArray(gc.ingredients) ? gc.ingredients : []).forEach((i) => { if (i && i.name && !pantryFind([...basePantry, ...extra], i.name)) extra.push(blankPantryItem(String(i.name).trim(), guessGroup(i.name) || (i.kind === "inclusion" ? "" : "flour"))); });
+              if (Array.isArray(gc.pantry) || extra.length) setPantry([...basePantry, ...extra]);
+            }
+            if (gc.costSettings && typeof gc.costSettings === "object") setCostSettings((cs) => ({ ...cs, ...gc.costSettings }));
+            if (gc.equipment && typeof gc.equipment === "object" && (Array.isArray(gc.equipment.mixers) || Array.isArray(gc.equipment.ovens))) setEquipment(cleanEquipment(gc.equipment));
+          }
+          let loadedDays = null;
+          const dRec = await window.storage.get(DAYS_KEY);
+          if (dRec && dRec.value) { const arr = JSON.parse(dRec.value); if (Array.isArray(arr)) loadedDays = arr; }
+          if (!loadedDays) {
+            // migrate the previous single-day config into one saved run + globals
+            const old = await window.storage.get(STORAGE_KEY);
+            if (old && old.value) {
+              const c = JSON.parse(old.value);
+              if (Array.isArray(c.library) && c.library.every((x) => Array.isArray(x.flours))) {
+                setCoreRecipes(c.library);
+                persist(GLOBALS_KEY, { coreRecipes: c.library, remixes: [], ingredients: [], inocCal: [{ inoc: 10, hrs: 5 }, { inoc: 5, hrs: 5 + (typeof c.inocDoubleHrs === "number" ? c.inocDoubleHrs : 1.5) }], tempUnit: c.tempUnit === "F" ? "F" : "C" });
+              }
+              const day = { params: c.params ? { ...DEFAULTS, ...c.params } : DEFAULTS, slots: normalizeSlots(c.slots), maxBatch: typeof c.maxBatch === "number" ? c.maxBatch : 19000, ambientTemp: typeof c.ambientTemp === "number" ? c.ambientTemp : 21, starterTemp: typeof c.starterTemp === "number" ? c.starterTemp : 21, feedMode: c.feedMode === "manual" ? "manual" : "auto", feedTime: typeof c.feedTime === "string" ? c.feedTime : "21:00", stagger: typeof c.stagger === "number" ? c.stagger : 45, offsets: Array.isArray(c.offsets) ? c.offsets : [0, 45, 90, 135], startTime: c.startTime || "07:00", bakeDateTimes: {}, retard: {}, levBuffer: {}, levBufferPct: {}, levCombine: false, doughBuffer: false, doughBufferPct: 4, doneBatches: [], foodSafety: defaultFoodSafety() };
+              loadedDays = [{ id: uid(), name: "Imported run", date: todayISO(), updatedAt: Date.now(), day }];
+            } else {
+              loadedDays = [newDayEntry("My first run", defaultDay())];
+            }
+            persist(DAYS_KEY, loadedDays);
+          }
+          setDays(loadedDays);
+          // reopen where THIS device left off (a home-screen launch is a cold start). Load the run's data first, flip the view last.
+          try {
+            const raw = localStorage.getItem(LASTLOC_KEY);
+            const loc = raw ? JSON.parse(raw) : null;
+            if (loc) {
+              if (HOME_TAB_KEYS.indexOf(loc.homeTab) !== -1) setHomeTab(loc.homeTab);
+              const ent = (loc.view === "editor" && loc.dayId) ? loadedDays.find((x) => x.id === loc.dayId) : null;
+              if (ent) {
+                loadDayVars(ent.day || {}); setDayName(ent.name || "Untitled"); setDayDate(ent.date || todayISO());
+                setCurrentDayId(ent.id); setTab(TAB_KEYS.indexOf(loc.tab) !== -1 ? loc.tab : "plan"); setActiveBatch(null);
+                setView("editor");
+              }
+            }
+          } catch (e) {}
+        } else {
+          setDays([newDayEntry("My first run", defaultDay())]);
+        }
+      } catch (e) { setDays([newDayEntry("Run", defaultDay())]); }
+      setLoaded(true);
+    })();
+  }, []);
+  // persist shared globals
+  useEffect(() => { if (!loaded) return; persist(GLOBALS_KEY, { coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, pantry, costSettings, equipment }); }, [coreRecipes, remixes, ingredients, starter, inocCal, tempUnit, pantry, costSettings, equipment, loaded]);
+  // autosave the open day's snapshot
+  useEffect(() => {
+    if (!loaded || view !== "editor" || !currentDayId) return;
+    const snap = { params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, rentalHours, rentalRate, soldLoaves, costLock, deduction, doneBatches, foodSafety, mixWaterTemp, calcInputs, helpChats, mixerId, ovenId };
+    setDays((ds) => { const nd = ds.map((d) => (d.id === currentDayId ? { ...d, name: dayName, date: dayDate, updatedAt: Date.now(), day: snap } : d)); persist(DAYS_KEY, nd); return nd; });
+  }, [params, slots, maxBatch, ambientTemp, starterTemp, feedMode, feedTime, stagger, offsets, startTime, bakeDateTimes, retard, levBuffer, levBufferPct, levCombine, doughBuffer, doughBufferPct, rentalHours, rentalRate, soldLoaves, costLock, deduction, doneBatches, foodSafety, mixWaterTemp, calcInputs, helpChats, mixerId, ovenId, dayName, dayDate, currentDayId, view, loaded]);
+
+  // remember where this device is (only after boot has restored, so we never overwrite the saved spot with defaults)
+  useEffect(() => {
+    if (!loaded) return;
+    try { localStorage.setItem(LASTLOC_KEY, JSON.stringify({ view, dayId: currentDayId, tab, homeTab })); } catch (e) {}
+  }, [loaded, view, currentDayId, tab, homeTab]);
+
+  // stay awake: held only while the toggle is on AND you're on a run's Mix tab; releases when you leave or hide the app
+  const [stayAwake, setStayAwake] = useState(false);
+  const [wakeMode, setWakeMode] = useState(""); // "" | "lock" | "video" | "none"
+  const wakeSentinel = useRef(null), wakeVideo = useRef(null);
+  const wantAwake = stayAwake && view === "editor" && tab === "build";
+  useEffect(() => {
+    if (!wantAwake) return;
+    let cancelled = false;
+    const startVideo = async () => {
+      try {
+        if (!wakeVideo.current) wakeVideo.current = makeNoSleepVideo();
+        await wakeVideo.current.play();
+        if (!cancelled) setWakeMode("video");
+        return true;
+      } catch (e) { return false; }
+    };
+    const acquire = async () => {
+      if (cancelled || document.visibilityState !== "visible") return;
+      if (wakeSentinel.current && !wakeSentinel.current.released) return; // already holding
+      if (!iosStandaloneLegacy() && "wakeLock" in navigator) {
+        try {
+          const sent = await navigator.wakeLock.request("screen");
+          if (cancelled) { try { sent.release(); } catch (e) {} return; }
+          wakeSentinel.current = sent; setWakeMode("lock"); return;
+        } catch (e) { /* fall through to the video */ }
+      }
+      if (!(await startVideo()) && !cancelled) setWakeMode("none");
+    };
+    acquire();
+    const onVis = () => { if (document.visibilityState === "visible") acquire(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      cancelled = true; document.removeEventListener("visibilitychange", onVis);
+      try { if (wakeSentinel.current) wakeSentinel.current.release(); } catch (e) {}
+      wakeSentinel.current = null;
+      try { if (wakeVideo.current) wakeVideo.current.pause(); } catch (e) {}
+      setWakeMode("");
+    };
+  }, [wantAwake]);
+
+  const distribute = (s) => { setStagger(s); setOffsets(Array.from({ length: totalBatches }, (_, b) => b * s)); };
+
+  // ---- schedule ------------------------------------------------------------
+  const schedule = useMemo(() => offsets.map((base, b) => {
+    const ti = plan.list[b] ? plan.list[b].ti : 0;
+    const aut = types[ti] && types[ti].autolyse != null ? +types[ti].autolyse : +params.autolyse;
+    const st = buildStages({ ...params, autolyse: aut });
+    let cur = base;
+    const blocks = st.map((stg) => { const bl = { batch: b, name: stg.name, active: stg.active, startOff: cur, endOff: cur + stg.min, min: stg.min }; cur += stg.min; return bl; });
+    return { batch: b, base, end: cur, blocks };
+  }), [offsets, params, plan, types]);
+
+  const { collisionSet, collisionCount } = useMemo(() => {
+    const acts = [];
+    schedule.forEach((row) => row.blocks.forEach((bl, i) => { if (bl.active && bl.min > 0) acts.push({ ...bl, key: `${bl.batch}-${i}` }); }));
+    const set = new Set();
+    for (let i = 0; i < acts.length; i++) for (let j = i + 1; j < acts.length; j++) { const a = acts[i], c = acts[j]; if (a.batch === c.batch) continue; if (a.startOff < c.endOff && c.startOff < a.endOff) { set.add(a.key); set.add(c.key); } }
+    return { collisionSet: set, collisionCount: set.size };
+  }, [schedule]);
+
+  const autoSpace = useCallback(() => {
+    const offs = []; let o = 0;
+    stages.forEach((st) => { if (st.active && st.min > 0) offs.push({ s: o, e: o + st.min }); o += st.min; });
+    if (offs.length === 0 || totalBatches < 2) return;
+    const collides = (stg) => { for (let b = 0; b < totalBatches; b++) for (let c = b + 1; c < totalBatches; c++) { const sB = b * stg, sC = c * stg; for (const x of offs) for (const y of offs) if (sB + x.s < sC + y.e && sC + y.s < sB + x.e) return true; } return false; };
+    for (let s = SNAP; s <= cycleMin + SNAP; s += SNAP) if (!collides(s)) { distribute(s); return; }
+    distribute(cycleMin);
+  }, [stages, totalBatches, cycleMin]); // eslint-disable-line
+
+  const onDown = (e, b) => { if (e.pointerType === "touch") return; e.currentTarget.setPointerCapture(e.pointerId); setHover(null); setDrag({ b, startX: e.clientX, startOff: offsets[b] }); };
+  const onMove = (e) => { if (!drag) return; const d = Math.round(((e.clientX - drag.startX) / PX) / SNAP) * SNAP; const no = Math.max(0, drag.startOff + d); setOffsets((o) => o.map((v, i) => (i === drag.b ? no : v))); };
+  const onUp = (e) => { if (drag) { try { e.currentTarget.releasePointerCapture(e.pointerId); } catch (x) {} setDrag(null); } };
+
+  const handsOn = useMemo(() => {
+    const list = [];
+    schedule.forEach((row) => row.blocks.forEach((bl, i) => { if (bl.active && bl.min > 0) list.push({ ...bl, key: `${bl.batch}-${i}`, hit: collisionSet.has(`${bl.batch}-${i}`) }); }));
+    return list.sort((a, b) => a.startOff - b.startOff || a.batch - b.batch);
+  }, [schedule, collisionSet]);
+
+  const lastEnd = schedule.length ? Math.max(...schedule.map((r) => r.end)) : cycleMin;
+  const totalActiveMin = handsOn.reduce((s, x) => s + x.min, 0);
+
+  // ---- prep/report aggregation --------------------------------------------
+  const report = useMemo(() => {
+    const tot = {};
+    plan.list.forEach((b) => {
+      const t = types[b.ti];
+      ingLines(t).forEach((l) => {
+        if (l.pct <= 0) return;
+        const g = (b.weights[l.key] || 0) * ((l.key === "scf" || l.key === "scl") ? scaldBufFactor(t) : 1); if (!g) return; // the scald buffer is real flour and milk you need on hand
+        const cat = (l.key.startsWith("fl_") || l.key === "scf") ? "flour" : (l.key.startsWith("in_") || l.key === "lsg") ? "inc" : "liquid";
+        const nm = l.matchName || l.name;
+        const key = (nm || "").trim().toLowerCase() + "|" + cat;
+        if (!tot[key]) tot[key] = { name: nm, cat, g: 0 };
+        tot[key].g += g;
+      });
+    });
+    const ingList = Object.values(tot).sort((a, b) => (CAT_ORDER[a.cat] - CAT_ORDER[b.cat]) || b.g - a.g);
+    const bann = {};
+    types.forEach((t, ti) => { const lv = plan.summaries[ti].loaves; if (lv > 0) { const sh = proofInfo(t.shape).key; bann[sh] = (bann[sh] || 0) + lv; } });
+    const vessels = plan.list.map((b, i) => ({ i, name: b.name, dough: b.dough, size: b.size, liters: vesselLiters(b.dough) }));
+    return { ingList, bann, vessels, totalLoaves: plan.list.reduce((a, b) => a + b.size, 0), totalDough: plan.list.reduce((a, b) => a + b.dough, 0) };
+  }, [plan, types]);
+
+  // ---- levain builds (grouping, timing via water temp) ---------------------
+  const levainPlan = useMemo(() => {
+    const raw = [];
+    if (levCombine) {
+      // one bucket per levain composition, across all recipes and mix times (retard covers early peaks)
+      const sig = {};
+      types.forEach((t, ti) => {
+        const batches = plan.list.map((b, gi) => ({ b, gi })).filter((x) => x.b.ti === ti);
+        if (batches.length === 0) return;
+        const k = [+t.levHyd || 80, +t.levInoc || 10, +t.levRefInoc || 10, +t.levBuildHrs || 5, +t.levRefTemp || 24, +t.levWhole || 0, +t.levSugar || 0, (+t.levSugar || 0) > 0 ? normName(levSugarName(t)) : ""].join("|");
+        if (!sig[k]) sig[k] = { ti, names: [], items: [] };
+        if (sig[k].names.indexOf(t.name) === -1) sig[k].names.push(t.name);
+        batches.forEach((x) => {
+          const base = schedule[x.gi] ? schedule[x.gi].base : 0;
+          sig[k].items.push({ gi: x.gi, mixOff: base + ((t.autolyse != null ? +t.autolyse : +params.autolyse) || 0), levW: x.b.weights["levain"] || 0, lsgW: x.b.weights["lsg"] || 0 });
+        });
+      });
+      Object.values(sig).forEach((g) => { g.items.sort((a, b) => a.mixOff - b.mixOff); raw.push({ ti: g.ti, name: g.names.join(" + "), items: g.items }); });
+    } else {
+      types.forEach((t, ti) => {
+        const batches = plan.list.map((b, gi) => ({ b, gi })).filter((x) => x.b.ti === ti);
+        if (batches.length === 0) return;
+        const withMix = batches.map((x) => {
+          const base = schedule[x.gi] ? schedule[x.gi].base : 0;
+          return { gi: x.gi, mixOff: base + ((types[ti] && types[ti].autolyse != null ? +types[ti].autolyse : +params.autolyse) || 0), levW: x.b.weights["levain"] || 0, lsgW: x.b.weights["lsg"] || 0 };
+        }).sort((a, b) => a.mixOff - b.mixOff);
+        let group = [];
+        const flush = () => { if (group.length) raw.push({ ti, name: t.name, items: group }); group = []; };
+        withMix.forEach((it) => {
+          if (group.length === 0) { group = [it]; return; }
+          if (group.length >= 5 || (it.mixOff - group[0].mixOff) > 90) { flush(); group = [it]; }
+          else group.push(it);
+        });
+        flush();
+      });
+    }
+    const builds = raw.map((bd) => {
+      const t = types[bd.ti];
+      const refTemp = +t.levRefTemp || 24;
+      const baselineMin = (+t.levBuildHrs || 5) * 60;
+      const H = +t.levHyd || 80;
+      const I = Math.max(0.1, +t.levInoc || 10);          // working inoculation
+      const refInoc = Math.max(0.1, +t.levRefInoc || 10);  // inoculation the baseline was calibrated at
+      const whole = Math.max(0, +t.levWhole || 0);         // % whole grain in the levain flour
+      const refH = +starter.refHyd || 80;
+      // inoculation: less seed than calibration → longer natural rise (each halving adds inocDoubleHrs)
+      const inocAdd = inocDoubleHrs * 60 * Math.log2(refInoc / I);
+      // hydration: stiffer than ref → slower. hydDoubleHrs = +hrs per halving of hydration below ref
+      const hydAdd = hydResp.hrs * 60 * Math.log2(Math.max(1, refH) / Math.max(1, H));
+      // flour: whole grain accelerates. wholeResp.hrs = -hrs per +25% whole grain in levain flour
+      const wholeAdd = -wholeResp.hrs * 60 * (whole / 25);
+      const baseAdjMin = Math.max(30, baselineMin + inocAdd + hydAdd + wholeAdd);
+      return { ...bd, refTemp, baselineMin, baseAdjMin, targetPeak: bd.items[0].mixOff, H, I, refInoc, whole, inocAdd, hydAdd, wholeAdd };
+    });
+    // auto feed = earliest the schedule demands (earliest build hits ref temp at its inoculation)
+    let autoFeed = null;
+    builds.forEach((bd) => { const f = bd.targetPeak - bd.baseAdjMin; if (autoFeed === null || f < autoFeed) autoFeed = f; });
+    if (autoFeed === null) autoFeed = 0;
+    const earliestTarget = builds.length ? Math.min(...builds.map((b) => b.targetPeak)) : 0;
+    // manual feed = a clock time the user chooses; resolve to the latest occurrence before the first peak
+    let feedOff = autoFeed;
+    if (feedMode === "manual") {
+      const earliestPeakAbs = startMin + earliestTarget;
+      let feedAbs = parseTime(feedTime);
+      while (feedAbs >= earliestPeakAbs) feedAbs -= 1440; // roll back to the night before if needed
+      feedOff = feedAbs - startMin;
+    }
+    const out = builds.map((bd) => {
+      const key = bd.items[0].gi;
+      const retarded = !!retard[key];
+      const desired = Math.max(1, bd.targetPeak - feedOff);
+      // retarded: build at normal ref temp so it peaks naturally, then hold cold until mix
+      const peakOff = retarded ? feedOff + bd.baseAdjMin : bd.targetPeak;
+      const Tlev = retarded ? bd.refTemp : bd.refTemp - 10 * (Math.log(desired / bd.baseAdjMin) / Math.log(q10));
+      const retardHold = retarded ? Math.max(0, bd.targetPeak - peakOff) : 0;
+      const retardLate = retarded && (peakOff > bd.targetPeak);
+      const buffered = !!levBuffer[key];
+      const rawBuf = levBufferPct[key];
+      const bufPct = buffered ? ((rawBuf === undefined || rawBuf === null || rawBuf === "") ? 2 : (Number(rawBuf) || 0)) : 0;
+      const M = bd.items.reduce((a, x) => a + x.levW, 0) * (1 + bufPct / 100);
+      const denom = 1 + bd.H / 100 + bd.I / 100;
+      const flourL = M / denom, waterL = flourL * bd.H / 100, seedL = flourL * bd.I / 100;
+      const sugarL = bd.items.reduce((a, x) => a + (x.lsgW || 0), 0) * (1 + bufPct / 100);
+      const sugarName = sugarL > 0 ? levSugarName(types[bd.ti]) : "";
+      const mTot = flourL + waterL + seedL;
+      const Twater = waterL > 0 ? (Tlev * mTot - flourL * ambientTemp - seedL * starterTemp) / waterL : Tlev;
+      const holdMin = bd.items[bd.items.length - 1].mixOff - bd.targetPeak;
+      return { ...bd, key, retarded, buffered, bufPct, retardHold, retardLate, peakOff, desired, Tlev, M, flourL, waterL, seedL, sugarL, sugarName, Twater, holdMin };
+    });
+    return { feedOff, autoFeed, builds: out };
+  }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard, levBuffer, levBufferPct, levCombine]);
+  // The Plan card's levain buffer is a per-recipe remote for the same per-build setting the Levain tab uses (one build can serve several batches, and one recipe can have several builds).
+  const levBuildsFor = (ti) => (levainPlan.builds || []).filter((bd) => bd.items.some((x) => plan.list[x.gi] && plan.list[x.gi].ti === ti));
+  const setLevBufferFor = (ti, on) => setLevBuffer((r) => { const n = { ...r }; levBuildsFor(ti).forEach((bd) => { n[bd.key] = on; }); return n; });
+  const setLevBufferPctFor = (ti, v) => setLevBufferPct((r) => { const n = { ...r }; levBuildsFor(ti).forEach((bd) => { n[bd.key] = v; }); return n; });
+
+  // scalds to make ahead, totalled across every batch of the run
+  const scaldPrep = useMemo(() => {
+    const out = [];
+    types.forEach((t, ti) => {
+      const sc = scaldInfo(t); if (!sc.on) return;
+      let fl = 0, lq = 0;
+      plan.list.forEach((b) => { if (b.ti === ti) { fl += b.weights.scf || 0; lq += (sc.isWater ? b.weights.scw : b.weights.scl) || 0; } });
+      const k = scaldBufFactor(t);
+      if (fl > 0) out.push({ ti, name: t.name, flourName: sc.flourName, fl: fl * k, liquidName: sc.liquidName, lq: lq * k, method: sc.method, k, dough: fl + lq, on: !!t.scaldBuf, pct: t.scaldBufPct });
+    });
+    return out;
+  }, [plan, types]);
+
+  // ---- costs + stock (Pantry) ----
+  const effRate = rentalRate != null ? rentalRate : (costSettings.rentalRate || 0);
+  const runCosts = useMemo(() => computeRunCosts({ plan, types, builds: levainPlan.builds, pantry, settings: costSettings, refHyd: starter.refHyd, rentalHours, rentalRate: effRate, sold: soldLoaves }), [plan, types, levainPlan, pantry, costSettings, starter.refHyd, rentalHours, effRate, soldLoaves]);
+  // once a run has been deducted, the counts already net it out; show the check as it stood BEFORE the deduction
+  const pantryForCheck = useMemo(() => deduction ? pantry.map((it) => { const ln = deduction.lines.find((l) => l.id === it.id); return ln ? { ...it, onHandBase: (it.onHandBase || 0) + ln.qty } : it; }) : pantry, [pantry, deduction]);
+  const stockRows = useMemo(() => stockCheck(costLock ? costLock.result.demand : runCosts.demand, pantryForCheck, dayDate, todayISO()), [runCosts, costLock, pantryForCheck, dayDate]);
+
+  // ---- bake schedule: groups per-recipe sessions by date, one oven sequential ----
+  const bakePlan = useMemo(() => {
+    const flatCap = Math.max(1, Math.floor(+params.ovenCap || 1));
+    // loaves of one pan type per load: from the selected oven (a blank Pullman number falls back to the boule number), else the flat "loaves per load"
+    const capFor = (shape) => { if (oven) { const c = ovenShapeCap(oven, shape) || ovenShapeCap(oven, "round"); if (c > 0) return c; } return flatCap; };
+    const cap = flatCap;
+    const preheat = Math.max(0, +params.preheatMin || 0);
+    const recover = Math.max(0, +params.recoverMin || 0);
+    // collect per-date recipe entries
+    const dateMap = {};
+    slots.forEach((slot, ti) => {
+      const t = types[ti];
+      (slot.sessions || []).forEach((sess, si) => {
+        const loaves = sessionLoaves(slot, si);
+        if (loaves <= 0) return;
+        const date = sess.date || todayISO();
+        if (!dateMap[date]) dateMap[date] = [];
+        dateMap[date].push({ ti, name: t.name, shape: t.shape, loaves, bakeOrder: t.bakeOrder || ti + 1, bakeMin: Math.max(1, +t.bakeMin || 45), steamMin: Math.min(Math.max(1, +t.bakeMin || 45), Math.max(0, +t.steamMin || 0)), temp: +t.bakeTemp || 245 });
+      });
+    });
+    const scheduleDate = (date, items) => {
+      items.sort((a, b) => (a.bakeOrder - b.bakeOrder) || (a.ti - b.ti));
+      // pool loaves that bake identically (temp / time / steam), then pack into loads up to capacity
+      const groups = {};
+      items.forEach((it) => {
+        const k = Math.round(it.temp) + "|" + it.bakeMin + "|" + it.steamMin;
+        if (!groups[k]) groups[k] = { order: it.bakeOrder, bakeMin: it.bakeMin, steamMin: it.steamMin, temp: it.temp, items: [] };
+        groups[k].order = Math.min(groups[k].order, it.bakeOrder);
+        groups[k].items.push(it);
+      });
+      const loads = [];
+      Object.values(groups).sort((a, b) => a.order - b.order).forEach((g) => {
+        const queue = g.items.map((it) => ({ ti: it.ti, name: it.name, left: it.loaves, c: capFor(it.shape) })).filter((q) => q.left > 0);
+        let qi = 0;
+        while (qi < queue.length) {
+          // a load is full when the shares add to 1: each loaf takes 1/c of the oven, c being what the oven holds of THAT pan type
+          const parts = []; let room = 1;
+          while (qi < queue.length) {
+            const q = queue[qi]; const fit = Math.floor(room * q.c + 1e-9);
+            if (fit <= 0) break;
+            const take = Math.min(fit, q.left);
+            parts.push({ ti: q.ti, name: q.name, n: take }); q.left -= take; room -= take / q.c;
+            if (q.left === 0) qi++;
+          }
+          if (!parts.length) break;
+          const label = parts.length === 1 ? parts[0].name : parts.map((p) => p.n + " " + p.name).join(" · ");
+          loads.push({ parts, label, n: parts.reduce((a, p) => a + p.n, 0), fill: Math.min(1, Math.max(0, 1 - room)), bakeMin: g.bakeMin, steamMin: g.steamMin, temp: g.temp });
+        }
+      });
+      let cur = preheat;
+      const sched = loads.map((ld, i) => { const startOff = cur, ventOff = cur + ld.steamMin, endOff = cur + ld.bakeMin; cur = endOff + recover; return { ...ld, i, startOff, ventOff, endOff }; });
+      const lastOut = sched.length ? sched[sched.length - 1].endOff : preheat;
+      return { date, items, sched, firstIn: preheat, lastOut, totalLoaves: loads.reduce((a, l) => a + l.n, 0), loadCount: sched.length };
+    };
+    const dateSchedules = Object.entries(dateMap).sort(([a], [b]) => a.localeCompare(b)).map(([date, items]) => scheduleDate(date, items));
+    const pool = types.map((t, ti) => {
+      const shaped = (plan.summaries[ti] && plan.summaries[ti].loaves) || 0;
+      const allocated = (slots[ti].sessions || []).reduce((a, _, si) => a + sessionLoaves(slots[ti], si), 0);
+      return { ti, name: t.name, shaped, allocated, remaining: shaped - allocated };
+    }).filter((p) => p.shaped > 0 || p.allocated > 0);
+    const notes = [];
+    if (oven) {
+      const seen = {};
+      Object.values(dateMap).forEach((its) => its.forEach((it) => {
+        const k = ovenKey(it.shape);
+        if (seen[k] || ovenShapeCap(oven, it.shape) > 0) return;
+        seen[k] = 1;
+        const used = capFor(it.shape);
+        notes.push(k === "boule" ? oven.name + " has no boule number set; loads use " + used + " per load." : proofInfo(it.shape).label + ": no number set for " + oven.name + ", so loads use its boule number (" + used + ").");
+      }));
+    }
+    return { cap, preheat, recover, dateSchedules, pool, notes };
+  }, [types, plan, slots, oven, params.ovenCap, params.preheatMin, params.recoverMin]);
+
+  // temperature unit display/input conversion (math stays in Celsius)
+  const cToU = (c) => (tempUnit === "F" ? c * 9 / 5 + 32 : c);
+  const uToC = (v) => (tempUnit === "F" ? (v - 32) * 5 / 9 : v);
+  const showTemp = (c) => (Math.round(cToU(c) * 10) / 10) + "°" + tempUnit;
+
+  // ---- live now/next -------------------------------------------------------
+  const live = useMemo(() => {
+    const nowOff = nowMin - startMin;
+    const steps = handsOn.filter((h) => h.name !== "Mix");
+    const upcoming = steps.filter((s) => s.startOff + Math.max(s.min, 1) > nowOff).sort((a, b) => a.startOff - b.startOff);
+    const batchStatus = schedule.map((row, b) => {
+      const info = plan.list[b];
+      let stage = null;
+      for (const bl of row.blocks) { if (nowOff >= bl.startOff && nowOff < bl.endOff) { stage = bl; break; } }
+      let state, label, sub = "";
+      if (nowOff < row.base) { state = "idle"; label = "Not started"; sub = "autolyse " + fmtClock(startMin + row.base); }
+      else if (nowOff >= row.end) { state = "done"; label = "Shaped ✓"; }
+      else if (stage && stage.active) { state = "attn"; label = stage.name + " — now"; }
+      else { const next = row.blocks.find((x) => x.active && x.startOff >= nowOff); state = "rest"; label = stage ? stage.name : "—"; sub = next ? "next: " + next.name + " " + fmtClock(startMin + next.startOff) : ""; }
+      return { b, name: info ? info.name : "", state, label, sub };
+    });
+    return { nowOff, hero: upcoming[0] || null, then: upcoming.slice(1, 6), batchStatus };
+  }, [nowMin, startMin, handsOn, schedule, plan]);
+
+  const completeAndNext = (i) => {
+    const done = doneBatches.includes(i) ? doneBatches : [...doneBatches, i];
+    setDoneBatches(done);
+    const n = plan.list.length; let next = null;
+    for (let k = 1; k <= n; k++) { const j = (i + k) % n; if (!done.includes(j)) { next = j; break; } }
+    setActiveBatch(next);
+  };
+  const anchorNow = () => { const d = new Date(); setStartTime(`${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`); };
+
+  // ---- live Gantt auto-follow ---------------------------------------------
+  const liveRef = useRef(null);
+  const progScroll = useRef(false);
+  const [follow, setFollow] = useState(true);
+  const [liveFull, setLiveFull] = useState(false);
+  const [mixed, setMixed] = useState(false);
+  const [recal, setRecal] = useState(false);
+  const liveDragRef = useRef(null);
+  const [vh, setVh] = useState(() => (typeof window !== "undefined" ? window.innerHeight : 800));
+  const centerNow = useCallback(() => {
+    const el = liveRef.current; if (!el) return;
+    const x = Math.max(0, LIVE_LABEL + (nowMin - startMin) * LIVE_PX - el.clientWidth / 3);
+    progScroll.current = true;
+    el.scrollTo({ left: x });
+    setTimeout(() => { progScroll.current = false; }, 140);
+  }, [nowMin, startMin]);
+  useEffect(() => { if (tab === "fold" && follow) centerNow(); }, [tab, follow, nowMin, centerNow]);
+  useEffect(() => {
+    if (!liveFull) return;
+    const onR = () => setVh(window.innerHeight);
+    setVh(window.innerHeight);
+    window.addEventListener("resize", onR);
+    const prev = document.body.style.overflow; document.body.style.overflow = "hidden";
+    const id = setTimeout(() => { if (follow) centerNow(); }, 80);
+    return () => { window.removeEventListener("resize", onR); document.body.style.overflow = prev; clearTimeout(id); };
+  }, [liveFull]); // eslint-disable-line
+  const onLiveScroll = () => { if (progScroll.current) return; if (follow) setFollow(false); };
+  // ---- bake Gantt scroll refs (one per date) + center-on-now -----------------
+  const bakeRefs = useRef({});
+  const centerBake = useCallback((date, bs) => {
+    const el = bakeRefs.current[date]; if (!el) return;
+    const x = Math.max(0, LIVE_LABEL + (nowMin - bs) * LIVE_PX - el.clientWidth / 3);
+    el.scrollTo({ left: x, behavior: "smooth" });
+  }, [nowMin]);
+  useEffect(() => {
+    if (tab !== "bake") return;
+    const id = setTimeout(() => { (bakePlan.dateSchedules || []).forEach((ds) => centerBake(ds.date, parseTime(bakeDateTimes[ds.date] || "08:00"))); }, 60);
+    return () => clearTimeout(id);
+  }, [tab]); // eslint-disable-line
+  const liveDown = (e, b) => { if (!recal) return; e.currentTarget.setPointerCapture(e.pointerId); setFollow(false); liveDragRef.current = { b, startX: e.clientX, startOff: offsets[b] }; };
+  const liveMove = (e) => { const d = liveDragRef.current; if (!d) return; const dm = Math.round(((e.clientX - d.startX) / LIVE_PX) / SNAP) * SNAP; const no = Math.max(0, d.startOff + dm); setOffsets((o) => o.map((v, i) => (i === d.b ? no : v))); };
+  const liveUp = (e) => { if (liveDragRef.current) { try { e.currentTarget.releasePointerCapture(e.pointerId); } catch (x) {} liveDragRef.current = null; } };
+  const span = Math.max(lastEnd, 60);
+  const tickStep = span > 480 ? 60 : 30;
+  const axisTicks = []; for (let t = 0; t <= span + tickStep; t += tickStep) axisTicks.push(t);
+
+  // ---- mutators ------------------------------------------------------------
+  const setP = (k, v) => setParams((p) => ({ ...p, [k]: Math.max(0, Number(v) || 0) }));
+  const patchSlot = (ti, fn) => setSlots((ss) => ss.map((s, i) => (i === ti ? fn(s) : s)));
+  const normalizeOrders = (ss) => {
+    const byMix = [...ss.keys()].sort((a, b) => ((ss[a].mixOrder || 99) - (ss[b].mixOrder || 99)) || (a - b));
+    const byBake = [...ss.keys()].sort((a, b) => ((ss[a].bakeOrder || 99) - (ss[b].bakeOrder || 99)) || (a - b));
+    const mr = {}, br = {}; byMix.forEach((idx, r) => { mr[idx] = r + 1; }); byBake.forEach((idx, r) => { br[idx] = r + 1; });
+    return ss.map((s, i) => ({ ...s, mixOrder: mr[i], bakeOrder: br[i] }));
+  };
+  // setting one card's order swaps with whoever currently holds that slot — keeps a clean 1..N permutation
+  const setMixOrder = (ti, v) => setSlots((ss) => { const cur = ss[ti].mixOrder; return ss.map((s, i) => (i === ti ? { ...s, mixOrder: v } : (s.mixOrder === v ? { ...s, mixOrder: cur } : s))); });
+  const setBakeOrder = (ti, v) => setSlots((ss) => { const cur = ss[ti].bakeOrder; return ss.map((s, i) => (i === ti ? { ...s, bakeOrder: v } : (s.bakeOrder === v ? { ...s, bakeOrder: cur } : s))); });
+  const addSlot = () => setSlots((ss) => normalizeOrders([...ss, { loaves: 50, mixOrder: ss.length + 1, bakeOrder: ss.length + 1, draft: blankRecipe() }]));
+  const removeSlot = (ti) => setSlots((ss) => (ss.length <= 1 ? ss : normalizeOrders(ss.filter((_, i) => i !== ti))));
+  const patchDraft = (ti, fn) => patchSlot(ti, (s) => ({ ...s, draft: fn(s.draft) }));
+  const setLoaves = (ti, v) => patchSlot(ti, (s) => ({ ...s, loaves: Math.max(0, Math.floor(Number(v) || 0)) }));
+  const setDraft = (ti, patch) => patchDraft(ti, (d) => ({ ...d, ...patch }));
+  const setFixed = (ti, k, v) => patchDraft(ti, (d) => ({ ...d, [k]: Math.max(0, Number(v) || 0) }));
+  const setFlourName = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, flours: d.flours.map((f, j) => (j === idx ? { ...f, name: v } : f)) }));
+  const setFlourPct = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, flours: d.flours.map((f, j) => (j === idx ? { ...f, pct: Math.max(0, Number(v) || 0) } : f)) }));
+  const addFlour = (ti) => patchDraft(ti, (d) => ({ ...d, flours: [...d.flours, mk("Flour " + (d.flours.length + 1), 0)] }));
+  const removeFlour = (ti, idx) => patchDraft(ti, (d) => ({ ...d, flours: d.flours.filter((_, j) => j !== idx) }));
+  const setIncName = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.map((f, j) => (j === idx ? { ...f, name: v } : f)) }));
+  const setIncWhen = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.map((f, j) => (j === idx ? { ...f, when: cleanWhen(v) } : f)) }));
+  const setIncPct = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.map((f, j) => (j === idx ? { ...f, pct: Math.max(0, Number(v) || 0) } : f)) }));
+  const addInc = (ti) => patchDraft(ti, (d) => ({ ...d, inclusions: [...d.inclusions, mk("Inclusion " + (d.inclusions.length + 1), 0)] }));
+  const removeInc = (ti, idx) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.filter((_, j) => j !== idx) }));
+  const setLiq = (ti, idx, patch) => patchDraft(ti, (d) => ({ ...d, liquids: (d.liquids || []).map((l, j) => (j === idx ? { ...l, ...patch } : l)) }));
+  const addLiq = (ti) => patchDraft(ti, (d) => ({ ...d, liquids: [...(d.liquids || []), mkL("Milk", 0, 88)] }));
+  const removeLiq = (ti, idx) => patchDraft(ti, (d) => ({ ...d, liquids: (d.liquids || []).filter((_, j) => j !== idx) }));
+
+  // ---- recipe library ------------------------------------------------------
+  const loadCoreRecipe = (ti, id) => { const r = coreRecipes.find((x) => x.id === id); if (r) patchSlot(ti, (s) => ({ ...s, coreRecipeId: id, draft: cloneRecipe(r) })); };
+  const updateCoreFromSlot = (ti) => {
+    const slot = slots[ti]; if (!slot || !slot.coreRecipeId) return;
+    const oldCore = coreRecipes.find((x) => x.id === slot.coreRecipeId);
+    const norm = cloneRecipe(slot.draft); norm.flours = norm.flours.map((f, i) => (i === 0 ? { ...f, pct: mainPct(slot.draft) } : f));
+    const r = { ...norm, id: slot.coreRecipeId };
+    setCoreRecipes((rs) => rs.map((x) => x.id === r.id ? r : x));
+    if (oldCore) setSlots((ss) => ss.map((sl) => (sl.coreRecipeId === r.id && sameFormula(sl.draft, oldCore)) ? { ...sl, draft: cloneRecipe(r) } : sl));
+  };
+  const saveSlotAsRemix = (ti) => { remixRecipe(ti); patchSlot(ti, (sl) => ({ ...sl, coreRecipeId: "" })); };
+  const goPantry = () => { setHomeTab("pantry"); setView("home"); if (typeof window !== "undefined") window.scrollTo({ top: 0 }); };
+  const lockCosts = () => setCostLock({ at: Date.now(), result: runCosts });
+  const unlockCosts = () => setCostLock(null);
+  const deductRun = () => {
+    if (deduction) return;
+    const demand = costLock ? costLock.result.demand : runCosts.demand;
+    const lines = [];
+    pantry.forEach((it) => { const q = demand[it.id] || 0; if (q > 0) lines.push({ id: it.id, qty: Math.min(q, it.onHandBase || 0) }); });
+    setPantry((ps) => ps.map((it) => { const ln = lines.find((l) => l.id === it.id); return ln ? { ...it, onHandBase: Math.max(0, (it.onHandBase || 0) - ln.qty) } : it; }));
+    setDeduction({ at: Date.now(), lines });
+  };
+  const undoDeduction = () => {
+    if (!deduction) return;
+    setPantry((ps) => ps.map((it) => { const ln = deduction.lines.find((l) => l.id === it.id); return ln ? { ...it, onHandBase: (it.onHandBase || 0) + ln.qty } : it; }));
+    setDeduction(null);
+  };
+  const addMissingToPantry = (names) => setPantry((ps) => [...ps, ...names.filter((n) => !pantryFind(ps, n)).map((n) => blankPantryItem(n))]);
+  const setRecipeNotes = (ti, v) => {
+    patchDraft(ti, (d) => ({ ...d, notes: v }));
+    const cid = slots[ti] && slots[ti].coreRecipeId;
+    if (cid) setCoreRecipes((rs) => rs.map((x) => x.id === cid ? { ...x, notes: v } : x));
+  };
+  const runAnalysis = async (r) => {
+    const id = r.id, loaves = Math.max(1, +aiLoaves[id] || 24), W = +r.loafWeight || 0, ovenC = oven ? (ovenShapeCap(oven, r.shape) || ovenShapeCap(oven, "round")) : 0, cap = ovenC || (+params.ovenCap || 15);
+    const lnR = ingLines(r), pSR = lnR.reduce((a, l) => a + l.pct, 0), fplR = (pSR > 0 && W > 0) ? (W / pSR) * grossFlourUnits(r, starter.refHyd) : 0, byFlourR = mixerFlourCapG > 0 && fplR > 0;
+    setAiState((st) => ({ ...st, [id]: { loading: true } }));
+    try {
+      const payload = {
+        recipe: {
+          name: r.name, loafWeightG: r.loafWeight, proofingContainer: proofInfo(r.shape).label,
+          flours: r.flours.map((fl, i) => ({ name: fl.name, pct: i === 0 ? mainPct(r) : (+fl.pct || 0) })),
+          waterPct: +r.water || 0,
+          scald: (() => { const sc = scaldInfo(r); return sc.on ? { flour: sc.flourName, pctOfTotalFlour: Math.round(sc.sf * 10) / 10, liquid: sc.liquidName, liquidPctOfFlour: Math.round(sc.S * 10) / 10, method: sc.method } : null; })(),
+          liquids: (r.liquids || []).map((l) => ({ name: l.name, pct: +l.pct || 0, waterFactorPct: +l.factor || 100, ...(isScaldLiquid(r, l) ? { addedAt: "scald" } : cleanWhen(l.when) ? { addedAt: cleanWhen(l.when) } : {}) })),
+          saltPct: +r.salt || 0, levainPct: +r.levain || 0, levainHydrationPct: +r.levHyd || 80, inoculationPct: +r.levInoc || 10,
+          levainBuildHrs: +r.levBuildHrs || 5, ...((+r.levSugar || 0) > 0 ? { levainSugarPctOfLevainFlour: +r.levSugar, levainSugarName: levSugarName(r) } : {}), levainRefTempC: +r.levRefTemp || 24, levainWholeGrainPct: +r.levWhole || 0,
+          trueHydrationPct: Math.round(trueHydration(r) * 10) / 10,
+          autolyseMin: +r.autolyse || 45, targetDoughTempC: Math.round((+r.ddt || DDT_DEFAULT_C) * 10) / 10,
+          bakeTempC: +r.bakeTemp || 245, bakeMin: +r.bakeMin || 45, steamMin: +r.steamMin || 20,
+          inclusions: (r.inclusions || []).map((fl) => ({ name: fl.name, pct: +fl.pct || 0, ...(cleanWhen(fl.when) ? { addedAt: cleanWhen(fl.when) } : {}) })),
+        },
+        loaves,
+        rig: { mixerDoughCapacityG: maxBatch, ...(byFlourR ? { mixerGrossFlourCapacityG: Math.round(mixerFlourCapG) } : {}), ovenLoafCapacity: cap },
+        derived: { totalDoughG: Math.round(loaves * W), mixerBatches: byFlourR ? Math.ceil(loaves * fplR / mixerFlourCapG) : (maxBatch > 0 ? Math.ceil(loaves * W / maxBatch) : 1), ovenLoads: cap > 0 ? Math.ceil(loaves / cap) : 1 },
+      };
+      const resp = await fetch("/api/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) throw new Error((data && (data.error || data.detail)) || ("Server " + resp.status));
+      setAiState((st) => ({ ...st, [id]: { result: data } }));
+    } catch (e) {
+      setAiState((st) => ({ ...st, [id]: { error: (e && e.message) || "Analysis failed" } }));
+    }
+  };
+  const remixRecipe = (ti) => {
+    const slot = slots[ti];
+    const originName = (slot.coreRecipeId && coreRecipes.find((r) => r.id === slot.coreRecipeId)?.name) || slot.draft?.name || "Recipe";
+    const name = remixName(originName, todayISO());
+    const draft = cloneRecipe(slot.draft); draft.flours = draft.flours.map((f, i) => (i === 0 ? { ...f, pct: mainPct(slot.draft) } : f));
+    const remix = { ...draft, id: uid(), name };
+    setRemixes((rs) => [remix, ...rs]);
+  };
+  // recipe builder mutators
+  const openNewCore = () => { setEditingDraft({ ...blankRecipe(), id: uid() }); setEditingRecipeId(null); setEditingIsRemix(false); setBuilderView("edit"); };
+  const openEditCore = (id) => { const r = coreRecipes.find((x) => x.id === id); if (r) { setEditingDraft(cloneRecipe(r)); setEditingRecipeId(id); setEditingIsRemix(false); setBuilderView("edit"); } };
+  const openEditRemix = (id) => { const r = remixes.find((x) => x.id === id); if (r) { setEditingDraft(cloneRecipe(r)); setEditingRecipeId(id); setEditingIsRemix(true); setBuilderView("edit"); } };
+  const cancelEdit = () => setBuilderView("list");
+  const saveEdit = () => {
+    if (!editingDraft) return;
+    const norm = cloneRecipe(editingDraft); norm.flours = norm.flours.map((f, i) => (i === 0 ? { ...f, pct: mainPct(editingDraft) } : f));
+    const r = { ...norm, id: editingRecipeId || uid() };
+    if (editingIsRemix) setRemixes((rs) => rs.map((x) => x.id === r.id ? r : x));
+    else {
+      const oldCore = coreRecipes.find((x) => x.id === r.id);
+      const curDone = !!(days.find((d) => d.id === currentDayId) || {}).complete;
+      setCoreRecipes((rs) => editingRecipeId ? rs.map((x) => x.id === r.id ? r : x) : [r, ...rs]);
+      if (editingRecipeId && oldCore && !curDone) setSlots((ss) => ss.map((s) => (s.coreRecipeId === r.id && sameFormula(s.draft, oldCore)) ? { ...s, draft: cloneRecipe(r) } : s));
+    }
+    setBuilderView("list");
+  };
+  const promoteRemixToCore = (id) => { const r = remixes.find((x) => x.id === id); if (!r) return; setCoreRecipes((rs) => [{ ...r, id: uid() }, ...rs]); setRemixes((rs) => rs.filter((x) => x.id !== id)); };
+  const deleteCoreRecipe = (id) => setCoreRecipes((rs) => rs.filter((x) => x.id !== id));
+  const deleteRemix = (id) => setRemixes((rs) => rs.filter((x) => x.id !== id));
+  // Dropdown source: the pantry's recipe ingredients (packaging and consumables are not offered). Names the baker types into a recipe are remembered in the pantry.
+  const ingOptions = useMemo(() => pantry.filter((it) => (it.usage || "recipe") === "recipe").map((it) => ({ id: it.id, name: it.name, group: validGroup(it.group) })), [pantry]);
+  const groupOf = (name) => { const it = pantryFind(pantry, name); return (it ? validGroup(it.group) : "") || guessGroup(name); };
+  const ensurePantryIng = (name, kind) => {
+    const n = String(name || "").trim(); if (!n || normName(n) === "water") return;
+    setPantry((ps) => (pantryFind(ps, n) ? ps : [...ps, blankPantryItem(n, guessGroup(n) || (kind === "flour" ? "flour" : kind === "liquid" ? "wet" : ""))]));
+  };
+  const patchEdit = (patch) => setEditingDraft((d) => d ? { ...d, ...patch } : d);
+  const patchEditFlour = (idx, patch) => setEditingDraft((d) => { if (!d) return d; const f = [...d.flours]; f[idx] = { ...f[idx], ...patch }; return { ...d, flours: f }; });
+  const addEditFlour = () => setEditingDraft((d) => d ? { ...d, flours: [...d.flours, mk("Flour " + (d.flours.length + 1), 0)] } : d);
+  const removeEditFlour = (idx) => setEditingDraft((d) => d ? { ...d, flours: d.flours.filter((_, i) => i !== idx) } : d);
+  const patchEditInc = (idx, patch) => setEditingDraft((d) => { if (!d) return d; const f = [...d.inclusions]; f[idx] = { ...f[idx], ...patch }; return { ...d, inclusions: f }; });
+  const addEditInc = () => setEditingDraft((d) => d ? { ...d, inclusions: [...(d.inclusions || []), mk("Inclusion " + ((d.inclusions || []).length + 1), 0)] } : d);
+  const removeEditInc = (idx) => setEditingDraft((d) => d ? { ...d, inclusions: (d.inclusions || []).filter((_, i) => i !== idx) } : d);
+  const patchEditLiq = (idx, patch) => setEditingDraft((d) => { if (!d) return d; const f = [...(d.liquids || [])]; f[idx] = { ...f[idx], ...patch }; return { ...d, liquids: f }; });
+  const addEditLiq = () => setEditingDraft((d) => d ? { ...d, liquids: [...(d.liquids || []), mkL("Milk", 0, 88)] } : d);
+  const removeEditLiq = (idx) => setEditingDraft((d) => d ? { ...d, liquids: (d.liquids || []).filter((_, i) => i !== idx) } : d);
+
+  const NUM = (label, key, hi) => (
+    <div className="bl-field2"><label className={hi ? "hi" : ""}>{label}</label>
+      <input type="number" min="0" value={params[key]} onChange={(e) => setP(key, e.target.value)} /></div>
+  );
+
+  return (
+    <>
+    <div className="bl-root" onFocusCapture={(e) => { const el = e.target; if (el && ((el.tagName === "INPUT" && (el.type === "text" || el.type === "number")) || el.tagName === "TEXTAREA")) { try { el.select(); } catch (err) {} } }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=DM+Sans:wght@400;500;600&family=B612+Mono:wght@400;700&display=swap');
+        /* B612 Mono sets its punctuation at the left of the cell ("7: 00a", "75. 9"). Colon, period, comma and degree come from a tiny DM Sans subset instead; every digit stays B612 Mono. */
+        @font-face{font-family:'BL Punct';font-weight:400;src:url(data:font/woff2;base64,d09GMgABAAAAAAMkAA8AAAAABkQAAALNAAQBBgAAAAAAAAAAAAAAAAAAAAAAAAAAGyAcKgZgP1NUQVReAEwRCAqBOIEsATYCJAMUCwwABCAFhGoHIAwHGyYFKC4HbGMUtg9xE2fMFuPJHdEhOYOPvNG2fCw/gmrt357d/QAcIgUogTWwD0tS79uwi2JFoIgcu+gnU9Ho7mpN90JoP8ULEJYQ7id/aVkhCgMoo6qryq62RpRCdvdim1KCiVgVwVX/F/pzzlJl/irfN+hUTYADmku2+9wcsTGrpQesWCPc5VOoVCzwAi2IL90mCtnT4VMiw2NIh/sLtBpXAG2orG8HiQIVACQzjwVvmuroCF0EBqWtLmk8zjWQzqbdALZfU+Ig+HJzZPgnNp+mKni1RDbXX+TfsRIIiP/pFWZgIKFZRj8+luCdYLk1JOHknaZIKg7RkXmUg6dRLx0E0U+FLKToiMukV8iSFGMAARKMMPQMgdVAq2ZJsoRLTLaC4K2rH359aocAEKKiCzSAVhQsAZYDnWiv7J7aS3d7x+EbNP1Wfu4B1O53lLf3HX778M4+fl8f7Ot7tXdf1h29RdNvZGdfQe31GA1mQLP/DPMP+Uz0b+efuy8N2bjFVvd4juE6brPEs0nmzmC4YjRXBsMWmAehSRBXugFY9LuaikCJxp5fN4fUiT+SnH9C/TRmAfVHvqrKNzO/o1ECwXB52YtQFkD8UhrSfHXeLPKi+GRRXWCG0GAHka0EAgBkgQ63ZFFacJsAYdAzkk5vkK32g2JeAjRYm41tNKtxVTQbbhct2uMaOnR6g36SuItRinh6/WNk8cZ6BGtV2owp0yjMx8MrAGs3bQJWrgHWZsQiDtYsjZg1YQyFlcigphFpHMxiGkWxODFublNmUNMyRrmMIRayVxLElHkTJhGLKI7buAXOmGztIY5iUa37TsmYNyItwMXDIyCuSpMmVeJ1xywjOGUeAgnvotPEj8tnEIswUxN68t4SxDxOHw+XKBc/j4EeYVM2O2PMiHmY1V0zocvEOIVXAGVq0NkZY1oRC+dmfKCapbz8LKoeCy4A) format('woff2');unicode-range:U+002C,U+002E,U+003A,U+00B0;}
+        @font-face{font-family:'BL Punct';font-weight:700;src:url(data:font/woff2;base64,d09GMgABAAAAAAMgAA8AAAAABigAAALGAAQBBgAAAAAAAAAAAAAAAAAAAAAAAAAAGyAcKgZgP1NUQVRaAEwRCAqBOIE1ATYCJAMUCwwABCAFhFIHIAwHGxMFIJ4DbvN0RPSISPXlZ083iWaLcGxF8fDffrT7ZmbFJC2aNuGSLXnCI801EvEQxTrZ9XRt/6/92tu7Q8T3TAUx3T/3F41ESIRGpHm8jDSrlCxOMbx7AEow8MBh6/9Cf84+z820nkcBrY8BwJycyFoaBZhggtH0bgAOoNMTOD0gOt3pUh1HVFb9fleBRsO6oWWR1ACUKlABBBpNkOFAplXvnqVb0Ao8BiUtSAU1pDNpI4C17pTYBIa0DBn+hZWTjcKpmS7yp/eU/DssQED8TwWMa4WEehnduJiJs49hD1Ap+3eFojKxg85uoHYctTp1QxDdqhGCaE8FZEmKIYAAieZ2uCd4ZgGN6iXJTBoOFxWEP1298OLBAASAEBVtoAY0omAmMB9oRXPB8tRc2psHjx7H4SdNZx859HDdcMXA+NGLF7ng5UuuP3/u0LNn648f7Nn7jWfuOnTvAE/yjs9/lYicRdBztt/DuV83tyb8AqlPqZb51ZCwIaBArWSR4gON7u5uVaM8bVe3GmACQp0g9tYCMON/e+LUCJSozdtPvm6ucf0p5eZf8GkfMwB8OjdE/7/+b2nMj0KtBIK/C8saAHFiBGKvUpMGhf1QetPsj7J1EEOosU6x1XgCAGSBFtdkURpwhxCh1xmSeo+RTbpFMe4DNebUytcark8Q9frbQoPmOIF2pR4T3VRcwaDKuPqoQ8rjlqUIxr68VctWUJiBjp4JNmDFIiwkDes3awsLy8kj1iyaR2F+26gVRB5iy5rNUgyWg5bWslWgb942R2MesUlrGUEs27BoCbGFYmkt2KRODssvcQ87BhVAbFhgoqGjY+IUlZUV5SzTRBFPvfq09LFGQxafY69ew8NDSB3LllAE/PmscToadhpGOpOD7WyKWTVv1sYjqgcWDVv8gkjPBKTjaHfVvD7E5nkbF6gGkyx9N6ouynkAAAA=) format('woff2');unicode-range:U+002C,U+002E,U+003A,U+00B0;}
+        * { box-sizing:border-box; }
+        .bl-root{--chrome:#1a0f07;--chrome2:#2f1c0f;--chrome3:#3d2010;--chrome-t:#f5efe3;--chrome-m:#b09070;--paper:#f4eeda;--paper2:#e8d9be;--cream:#fffdf8;--ink:#241508;--ink2:#7a5a3a;--line:#d4c4a8;--crust:#b5651d;--crust2:#8a4a14;--active:#c4521f;--passive:#dfc99a;--passive-line:#c9ad79;--sand:#a08060;--alert:#b32d24;--alert-bg:#f6d9d4;font-family:'DM Sans',system-ui,sans-serif;color:var(--ink);background:var(--paper);padding:0 22px 40px;min-height:100vh;overflow-x:clip;}
+        .bl-head{background:var(--chrome);margin:0 -22px;padding:14px 22px 0;border-bottom:none;display:flex;flex-direction:column;gap:0;}
+        .bl-brandstrip{display:flex;align-items:center;gap:11px;padding-bottom:12px;border-bottom:1px solid rgba(245,239,227,.08);margin-bottom:12px;}
+        .bl-build-id{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;letter-spacing:.04em;color:var(--chrome-m,#b09070);opacity:.75;margin-left:0;align-self:center;white-space:nowrap;}
+        .bl-hap-logo-sm{height:20px;width:auto;color:var(--chrome-t);display:block;}
+        .bl-prodname-sm{font-family:'Fraunces',serif;font-weight:600;font-size:16px;color:var(--chrome-m);letter-spacing:-0.2px;}
+        .bl-runnav{margin-left:auto;display:inline-flex;border:1.5px solid rgba(245,239,227,.18);border-radius:8px;overflow:hidden;flex:none;}
+        .bl-runnav button{font-family:'DM Sans';font-size:12.5px;font-weight:600;padding:8px 14px;border:none;background:transparent;color:var(--chrome-m);cursor:pointer;}
+        .bl-runnav button + button{border-left:1px solid rgba(245,239,227,.12);}
+        .bl-runnav button:hover{background:rgba(245,239,227,.1);color:var(--chrome-t);}
+        .bl-prodname-sm::before{content:'';display:inline-block;width:1px;height:14px;background:rgba(245,239,227,.2);margin-right:11px;vertical-align:-2px;}
+        .bl-dayhd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding-bottom:12px;}
+        .bl-title{font-family:'Fraunces',serif;font-weight:600;font-size:26px;line-height:1;letter-spacing:-0.5px;color:var(--ink);display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+        .bl-hap-logo{height:26px;width:auto;color:var(--ink);display:block;}
+        .bl-prodname{font-family:'Fraunces',serif;font-weight:600;font-size:21px;color:var(--crust2);position:relative;padding-left:13px;}
+        .bl-prodname::before{content:'';position:absolute;left:0;top:50%;transform:translateY(-50%);width:1.5px;height:20px;background:var(--line);}
+        .bl-title small{flex-basis:100%;display:block;font-family:'DM Sans',sans-serif;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--sand);margin-top:2px;font-weight:600;}
+        .bl-back{display:inline-flex;align-items:center;justify-content:center;color:var(--chrome-m);background:transparent;border:1.5px solid rgba(245,239,227,.18);border-radius:8px;width:40px;height:40px;padding:0;cursor:pointer;flex:none;}
+        .bl-back:hover{background:rgba(245,239,227,.1);color:var(--chrome-t);}
+        .bl-dayid{display:flex;align-items:center;gap:10px;flex-wrap:wrap;flex:1;min-width:0;}
+        .bl-dayname{font-family:'Fraunces',serif;font-weight:600;font-size:22px;color:var(--chrome-t);background:transparent;border:none;border-bottom:1.5px solid transparent;padding:2px 2px;min-width:140px;flex:1;}
+        .bl-dayname::placeholder{color:var(--chrome-m);}
+        .bl-dayname:hover{border-bottom-color:rgba(245,239,227,.25);}
+        .bl-dayname:focus{outline:none;border-bottom-color:var(--crust);}
+        .bl-daydate{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;color:var(--chrome-m);background:rgba(245,239,227,.08);border:1.5px solid rgba(245,239,227,.15);border-radius:7px;padding:6px 9px;}
+        .bl-unittoggle-hd{margin-left:auto;align-self:center;flex:none;height:36px;border:1.5px solid rgba(245,239,227,.18);border-radius:7px;overflow:hidden;}
+        .bl-unittoggle-hd button{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;font-weight:600;padding:0 11px;border:none;cursor:pointer;height:100%;}
+        .bl-unittoggle-hd button.on{background:var(--crust);color:var(--chrome-t);}
+        .bl-unittoggle-hd button.off{background:transparent;color:var(--chrome-m);}
+        .bl-panel{background:var(--cream);border:1.5px solid var(--line);border-radius:12px;padding:18px;margin-bottom:20px;box-shadow:0 2px 8px rgba(26,15,7,.04);}
+        .bl-panel h3{font-family:'Fraunces',serif;font-size:20px;margin:0 0 14px;font-weight:600;display:flex;align-items:center;gap:9px;letter-spacing:-0.3px;}
+        .bl-panel h3::before{content:'◆';width:auto;height:auto;background:transparent;border-radius:0;transform:none;font-size:10px;color:var(--crust);font-family:'DM Sans';line-height:1;margin-top:1px;}
+        .bl-grid{display:grid;grid-template-columns:300px 1fr;gap:24px;align-items:start;}
+        .bl-grid>div{min-width:0;}
+        @media (max-width:880px){.bl-grid{grid-template-columns:1fr;}}
+        .bl-field{margin-bottom:13px;} .bl-field label{display:block;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--ink2);margin-bottom:5px;}
+        .bl-field input{width:100%;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:15px;padding:7px 9px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);}
+        .bl-ro{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:15px;padding:7px 9px;border:1.5px dashed var(--line);border-radius:6px;background:var(--paper2);color:var(--crust2);font-weight:600;}
+        .bl-slider-val{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:600;color:var(--crust2);float:right;}
+        input[type=range]{width:100%;accent-color:var(--crust);}
+        .bl-field2 label{display:block;font-size:10.5px;letter-spacing:.5px;color:var(--ink2);margin-bottom:4px;}
+        .bl-field2 label.hi{color:var(--crust2);font-weight:600;} .bl-field2 label.hi::after{content:' •';color:var(--crust);}
+        .bl-field2 input{width:100%;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:14px;padding:6px 8px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);}
+        .bl-recipe{display:grid;grid-template-columns:1fr 1fr;gap:10px 12px;}
+        .bl-btn{font-family:'DM Sans';font-weight:600;font-size:13px;cursor:pointer;border-radius:7px;padding:9px 12px;border:1.5px solid var(--ink);background:var(--ink);color:var(--paper);transition:.15s;}
+        .bl-btn:hover{background:var(--crust2);border-color:var(--crust2);} .bl-btn.block{width:100%;}
+        /* planner */
+        .bl-types{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+        @media (max-width:760px){.bl-types{grid-template-columns:1fr;}}
+        .bl-type{border:1.5px solid var(--line);border-radius:12px;padding:14px;background:var(--cream);min-width:0;overflow:hidden;box-shadow:0 2px 10px rgba(26,15,7,.05);}
+        .bl-card-hd{display:flex;justify-content:space-between;align-items:center;background:var(--chrome2);margin:-14px -14px 12px;padding:11px 14px;border-radius:0;}
+        .bl-card-hd .cardno{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--chrome-m);font-weight:600;}
+        .bl-rmcard{font-family:'DM Sans';font-size:11px;color:#fca5a5;background:none;border:none;cursor:pointer;padding:3px 4px;border-radius:5px;}
+        .bl-rmcard:hover{background:rgba(255,100,100,.15);}
+        .bl-orders{display:flex;gap:10px;margin-bottom:12px;}
+        .bl-orders>div{flex:1;display:flex;flex-direction:column;gap:4px;}
+        .bl-orders label{font-size:11px;color:var(--ink2);font-family:'DM Sans';}
+        .bl-orders select{font-family:'DM Sans';font-size:14px;padding:7px 8px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);}
+        .bl-addrec{display:block;width:100%;margin-top:14px;padding:11px;font-family:'DM Sans';font-size:14px;font-weight:600;color:var(--crust2);background:#fff;border:1.5px dashed var(--crust);border-radius:9px;cursor:pointer;}
+        .bl-addrec:hover{background:var(--paper2);}
+        .bl-calnote{flex-basis:100%;width:100%;margin-top:4px;font-family:'DM Sans';font-size:12.5px;line-height:1.4;padding:8px 10px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);resize:vertical;box-sizing:border-box;}
+        .bl-calnote::placeholder{color:var(--ink2);opacity:.7;}
+        .bl-ordbadge{font-style:normal;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;color:var(--crust2);background:var(--paper2);padding:2px 6px;border-radius:5px;font-weight:600;}
+        .bl-bakesum{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 12px;}
+        .bl-bakesum>div{flex:1;min-width:88px;border:1.5px solid var(--line);border-radius:9px;padding:10px 12px;background:#fffdf8;display:flex;flex-direction:column;gap:2px;}
+        .bl-bakesum .v{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:18px;color:var(--crust2);}
+        .bl-bakesum .l{font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:var(--ink2);}
+        .bl-preheat{font-size:12.5px;color:var(--ink2);background:#fff4e6;border:1px solid #f0d6b0;border-radius:8px;padding:9px 12px;margin-bottom:12px;}
+        .bl-preheat b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;color:var(--crust2);}
+        .bl-loads{display:flex;flex-direction:column;gap:0;}
+        .bl-recover{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--ink2);text-align:center;padding:5px 0;opacity:.8;}
+        .bl-load{display:flex;gap:12px;align-items:stretch;border:1.5px solid var(--line);border-radius:9px;background:#fffdf8;padding:11px 13px;}
+        .bl-load .lo-no{flex:none;width:30px;height:30px;border-radius:50%;background:var(--crust);color:var(--paper);font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:14px;display:flex;align-items:center;justify-content:center;}
+        .bl-load .lo-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:7px;}
+        .bl-load .lo-hd{display:flex;align-items:baseline;gap:10px;}
+        .bl-load .lo-nm{font-family:'Fraunces',serif;font-weight:600;font-size:15px;color:var(--ink);}
+        .bl-load .lo-n{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--ink2);}
+        .bl-load .lo-temp{margin-left:auto;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:600;font-size:13px;color:#a8401a;}
+        .bl-load .lo-bar{display:flex;height:9px;border-radius:5px;overflow:hidden;background:var(--paper2);}
+        .bl-load .lo-bar .seg.steam{background:repeating-linear-gradient(45deg,#c47a3a,#c47a3a 5px,#b86c2c 5px,#b86c2c 10px);}
+        .bl-load .lo-bar .seg.vent{background:#e2cda3;}
+        .bl-load .lo-times{display:flex;justify-content:space-between;gap:8px;font-size:11.5px;color:var(--ink2);}
+        .bl-load .lo-times b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;color:var(--crust2);}
+        .bl-load .lo-times .vent{color:#a8401a;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;}
+        .bl-pool{border:1.5px solid var(--line);border-radius:9px;background:var(--paper2);padding:12px 14px;margin:16px 0 18px;}
+        .bl-pool-hd{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--crust2);font-weight:600;margin-bottom:8px;}
+        .bl-pool-row{display:flex;align-items:baseline;gap:10px;padding:5px 0;border-top:1px dashed var(--line);}
+        .bl-pool-row:first-of-type{border-top:none;}
+        .bl-pool-row .pr-nm{font-family:'Fraunces',serif;font-weight:600;font-size:15px;color:var(--ink);flex:1;min-width:0;}
+        .bl-pool-row .pr-fig{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;color:var(--ink2);}
+        .bl-pool-row .pr-rem{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;font-weight:600;color:var(--crust2);min-width:118px;text-align:right;}
+        .bl-pool-row .pr-rem.done{color:#3a7d44;} .bl-pool-row .pr-rem.over{color:var(--alert);}
+        .bl-pool-row.over .pr-nm{color:var(--alert);}
+        .bl-mixday{display:flex;align-items:flex-end;gap:18px;flex-wrap:wrap;}
+        .bl-mixday-field{display:flex;flex-direction:column;gap:6px;}
+        .bl-mixday-field label{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink2);font-weight:700;}
+        .bl-mixday-field input{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:15px;padding:10px 12px;border:1.5px solid var(--line);border-radius:9px;background:var(--cream);color:var(--ink);}
+        .bl-mixday-note{font-size:13px;color:var(--ink2);margin:0;max-width:340px;line-height:1.5;}
+        .bl-mixday-note strong{color:var(--ink);font-weight:600;}
+        @media(max-width:600px){.bl-mixday{gap:12px;}.bl-mixday-note{max-width:none;}}
+        .bl-session{border:1.5px solid var(--line);border-radius:11px;background:#fffdf8;padding:14px;margin-bottom:14px;}
+        .bl-session-hd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;padding-bottom:12px;border-bottom:1.5px solid var(--line);}
+        .bl-session-hd .ss-no{font-family:'Fraunces',serif;font-weight:600;font-size:18px;color:var(--ink);}
+        .bl-session-hd .ss-start{display:flex;align-items:center;gap:6px;}
+        .bl-session-hd .ss-start label{font-size:12px;color:var(--ink2);}
+        .bl-session-hd .bl-rmcard{margin-left:auto;}
+        .bl-alloc{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px;}
+        .bl-alloc .al-cell{display:flex;flex-direction:column;gap:4px;width:108px;}
+        .bl-alloc .al-cell label{font-size:11px;color:var(--ink2);font-family:'DM Sans';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .bl-alloc .al-cell input{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:15px;padding:7px 9px;border:1.5px solid var(--line);border-radius:7px;background:#fff;}
+        .bl-sessempty{font-size:13px;color:var(--ink2);opacity:.7;padding:4px 0 6px;}
+        .bl-sesslist{display:flex;flex-direction:column;gap:8px;margin-bottom:12px;}
+        .bl-rec-sessions{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line);}
+        .bl-sess-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:5px 0;border-bottom:1px solid #f3ece0;}
+        .bl-sess-row:last-of-type{border-bottom:none;}
+        .bl-sess-row .ss-no{font-family:'Fraunces',serif;font-weight:600;font-size:13px;color:var(--crust2);min-width:72px;}
+        .bl-sess-row input[type="date"]{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;padding:6px 8px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);}
+        .bl-sess-row .ss-lv-auto{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:14px;color:var(--crust2);}
+        .bl-sess-row .ss-lv{width:58px;}
+        .bl-sess-row .ss-lvu{font-size:12px;color:var(--ink2);}
+        .bl-sess-row.over .ss-no,.bl-sess-row.over .ss-lv-auto{color:var(--alert);}
+        .bl-addrow{font-family:'DM Sans';font-size:13px;font-weight:600;color:var(--crust2);background:transparent;border:1.5px dashed var(--crust);border-radius:7px;padding:6px 12px;cursor:pointer;margin-top:8px;}
+        .bl-addrow:hover{background:var(--paper2);}
+        .bl-date-schedules{display:flex;flex-direction:column;gap:16px;margin-top:16px;}
+        .bl-datesect{border:1.5px solid var(--line);border-radius:9px;overflow:hidden;}
+        .bl-datesect-hd{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 14px;background:var(--paper2);border-bottom:1.5px solid var(--line);}
+        .bl-datesect-hd .ds-date{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:15px;color:var(--crust2);}
+        .bl-datesect-hd .ss-start{display:flex;align-items:center;gap:6px;margin-left:auto;}
+        .bl-datesect-hd .ss-start label{font-size:12px;color:var(--ink2);}
+        .bl-datesect .bl-preheat{margin:10px 14px 6px;border-radius:7px;}
+        .bl-datesect .bl-loads{padding:0 10px 10px;display:flex;flex-direction:column;gap:8px;}
+        .bl-sessrow{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+        .bl-sessrow .ss-no{font-family:'Fraunces',serif;font-weight:600;font-size:15px;color:var(--ink);min-width:84px;}
+        .bl-session-hd .ss-date{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;color:var(--crust2);font-weight:600;background:var(--paper2);border-radius:7px;padding:7px 11px;}
+        .dc-bake{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--crust2);}
+        .bl-home-tabs{display:inline-flex;border:1.5px solid var(--line);border-radius:9px;overflow:hidden;}
+        .bl-home-tabs button{font-family:'DM Sans';font-size:13px;font-weight:600;padding:9px 18px;border:none;background:var(--cream);color:var(--ink2);cursor:pointer;}
+        .bl-home-tabs button.on{background:var(--chrome2);color:var(--chrome-t);}
+        .bl-starter{max-width:760px;}
+        .bl-st-hero{display:flex;align-items:center;justify-content:space-between;gap:16px;background:var(--chrome2);border-radius:14px;padding:18px 20px;margin-bottom:18px;}
+        .bl-st-name{font-family:'Fraunces',serif;font-weight:600;font-size:26px;color:var(--chrome-t);line-height:1;}
+        .bl-st-est{font-family:'DM Sans';font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--chrome-m);font-weight:600;margin-top:7px;}
+        .bl-st-status{display:flex;align-items:center;gap:10px;background:rgba(245,239,227,.07);border:1px solid rgba(245,239,227,.13);border-radius:10px;padding:9px 14px;}
+        .bl-st-status .sts-dot{width:11px;height:11px;border-radius:50%;flex:none;}
+        .bl-st-status .sts-text{display:flex;flex-direction:column;line-height:1.25;}
+        .bl-st-status .sts-text b{font-family:'DM Sans';font-size:13px;color:var(--chrome-t);}
+        .bl-st-status .sts-text span{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;color:var(--chrome-m);}
+        .bl-st-status.fresh .sts-dot{background:#6fae54;box-shadow:0 0 0 3px rgba(111,174,84,.25);}
+        .bl-st-status.due .sts-dot{background:#d9a93b;box-shadow:0 0 0 3px rgba(217,169,59,.25);}
+        .bl-st-status.overdue .sts-dot{background:#cf5347;box-shadow:0 0 0 3px rgba(207,83,71,.25);}
+        .bl-st-panel{background:var(--cream);border:1.5px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px;box-shadow:0 2px 8px rgba(26,15,7,.04);}
+        .bl-st-panel h3{font-family:'Fraunces',serif;font-size:19px;margin:0 0 13px;font-weight:600;display:flex;align-items:center;gap:9px;}
+        .bl-st-panel h3::before{content:'◆';font-size:9px;color:var(--crust);}
+        .bl-st-feedtop{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px;}
+        .bl-st-feedtop .bl-field2{flex:1;min-width:96px;}
+        .bl-st-subhead{font-size:10px;letter-spacing:1.2px;text-transform:uppercase;color:var(--sand);font-weight:600;margin:14px 0 8px;}
+        .bl-st-recipe{background:var(--chrome2);border-radius:11px;padding:14px 16px;margin-top:14px;}
+        .bl-st-recipe .str-hd{font-family:'Fraunces',serif;font-weight:600;font-size:15px;color:var(--chrome-t);margin-bottom:9px;}
+        .bl-st-recipe .str-row{display:flex;justify-content:space-between;align-items:baseline;padding:5px 0;border-bottom:1px solid rgba(245,239,227,.1);font-size:13px;color:var(--chrome-m);}
+        .bl-st-recipe .str-row:last-child{border-bottom:none;}
+        .bl-st-recipe .str-row b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;color:var(--chrome-t);font-weight:600;}
+        .bl-st-recipe .str-row.sub{padding-left:14px;font-size:12px;opacity:.85;}
+        .bl-st-recipe .str-row.sub span::before{content:'└ ';opacity:.5;}
+        .bl-st-recipe .str-row.tot{margin-top:3px;border-top:1.5px solid rgba(245,239,227,.2);padding-top:8px;}
+        .bl-st-recipe .str-row.tot b{font-size:15px;color:var(--crust);}
+        .bl-st-fridgenote{font-size:12px;color:var(--ink2);line-height:1.5;margin-top:12px;background:#eaf1f8;border-radius:8px;padding:10px 12px;}
+        .bl-st-inline-num{width:50px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;padding:3px 6px;border:1.5px solid var(--line);border-radius:6px;margin-left:4px;}
+        .bl-feed-btn{align-self:flex-end;font-family:'DM Sans';font-size:13px;font-weight:600;color:var(--chrome-t);background:var(--crust);border:none;border-radius:8px;padding:9px 16px;cursor:pointer;height:fit-content;}
+        .bl-feed-btn:hover{background:var(--crust2);}
+        .bl-st-caltext{font-size:12px;color:var(--ink2);line-height:1.4;margin-bottom:6px;}
+        .bl-st-cal{display:flex;flex-direction:column;gap:7px;margin-bottom:8px;}
+        .bl-subhead{font-size:10px;letter-spacing:1.2px;text-transform:uppercase;color:var(--sand);font-weight:600;margin:14px 0 7px;}
+        .bl-lev-sh{display:flex;align-items:center;gap:8px;}
+        .bl-lev-starter{font-family:'DM Sans';font-size:10px;font-weight:600;letter-spacing:.5px;color:var(--crust);}
+        .bl-lev-section{border:1.5px solid var(--passive-line);border-radius:10px;padding:12px;background:var(--paper);margin-bottom:4px;}
+        .bl-lev-section .bl-fixed{margin-bottom:10px;}
+        .bl-lev-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px;}
+        @media (max-width:600px){.bl-lev-grid{grid-template-columns:1fr 1fr;}}
+        .bl-lev-grid .wrap2{display:flex;align-items:center;gap:4px;}
+        .bl-lev-grid .wrap2 input{width:100%;}
+        .bl-lev-grid .wrap2 .pc{font-size:12px;color:var(--ink2);}
+        .bl-lev-exp{display:flex;flex-direction:column;gap:4px;margin-bottom:8px;}
+        .bl-lev-exp label{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--sand);font-weight:600;}
+        .bl-lev-expnote{font-family:'DM Sans';font-size:13px;padding:8px 10px;border:1.5px solid var(--line);border-radius:7px;background:var(--cream);color:var(--ink);width:100%;}
+        .bl-lev-hint{font-size:11px;color:var(--ink2);line-height:1.4;font-style:italic;}
+        .bl-rec-title{font-family:'Fraunces',serif;font-weight:600;font-size:18px;color:var(--ink);line-height:1.2;}
+        .bl-rec-none{font-style:italic;font-size:14px;color:var(--ink2);font-family:'DM Sans';font-weight:400;}
+        .bl-loadsel-core{font-family:'DM Sans';font-size:14px;padding:8px 10px;border:1.5px solid var(--line);border-radius:8px;background:var(--paper2);color:var(--crust2);width:100%;}
+        .bl-remix-btn{width:100%;margin-top:12px;padding:11px;font-family:'DM Sans';font-size:14px;font-weight:600;color:var(--crust);background:#fff;border:1.5px solid var(--crust);border-radius:9px;cursor:pointer;}
+        .bl-remix-btn:hover{background:var(--paper2);}
+        .bl-builder-list{display:flex;flex-direction:column;gap:4px;}
+        .bl-builder-sh{margin:12px 0 8px;}
+        .bl-recipe-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-bottom:6px;}
+        .bl-recipe-card{position:relative;border:1.5px solid var(--line);border-radius:12px;background:var(--cream);padding:0;cursor:pointer;transition:border-color .15s,box-shadow .15s;overflow:hidden;box-shadow:0 2px 8px rgba(26,15,7,.04);}
+        .bl-recipe-card:hover{border-color:var(--crust);box-shadow:0 4px 16px rgba(26,15,7,.1);}
+        .bl-recipe-card.remix{border-color:#c5b4e3;}
+        .brc-band{background:var(--chrome2);padding:12px 14px;}
+        .brc-band .brc-name{font-family:'Fraunces',serif;font-weight:600;font-size:17px;color:var(--chrome-t);padding-right:26px;}
+        .bl-recipe-card.remix .brc-band{background:#2a1840;}
+        .brc-body{padding:10px 14px 12px;display:flex;flex-direction:column;gap:3px;}
+        .brc-body .brc-meta{font-size:11.5px;color:var(--ink2);line-height:1.4;}
+        .brc-body .brc-acts{display:flex;gap:6px;margin-top:6px;}
+        .bl-recipe-card .brc-del{position:absolute;top:9px;right:9px;width:24px;height:24px;border:none;background:transparent;color:var(--chrome-m);font-size:15px;cursor:pointer;border-radius:4px;}
+        .bl-recipe-card .brc-del:hover{background:rgba(255,100,100,.2);color:#fca5a5;}
+        .bl-recipe-card .brc-promote{font-family:'DM Sans';font-size:12px;font-weight:600;color:#5a3fa0;background:#ede8f8;border:none;border-radius:7px;padding:5px 10px;cursor:pointer;}
+        .bl-re-hd{display:flex;align-items:center;gap:12px;margin-bottom:18px;padding-bottom:14px;border-bottom:1.5px solid var(--line);}
+        .bl-re-title{font-family:'Fraunces',serif;font-weight:600;font-size:20px;color:var(--ink);}
+        .bl-helpbtn{width:100%;margin-top:10px;padding:11px;font-family:'DM Sans';font-size:14px;font-weight:600;color:var(--crust2);background:#fff;border:1.5px solid var(--crust);border-radius:9px;cursor:pointer;}
+        .help-overlay{--cream:#fffdf8;--ink:#241508;--ink2:#7a5a3a;--line:#d4c4a8;--crust:#b5651d;--crust2:#8a4a14;font-family:'DM Sans',system-ui,sans-serif;color:var(--ink);position:fixed;inset:0;z-index:300;background:rgba(26,15,7,.5);display:flex;align-items:flex-end;justify-content:center;}
+        .help-sheet{width:100%;max-width:680px;height:min(90vh,780px);background:var(--cream);border-radius:16px 16px 0 0;display:flex;flex-direction:column;box-shadow:0 -8px 40px rgba(0,0,0,.3);overflow:hidden;}
+        @media (min-width:760px){.help-overlay{align-items:center;}.help-sheet{border-radius:16px;height:min(82vh,740px);}}
+        .help-hd{display:flex;align-items:center;gap:8px;padding:12px 14px;background:#2a1c10;color:#f5efe3;}
+        .help-title{flex:1;min-width:0;display:flex;flex-direction:column;}
+        .help-title b{font-family:'Fraunces',serif;font-size:17px;}
+        .help-title span{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;opacity:.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .help-hd button{font-family:'DM Sans';font-size:13px;font-weight:600;color:#f5efe3;background:rgba(245,239,227,.14);border:none;border-radius:8px;padding:8px 12px;cursor:pointer;}
+        .help-hd .help-x{font-size:20px;line-height:1;padding:6px 12px;}
+        .help-list{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px;-webkit-overflow-scrolling:touch;}
+        .help-empty p{margin:0 0 12px;font-size:14px;color:var(--ink2);line-height:1.45;}
+        .help-chips{display:flex;flex-wrap:wrap;gap:8px;}
+        .help-chips button{font-family:'DM Sans';font-size:13.5px;font-weight:600;padding:9px 13px;border:1.5px solid var(--crust);background:#fff;color:var(--crust2);border-radius:999px;cursor:pointer;}
+        .help-msg{max-width:92%;padding:10px 13px;border-radius:14px;font-size:15px;line-height:1.45;word-wrap:break-word;overflow-wrap:anywhere;}
+        .help-msg p{margin:0 0 8px;} .help-msg p:last-child{margin-bottom:0;} .help-msg ul{margin:0 0 8px;padding-left:20px;} .help-msg li{margin-bottom:3px;}
+        .help-msg.user{align-self:flex-end;background:var(--crust2);color:#fff;border-bottom-right-radius:4px;}
+        .help-msg.assistant{align-self:flex-start;background:#fff;border:1px solid var(--line);color:var(--ink);border-bottom-left-radius:4px;}
+        .help-think{color:var(--ink2);font-style:italic;}
+        .help-err{align-self:stretch;display:flex;gap:10px;align-items:center;justify-content:space-between;font-size:13.5px;color:#b3261e;background:#fdecea;border-radius:10px;padding:10px 12px;}
+        .help-err button{font-family:'DM Sans';font-weight:600;font-size:13px;border:none;background:#b3261e;color:#fff;border-radius:8px;padding:7px 12px;cursor:pointer;flex:none;}
+        .help-foot{border-top:1px solid var(--line);padding:8px 12px 12px;background:#faf7f0;}
+        .help-note{font-size:11.5px;color:var(--ink2);margin-bottom:6px;}
+        .help-photochip{display:inline-flex;align-items:flex-start;gap:4px;margin-bottom:6px;}
+        .help-photochip img{height:56px;width:auto;border-radius:8px;border:1px solid var(--line);}
+        .help-photochip button{border:none;background:#b3261e;color:#fff;border-radius:50%;width:22px;height:22px;line-height:1;cursor:pointer;font-size:14px;}
+        .help-row{display:flex;gap:8px;align-items:flex-end;}
+        .help-photo{flex:none;width:44px;height:44px;display:flex;align-items:center;justify-content:center;font-size:20px;border:1.5px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;}
+        .help-photo input{display:none;}
+        .help-input{flex:1;min-width:0;font-family:'DM Sans';font-size:16px;padding:10px 12px;border:1.5px solid var(--line);border-radius:10px;resize:none;background:#fff;color:var(--ink);box-sizing:border-box;}
+        .help-send{flex:none;height:44px;padding:0 18px;font-family:'DM Sans';font-size:15px;font-weight:700;color:#fff;background:var(--crust2);border:none;border-radius:10px;cursor:pointer;}
+        .help-send:disabled,.help-input:disabled{opacity:.5;cursor:default;}
+        @media print { .help-overlay { display: none !important; } }
+        .bl-cap.bl-equip{flex-direction:column;align-items:stretch;}
+        .eq-pick{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;width:100%;}
+        .bl-cap.bl-equip .bl-field{width:290px;max-width:100%;} .bl-equip .bl-field select{width:100%;font-family:'DM Sans';font-size:15px;padding:9px 10px;border:1.5px solid var(--line);border-radius:9px;background:#fff;color:var(--ink);}
+        .eq-notes{display:flex;flex-direction:column;gap:5px;align-items:flex-start;}
+        .eq-warn{color:#b3261e;font-size:12.5px;font-weight:600;}
+        .eq-bakenote{flex-basis:100%;}
+        .eq-link{border:none;background:none;padding:0;font-family:'DM Sans';font-size:12.5px;font-weight:700;color:var(--crust2);text-decoration:underline;cursor:pointer;}
+        .eq-ro{flex:1 1 260px;} .eq-roval{font-size:13px;color:var(--ink);line-height:1.4;padding-top:2px;} .eq-roval span{color:var(--ink2);font-size:11.5px;}
+        .eq-h{font-family:'Fraunces',serif;font-size:22px;margin:4px 0 6px;color:var(--ink);} .eq-sub{font-family:'Fraunces',serif;font-size:16px;margin:18px 0 8px;color:var(--crust2);}
+        .eq-intro{font-size:13px;color:var(--ink2);line-height:1.45;margin:0 0 6px;max-width:640px;}
+        .eq-card{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;border:1.5px solid var(--line);border-radius:12px;background:#fffdf8;padding:12px 14px;margin-bottom:10px;}
+        .eq-card .bl-field{margin:0;width:150px;} .eq-card .eq-name{width:240px;max-width:100%;}
+        .eq-card .bl-field input{width:100%;box-sizing:border-box;}
+        .eq-del{margin-left:auto;font-family:'DM Sans';font-size:12.5px;font-weight:600;padding:8px 12px;border:1.5px solid var(--line);background:#fff;color:var(--ink2);border-radius:8px;cursor:pointer;}
+        .eq-del.armed{background:#b3261e;border-color:#b3261e;color:#fff;}
+        .bl-lev-sugar{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0;align-items:flex-end;}
+        .bl-lev-sugar .bl-field2{flex:1 1 200px;min-width:0;}
+        .bl-lev-sugar .bl-sub-note{display:block;margin-left:0;}
+        .bl-lev-sugar .ing-name{font-family:'DM Sans',sans-serif;font-size:14px;padding:9px 10px;}
+        .bl-lev-sugar .wrap2{display:flex;align-items:center;gap:6px;}
+        .when-end{display:flex;align-items:center;gap:6px;flex:0 1 192px;min-width:0;}
+        .when-sel{font-family:'DM Sans';font-size:12px;padding:6px 6px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);flex:1 1 auto;min-width:0;}
+        .bl-when{font-style:normal;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;font-weight:700;color:var(--crust2);}
+        .bl-eggnote{font-style:normal;font-weight:400;color:var(--ink2);font-size:.88em;}
+        .bl-ai-recipe{margin-bottom:18px;border:1.5px solid var(--line);border-radius:10px;background:#faf7f0;overflow:hidden;}
+        .bl-ai-recipe-toggle{width:100%;display:flex;align-items:center;gap:8px;padding:11px 14px;font-family:'DM Sans';font-size:13.5px;font-weight:600;color:var(--crust2);background:transparent;border:none;cursor:pointer;text-align:left;}
+        .bl-ai-dot{width:7px;height:7px;border-radius:50%;background:var(--crust);flex:none;}
+        .bl-ai-recipe-body{padding:0 14px 14px;display:flex;flex-direction:column;gap:9px;}
+        .bl-ai-recipe-input{width:100%;font-family:'DM Sans';font-size:13.5px;padding:9px 11px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);resize:vertical;box-sizing:border-box;}
+        .bl-ai-recipe-actions{display:flex;align-items:center;gap:10px;}
+        .bl-ai-recipe-error{font-size:12.5px;color:#b3261e;}
+        .bl-ai-recipe-preview{display:flex;flex-direction:column;gap:9px;padding-top:9px;border-top:1px dashed var(--line);}
+        .bl-ai-recipe-rationale{font-size:13px;color:var(--ink);line-height:1.5;}
+        .bl-ai-recipe-summary{font-family:'Fraunces',serif;font-size:14px;font-weight:600;color:var(--crust2);}
+        .bl-ai-recipe-note{font-size:11.5px;color:var(--ink2);}
+        .bl-ai-recipe-confirm{display:flex;gap:10px;align-items:center;}
+        .bl-ai-recipe-diff{display:flex;flex-direction:column;gap:5px;}
+        .bl-ai-diff-row{display:flex;align-items:baseline;gap:8px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;flex-wrap:wrap;}
+        .bl-ai-diff-field{font-weight:700;color:var(--ink);min-width:90px;}
+        .bl-ai-diff-before{color:var(--ink2);text-decoration:line-through;}
+        .bl-ai-diff-arrow{color:var(--ink2);}
+        .bl-ai-diff-after{color:var(--crust2);font-weight:600;}
+        .bl-re-form{display:flex;flex-direction:column;gap:10px;}
+        .bl-re-row{display:flex;gap:10px;flex-wrap:wrap;}
+        .bl-re-row .bl-field2{width:120px;flex:1;}
+        .bl-re-name-input{width:100%;font-family:'Fraunces',serif;font-weight:600;font-size:18px;padding:8px 10px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);}
+        .bl-promote-btn{padding:11px;font-family:'DM Sans';font-size:14px;font-weight:600;color:#5a3fa0;background:#ede8f8;border:none;border-radius:9px;cursor:pointer;}
+        .bl-ing-manager{display:flex;flex-direction:column;gap:6px;}
+        .bl-ing-list{display:flex;flex-direction:column;gap:4px;}
+        .bl-ing-row{display:flex;align-items:center;gap:8px;padding:6px 10px;background:#fffdf8;border:1px solid var(--line);border-radius:7px;}
+        .bl-ing-row .ir-kind{font-family:'DM Sans';font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;border:none;border-radius:6px;padding:4px 9px;cursor:pointer;}
+        .bl-ing-row .ir-kind.flr{background:var(--paper2);color:var(--crust2);}
+        .bl-ing-row .ir-kind.inc{background:#e7eef0;color:#3a6b80;}
+        .bl-ing-kindtoggle{display:inline-flex;border:1.5px solid var(--line);border-radius:8px;overflow:hidden;flex:none;}
+        .bl-ing-kindtoggle button{font-family:'DM Sans';font-size:12px;font-weight:600;padding:8px 12px;border:none;background:var(--cream);color:var(--ink2);cursor:pointer;}
+        .bl-ing-kindtoggle button.on{background:var(--chrome2);color:var(--chrome-t);}
+        .bl-ing-row .ir-name{flex:1;font-family:'DM Sans';font-size:14px;color:var(--ink);}
+        .bl-ing-row .ir-price{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;color:var(--crust2);}
+        .bl-ing-add{display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;align-items:center;}
+        .bl-ing-input{flex:1;min-width:140px;font-family:'DM Sans';font-size:14px;padding:8px 10px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);}
+        .bl-ingwrap{position:relative;display:flex;align-items:center;flex:1;min-width:0;}
+        .bl-ingwrap .ing-name{flex:1;min-width:0;width:100%;padding-right:30px;}
+        .bl-ingdrop-btn{position:absolute;right:4px;width:24px;height:100%;border:none;background:transparent;color:var(--ink2);cursor:pointer;font-size:11px;display:flex;align-items:center;justify-content:center;}
+        .bl-ingdrop{position:absolute;top:100%;left:0;right:0;z-index:200;background:#fff;border:1.5px solid var(--crust);border-radius:8px;box-shadow:0 6px 18px rgba(42,29,18,.14);max-height:280px;overflow-y:auto;margin-top:3px;}
+        .bl-ingdrop-grp{padding:6px 12px 3px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:9.5px;letter-spacing:1.4px;text-transform:uppercase;color:var(--crust2);font-weight:700;background:var(--paper);border-top:1px solid var(--line);}
+        .bl-ingdrop-grp:first-child{border-top:none;}
+        .bl-ingdrop-item{padding:9px 12px;font-family:'DM Sans';font-size:13px;color:var(--ink);cursor:pointer;}
+        .bl-ingdrop-item:hover{background:var(--paper2);}
+        .bl-ingdrop-empty{padding:9px 12px;font-size:12px;color:var(--ink2);font-style:italic;}
+        .bl-rec-top{display:grid;grid-template-columns:1fr 64px 78px;gap:8px;align-items:end;margin-bottom:8px;}
+        .bl-rec-top.two{grid-template-columns:1fr 120px;}
+        .bl-qty{display:flex;align-items:center;gap:8px;margin-bottom:6px;}
+        .bl-qty .nm{flex:1;min-width:0;font-size:13px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .bl-qty input{width:74px;flex:none;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:14px;padding:6px 8px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);text-align:right;}
+        .bl-rec-top label{display:block;font-size:9.5px;letter-spacing:.5px;text-transform:uppercase;color:var(--ink2);margin-bottom:3px;}
+        .bl-rec-top select{width:100%;font-family:'DM Sans';font-size:13px;padding:7px 7px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);cursor:pointer;}
+        .bl-rec-top input.n{width:100%;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:14px;padding:7px 6px;border:1.5px solid var(--line);border-radius:6px;background:#fff;}
+        .bl-rec-name{display:flex;gap:7px;align-items:center;margin-bottom:3px;flex-wrap:wrap;}
+        .bl-loadsel{flex:none;font-family:'DM Sans';font-size:13px;padding:7px 8px;border:1.5px solid var(--line);border-radius:6px;background:var(--paper2);color:var(--crust2);max-width:130px;}
+        .bl-namelabel{display:block;font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--ink2);font-family:'DM Sans';margin-bottom:5px;}
+        .bl-rec-name .nm{flex:1 1 100%;min-width:0;font-family:'Fraunces',serif;font-weight:600;font-size:16px;padding:6px 9px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);}
+        .bl-save{font-family:'DM Sans';font-weight:600;font-size:12px;padding:8px 13px;border-radius:6px;border:1.5px solid var(--crust2);background:var(--crust2);color:var(--paper);cursor:pointer;flex:none;}
+        .bl-save:hover{background:var(--crust);border-color:var(--crust);}
+        .bl-save.saved{background:transparent;color:var(--ink2);border-color:var(--line);cursor:default;}
+        .bl-recmod{font-size:10.5px;color:var(--crust);font-style:italic;margin-bottom:6px;height:14px;}
+        .bl-subhead{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--crust2);font-weight:600;margin:13px 0 7px;}
+        .ing-row{display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin-bottom:6px;}
+        .ing-row .bl-ingwrap,.liq-row .bl-ingwrap{flex:1 1 130px;min-width:130px;}
+        .ing-name{flex:1;min-width:0;font-family:'DM Sans';font-size:13px;padding:6px 8px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);}
+        .ing-pct{display:flex;align-items:center;width:80px;flex:none;position:relative;}
+        .ing-pct input{width:100%;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;padding:6px 17px 6px 7px;border:1.5px solid var(--line);border-radius:6px;background:#fff;text-align:right;}
+        .ing-pct em{position:absolute;right:7px;font-style:normal;font-size:11px;color:var(--ink2);pointer-events:none;}
+        .ing-pct.main{background:var(--paper2);border:1.5px dashed var(--line);border-radius:6px;padding:6px 8px;justify-content:flex-end;gap:4px;white-space:nowrap;overflow:hidden;}
+        .ing-pct.main span{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;font-weight:600;color:var(--crust2);} .ing-pct.main em{position:static;}
+        .ing-pct.main b{position:absolute;left:6px;font-size:7.5px;letter-spacing:.5px;text-transform:uppercase;color:var(--crust);font-weight:700;}
+        .ing-x{width:28px;height:30px;flex:none;border:1.5px solid var(--line);background:#fff;border-radius:6px;cursor:pointer;color:var(--ink2);font-size:15px;line-height:1;display:flex;align-items:center;justify-content:center;padding:0;}
+        .ing-x:hover{background:var(--alert);border-color:var(--alert);color:#fff;} .ing-x.ph{visibility:hidden;cursor:default;}
+        .ing-empty{font-size:11px;color:var(--ink2);font-style:italic;opacity:.7;margin-bottom:6px;}
+        .bl-add{font-family:'DM Sans';font-weight:600;font-size:12px;cursor:pointer;border-radius:6px;padding:5px 11px;border:1.5px dashed var(--crust);background:transparent;color:var(--crust2);margin-top:2px;}
+        .bl-add:hover{background:var(--paper2);}
+        .bl-fixed{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px 10px;}
+        .bl-fixed .cell label{display:block;font-size:9.5px;letter-spacing:.3px;color:var(--ink2);margin-bottom:3px;}
+        .bl-fixed .cell .wrap{position:relative;}
+        .bl-fixed .cell input{width:100%;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;padding:5px 18px 5px 7px;border:1.5px solid var(--line);border-radius:5px;background:#fff;}
+        .bl-fixed .cell .pc{position:absolute;right:6px;top:50%;transform:translateY(-50%);font-size:10px;color:var(--ink2);pointer-events:none;}
+        .bl-typesum{margin-top:12px;font-size:11.5px;color:var(--ink2);line-height:1.5;border-top:1px dashed var(--line);padding-top:9px;}
+        .bl-typesum b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;color:var(--crust2);} .bl-warn{color:var(--alert);font-weight:600;}
+        .bl-cap{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-top:16px;border-top:1.5px solid var(--line);padding-top:14px;}
+        .bl-cap .bl-field{margin:0;width:190px;} .bl-cap .note{font-size:11px;color:var(--ink2);flex:1;min-width:160px;line-height:1.5;}
+        .bl-mixwrap{overflow-x:auto;margin-top:16px;border:1.5px solid var(--line);border-radius:9px;}
+        .bl-mixhead{font-family:'Fraunces',serif;font-weight:600;font-size:13px;padding:9px 12px;background:var(--paper2);border-bottom:1.5px solid var(--line);color:var(--crust2);}
+        table.bl-mix{border-collapse:collapse;width:100%;font-size:12px;}
+        table.bl-mix th,table.bl-mix td{padding:7px 10px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--line);}
+        table.bl-mix th{font-family:'DM Sans';font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:var(--ink2);background:var(--paper2);font-weight:600;}
+        table.bl-mix td{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;} table.bl-mix td.l,table.bl-mix th.l{text-align:left;}
+        table.bl-mix tr td:first-child{font-weight:600;color:var(--crust2);}
+        table.bl-mix tr.tot td{background:var(--paper);font-weight:600;border-top:1.5px solid var(--ink);}
+        .bl-legend{display:flex;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--ink2);margin-bottom:10px;align-items:center;}
+        .bl-legend span{display:inline-flex;align-items:center;gap:6px;}
+        .sw{width:16px;height:11px;border-radius:2px;} .sw.a{background:var(--active);} .sw.p{background:var(--passive);border:1px solid var(--passive-line);} .sw.x{background:repeating-linear-gradient(45deg,var(--alert),var(--alert) 3px,#fff 3px,#fff 6px);}
+        .bl-hint{font-size:11px;color:var(--ink2);margin:0 0 10px;font-style:italic;}
+        .bl-chart-wrap{overflow-x:auto;border:1.5px solid var(--line);border-radius:10px;background:var(--paper);padding:14px 0 8px;min-width:0;max-width:100%;}
+        .bl-axis{position:relative;height:20px;margin-left:108px;} .bl-tick{position:absolute;top:0;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;color:var(--ink2);transform:translateX(-50%);} .bl-tick::after{content:'';position:absolute;left:50%;top:15px;width:1px;height:6px;background:var(--line);}
+        .bl-rowline{position:relative;height:42px;border-top:1px solid var(--line);}
+        .bl-rowlabel{position:absolute;left:0;top:0;width:100px;height:100%;display:flex;flex-direction:column;justify-content:center;padding-left:4px;overflow:hidden;}
+        .bl-rowlabel .b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;font-weight:600;color:var(--crust2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .bl-rowlabel .t{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;color:var(--ink2);}
+        .bl-track{position:absolute;left:108px;right:0;top:0;bottom:0;cursor:grab;} .bl-track.grabbing{cursor:grabbing;}
+        .bl-gridcol{position:absolute;top:0;bottom:0;width:1px;background:var(--line);opacity:.5;}
+        .bl-bar{position:absolute;top:8px;height:26px;border-radius:4px;display:flex;align-items:center;padding:0 6px;overflow:hidden;font-size:10.5px;white-space:nowrap;pointer-events:auto;cursor:grab;}
+        .bl-track.grabbing .bl-bar{cursor:grabbing;}
+        .bl-bar.p{background:var(--passive);border:1px solid var(--passive-line);color:var(--ink2);}
+        .bl-bar.a{background:var(--active);color:#fff;font-weight:600;box-shadow:0 1px 3px rgba(140,74,20,.3);}
+        .bl-bar.x{background:repeating-linear-gradient(45deg,var(--alert),var(--alert) 4px,#d9534f 4px,#d9534f 8px);color:#fff;font-weight:700;box-shadow:0 0 0 1.5px var(--alert);}
+        .bl-tip{position:fixed;z-index:60;pointer-events:none;background:var(--ink);color:var(--paper);border-radius:8px;padding:8px 11px;box-shadow:0 6px 22px rgba(0,0,0,.3);transform:translate(12px,-118%);min-width:118px;}
+        .bl-tip .b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--passive);} .bl-tip .n{font-family:'Fraunces',serif;font-weight:600;font-size:15px;margin:1px 0 3px;line-height:1.1;} .bl-tip .d{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:#e7d3b1;} .bl-tip .x{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;font-weight:600;color:#ffb3a7;margin-top:4px;}
+        .bl-sched{margin-top:22px;} .bl-sched h3{font-family:'Fraunces',serif;font-size:16px;margin:0 0 4px;font-weight:600;} .bl-sched .sub{font-size:11px;color:var(--ink2);margin-bottom:12px;}
+        .bl-list{display:flex;flex-direction:column;gap:2px;}
+        .bl-item{display:grid;grid-template-columns:62px 1fr auto;gap:12px;align-items:center;padding:8px 12px;border-radius:7px;background:var(--paper);border:1px solid var(--line);}
+        .bl-item.hit{border-color:var(--alert);background:var(--alert-bg);} .bl-item .tm{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:600;font-size:14px;} .bl-item .lb{font-size:13px;} .bl-item .lb b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:600;color:var(--crust2);font-size:11px;} .bl-item .dn{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--ink2);} .bl-item .flag{font-size:10px;font-weight:700;color:var(--alert);}
+        .bl-note{font-size:11px;color:var(--ink2);margin-top:10px;line-height:1.5;}
+        .bl-tabs{position:sticky;top:0;z-index:90;background:var(--chrome);display:flex;gap:8px;margin:0 -22px 22px;padding:11px 18px;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;scroll-snap-type:x proximity;scrollbar-width:none;box-shadow:0 6px 18px -10px rgba(0,0,0,.5);transition:transform .25s ease;}
+        .bl-tabs::-webkit-scrollbar{display:none;}
+        .bl-tab{font-family:'DM Sans';font-weight:600;font-size:15px;letter-spacing:.2px;cursor:pointer;border:none;background:rgba(245,239,227,.08);color:var(--chrome-m);padding:11px 20px;border-radius:999px;display:flex;align-items:center;gap:7px;flex:0 0 auto;white-space:nowrap;scroll-snap-align:center;transition:background .15s,color .15s;}
+        .bl-tab:hover{color:var(--chrome-t);background:rgba(245,239,227,.15);}
+        .bl-tab.on{background:var(--crust);color:#fff;}
+        .bl-tab .num{display:none;}
+        .bl-tab .tlabel{display:none;}
+        .bl-tab .tshort{display:inline;}
+        .bl-mininav{display:none;}
+        .bl-home{max-width:1100px;margin:0 auto;padding-top:28px;}
+        .bl-home-hd{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:24px;padding-bottom:18px;border-bottom:1.5px solid var(--line);}
+        .bl-home-actions{display:flex;justify-content:flex-end;margin-bottom:18px;}
+        .bl-newday{font-family:'DM Sans';font-size:14px;font-weight:600;color:var(--chrome-t);background:var(--chrome2);border:none;border-radius:9px;padding:11px 18px;cursor:pointer;white-space:nowrap;}
+        .bl-newday:hover{background:var(--chrome);}
+        .bl-daygrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px;}
+        .bl-daycard{position:relative;border:1.5px solid var(--line);border-radius:12px;background:var(--cream);padding:0;cursor:pointer;transition:border-color .15s,box-shadow .15s,transform .15s;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 2px 8px rgba(26,15,7,.04);}
+        .bl-daycard:hover{border-color:var(--crust);box-shadow:0 6px 22px rgba(26,15,7,.12);transform:translateY(-2px);}
+        .dc-band{background:var(--chrome2);padding:12px 14px 11px;}
+        .dc-band .dc-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;}
+        .dc-band .dc-date{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--chrome-m);font-weight:600;}
+        .dc-band .dc-acts{display:flex;gap:2px;}
+        .dc-band .dc-acts button{width:26px;height:26px;border:none;background:transparent;border-radius:5px;color:var(--chrome-m);font-size:14px;cursor:pointer;line-height:1;}
+        .dc-band .dc-acts button:hover{background:rgba(245,239,227,.12);color:var(--chrome-t);}
+        .dc-band .dc-name{font-family:'Fraunces',serif;font-weight:600;font-size:18px;color:var(--chrome-t);line-height:1.15;}
+        .dc-body{padding:10px 14px 13px;display:flex;flex-direction:column;gap:4px;}
+        .dc-body .dc-sum{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;color:var(--crust2);font-weight:600;}
+        .dc-body .dc-recipes{font-size:13px;color:var(--ink2);line-height:1.35;}
+        .dc-status{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;font-weight:700;letter-spacing:.02em;padding:3px 8px;border-radius:20px;border:1.5px solid var(--crust);color:var(--crust2);background:#fff;cursor:pointer;white-space:nowrap;}
+        .dc-status.done{border-color:var(--line);color:var(--ink2);background:var(--paper);}
+        .bl-daycard.done{opacity:.62;}
+        .bl-detach{margin:10px 0 2px;padding:10px 12px;border:1.5px solid #e9c47e;background:#fff6e3;border-radius:10px;}
+        .bl-detach-msg{font-size:12.5px;color:var(--crust2);line-height:1.35;margin-bottom:8px;}
+        .bl-detach-acts{display:flex;flex-wrap:wrap;gap:7px;}
+        .bl-detach-acts button{font-family:'DM Sans';font-size:12.5px;font-weight:600;padding:7px 11px;border-radius:8px;cursor:pointer;border:1.5px solid;}
+        .bl-detach-up{background:var(--crust);color:#fff;border-color:var(--crust2);}
+        .bl-detach-remix{background:#fff;color:var(--crust2);border-color:var(--crust);}
+        .bl-detach-dismiss{background:#fff;color:var(--ink2);border-color:var(--line);}
+        .bl-profiles{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 9px;}
+        .bl-prof-lbl{font-size:10.5px;color:var(--ink2);text-transform:uppercase;letter-spacing:.04em;}
+        .bl-prof{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10.5px;color:var(--ink2);background:var(--paper);border:1px solid var(--line);border-radius:6px;padding:2px 7px;}
+        .bl-basedough{background:#fff6e3;border:1.5px solid #e9c47e;border-radius:12px;padding:12px 14px;margin:0 0 16px;}
+        .bl-bd-hd{display:flex;align-items:baseline;gap:9px;margin-bottom:9px;}
+        .bl-bd-title{font-family:'Fraunces';font-size:15px;font-weight:600;color:var(--crust2);}
+        .bl-bd-sub{font-size:11px;color:var(--ink2);text-transform:uppercase;letter-spacing:.04em;}
+        .bl-bd-group{padding:9px 0;border-top:1px solid #e9c47e;}
+        .bl-bd-group:first-of-type{border-top:none;padding-top:0;}
+        .bl-bd-total{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12.5px;font-weight:700;color:var(--ink);margin-bottom:6px;}
+        .bl-bd-weigh{display:flex;flex-wrap:wrap;gap:5px 10px;margin-bottom:8px;}
+        .bl-bd-ing{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11.5px;color:var(--ink2);}
+        .bl-bd-ing b{color:var(--ink);font-weight:600;}
+        .bl-bd-split{display:flex;flex-direction:column;gap:4px;}
+        .bl-bd-member{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;}
+        .bl-bd-mname{font-family:'DM Sans';font-size:12.5px;font-weight:600;color:var(--ink);}
+        .bl-bd-inc{font-size:11.5px;color:var(--crust2);}
+        .bl-bd-inc.plain{color:var(--ink2);font-style:italic;}
+        .bl-sub-note{font-size:10.5px;font-weight:400;color:var(--ink2);text-transform:none;letter-spacing:0;margin-left:6px;}
+        .liq-row{display:flex;align-items:center;gap:6px;margin-bottom:6px;flex-wrap:wrap;}
+        .liq-row .ing-name{flex:1 1 120px;min-width:100px;}
+        .liq-cell{display:flex;align-items:center;gap:3px;}
+        .liq-cell input{width:54px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;padding:5px 6px;border:1px solid var(--line);border-radius:6px;text-align:right;background:#fff;color:var(--ink);}
+        .liq-cell em{font-size:10px;color:var(--ink2);font-style:normal;white-space:nowrap;}
+        .bl-hyd-readout{margin:8px 0 4px;padding:8px 12px;background:#eef4f6;border:1px solid #cfe0e6;border-radius:8px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;color:#1f6f86;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 14px;}
+        .bl-hyd-solve{display:flex;align-items:center;gap:7px;flex-wrap:wrap;}
+        .bl-hyd-solve input{width:76px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;padding:4px 7px;border:1.5px solid #cfe0e6;border-radius:6px;background:#fff;color:var(--ink);text-align:right;}
+        .bl-hyd-need{font-size:12px;color:#155;}
+        .bl-hyd-need.bad{color:var(--alert);font-family:'DM Sans';font-size:11px;}
+        .bl-hyd-solve button{font-family:'DM Sans';font-size:12px;font-weight:600;padding:5px 11px;border-radius:7px;border:1.5px solid #1f6f86;background:#1f6f86;color:#fff;cursor:pointer;}
+        .bl-hyd-solve button:disabled{opacity:.4;cursor:default;}
+        .bl-mixwater-btn.awake{background:transparent;color:var(--ink);border:1.5px solid var(--line);}
+        .bl-mixwater-btn.awake:hover{background:var(--paper);}
+        .bl-mixwater-btn.awake.on{background:var(--crust);color:#fff;border-color:var(--crust2);}
+        .bl-awake-note{margin:-6px 0 12px;font-size:12px;color:var(--ink2);line-height:1.4;}
+        .bl-awake-note.bad{color:var(--alert);}
+        .pt-card{border:1.5px solid var(--line);border-radius:10px;background:var(--cream);padding:11px 13px;margin-bottom:11px;}
+        .pt-card.item.nopr{border-color:#e9c47e;background:#fff9ec;}
+        .pt-h{font-family:'Fraunces',serif;font-weight:600;font-size:14px;color:var(--crust2);margin-bottom:8px;}
+        .pt-top{display:flex;align-items:center;gap:9px;margin-bottom:8px;}
+        .pt-name{flex:1;min-width:0;font-family:'DM Sans';font-size:14.5px;font-weight:600;padding:6px 9px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);}
+        .pt-per{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11.5px;color:var(--crust2);white-space:nowrap;}
+        .pt-per.bad{color:var(--alert);}
+        .pt-row{display:flex;flex-wrap:wrap;gap:8px 10px;margin-bottom:8px;align-items:flex-end;}
+        .pt-f{display:flex;flex-direction:column;gap:3px;font-size:10.5px;color:var(--ink2);flex:1 1 150px;min-width:0;}
+        .pt-f.sm{flex:0 1 112px;}
+        .pt-f input,.pt-f select{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;padding:6px 8px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);min-width:0;width:100%;box-sizing:border-box;}
+        .pt-f select{font-family:'DM Sans';}
+        .pt-f input[type=text]{font-family:'DM Sans';}
+        .pt-f input:disabled{background:var(--paper);color:var(--ink2);}
+        .pt-hint,.pt-empty{font-size:12px;color:var(--ink2);line-height:1.4;}
+        .pt-empty{padding:10px 2px 14px;}
+        .pt-bar{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px;}
+        .pt-groups{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px;}
+        .pt-chip{font-family:'DM Sans';font-size:12.5px;font-weight:600;padding:7px 12px;border:1.5px solid var(--line);background:var(--cream);color:var(--ink2);border-radius:999px;cursor:pointer;}
+        .pt-chip.on{background:var(--chrome2);border-color:var(--chrome2);color:var(--chrome-t);}
+        .pt-chip em{font-style:normal;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10.5px;opacity:.7;margin-left:6px;}
+        .pt-search{width:100%;box-sizing:border-box;font-family:'DM Sans';font-size:14px;padding:9px 12px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);margin:0 0 6px;}
+        .pt-grp{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;letter-spacing:1.6px;text-transform:uppercase;color:var(--crust2);font-weight:700;margin:18px 2px 8px;}
+        .pt-link{background:none;border:none;color:var(--crust2);text-decoration:underline;cursor:pointer;font:inherit;padding:0;}
+        .sc-card{margin-bottom:16px;}
+        .sc-card .ch-sub{font-family:'DM Sans';font-weight:400;font-size:11px;color:var(--ink2);margin-left:6px;}
+        .sc-row{display:flex;flex-wrap:wrap;align-items:baseline;gap:3px 12px;padding:8px 13px;border-bottom:1px solid var(--paper2);font-size:13px;}
+        .sc-row:last-of-type{border-bottom:none;}
+        .sc-name{font-weight:600;color:var(--ink);min-width:120px;}
+        .sc-nums{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;color:var(--ink2);}
+        .sc-flag{font-size:12.5px;margin-left:auto;color:var(--ink2);}
+        .sc-buf{display:flex;align-items:center;gap:8px;width:100%;font-size:12.5px;color:var(--ink2);cursor:pointer;} .sc-buf input[type=number]{width:58px;padding:5px 7px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12.5px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);} .sc-buf .lbuffer-pct{display:inline-flex;align-items:center;gap:4px;}
+        .lev-buf{margin:2px 0 8px;} .lev-buf-tog{display:inline-flex;align-items:center;gap:8px;cursor:pointer;} .lev-buf-note{font-size:11.5px;color:var(--ink2);margin-left:auto;}
+        .sd-buf{margin-top:8px;} .sc-buf input[type=checkbox]{accent-color:var(--crust);width:18px;height:18px;}
+        .sc-row.short{background:#fdf0ef;} .sc-row.short .sc-flag{color:var(--alert);font-weight:700;}
+        .sc-row.low{background:#fff6e3;} .sc-row.low .sc-flag{color:var(--crust2);font-weight:700;}
+        .sc-flag em{font-style:normal;font-weight:400;color:var(--ink2);} .sc-flag em.late{color:var(--alert);font-weight:700;}
+        .sc-empty,.sc-note,.sc-missing{padding:10px 13px;font-size:12.5px;color:var(--ink2);line-height:1.4;}
+        .sc-missing{border-top:1px solid var(--paper2);color:var(--crust2);}
+        .cs-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px;}
+        @media (max-width:640px){.cs-stats{grid-template-columns:repeat(2,1fr);}}
+        .cs-stat{border:1.5px solid var(--line);border-radius:10px;background:var(--cream);padding:10px 12px;}
+        .cs-stat .v{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:19px;color:var(--ink);}
+        .cs-stat .l{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink2);margin-top:2px;}
+        .cs-stat.neg .v{color:var(--alert);}
+        .cs-note{font-size:12px;color:var(--ink2);line-height:1.4;margin-bottom:12px;}
+        .cs-warn{margin-bottom:12px;padding:9px 12px;border:1.5px solid #e9c47e;background:#fff6e3;border-radius:9px;font-size:12.5px;color:var(--crust2);line-height:1.4;}
+        .cs-warn button,.cs-lock button,.cs-deducted button{margin-left:8px;font-family:'DM Sans';font-size:11.5px;font-weight:600;padding:3px 9px;border-radius:6px;border:1px solid var(--crust);background:#fff;color:var(--crust2);cursor:pointer;}
+        .cs-lock{margin-bottom:12px;padding:9px 12px;border:1.5px solid var(--line);background:var(--paper);border-radius:9px;font-size:12.5px;color:var(--ink);}
+        .cs-inputs{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:flex-end;margin-bottom:14px;}
+        .cs-rental{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;color:var(--ink2);padding-bottom:7px;}
+        .cs-recipe{border:1.5px solid var(--line);border-radius:10px;background:var(--cream);padding:12px 14px;margin-bottom:11px;}
+        .cs-rhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;}
+        .cs-rname{font-family:'Fraunces',serif;font-weight:600;font-size:16px;color:var(--ink);}
+        .cs-rloaves{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;color:var(--ink2);}
+        .cs-rin{display:flex;flex-wrap:wrap;gap:8px 12px;margin-bottom:9px;}
+        .cs-lines{display:flex;flex-direction:column;gap:3px;font-size:13px;}
+        .cs-lines>div{display:flex;justify-content:space-between;color:var(--ink2);}
+        .cs-lines b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:600;color:var(--ink);}
+        .cs-lines .tot{border-top:1px solid var(--line);padding-top:4px;margin-top:3px;} .cs-lines .tot b{font-size:15px;}
+        .cs-lines .m b{color:var(--crust2);}
+        .cs-rfoot{margin-top:8px;font-size:12px;color:var(--ink2);} .cs-rfoot b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;color:var(--ink);}
+        .cs-items{margin:4px 0 14px;font-size:13px;} .cs-items summary{cursor:pointer;color:var(--crust2);font-weight:600;padding:6px 0;}
+        .cs-item{display:flex;gap:12px;padding:4px 0;border-bottom:1px solid var(--paper2);} .cs-item span:first-child{flex:1;} .cs-item span:nth-child(2){font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;color:var(--ink2);} .cs-item b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;min-width:62px;text-align:right;}
+        .cs-actions{display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin-top:14px;padding-top:14px;border-top:1px solid var(--line);}
+        .cs-btn{font-family:'DM Sans';font-size:13.5px;font-weight:600;padding:10px 16px;border-radius:9px;border:1.5px solid var(--crust2);background:var(--crust);color:#fff;cursor:pointer;min-height:44px;}
+        .cs-btn.alt{background:#fff;color:var(--crust2);} .cs-btn.ghost{background:transparent;color:var(--ink2);border-color:var(--line);} .cs-btn:disabled{opacity:.45;cursor:not-allowed;}
+        .sd-box{margin:8px 0 4px;padding:10px 12px;border:1.5px solid var(--line);border-radius:9px;background:var(--cream);}
+        .sd-tog{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--ink);cursor:pointer;}
+        .sd-tog input{width:16px;height:16px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .sd-presets{display:flex;gap:7px;margin:9px 0 8px;flex-wrap:wrap;}
+        .sd-presets button{font-family:'DM Sans';font-size:11.5px;font-weight:600;padding:5px 10px;border-radius:7px;border:1.5px solid var(--crust);background:#fff;color:var(--crust2);cursor:pointer;}
+        .sd-presets button.on{background:var(--crust);color:#fff;border-color:var(--crust2);box-shadow:0 0 0 2px rgba(181,101,29,.25);}
+        .sd-custom{align-self:center;font-family:'DM Sans';font-size:11.5px;font-weight:600;color:var(--ink2);font-style:italic;}
+        .sd-row{display:flex;flex-wrap:wrap;gap:8px 10px;}
+        .sd-f{display:flex;flex-direction:column;gap:3px;font-size:10.5px;color:var(--ink2);flex:1 1 140px;min-width:0;}
+        .sd-f input,.sd-f select{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;padding:6px 8px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);min-width:0;width:100%;box-sizing:border-box;}
+        .sd-f select{font-family:'DM Sans';}
+        .sd-read{margin-top:9px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11.5px;color:var(--crust2);line-height:1.45;}
+        .sd-warn{margin-top:6px;font-size:12px;color:var(--alert);line-height:1.35;}
+        .bl-scald-call{margin:8px 13px 4px;padding:8px 10px;border:1.5px solid #e9c47e;background:#fff6e3;border-radius:8px;font-size:12.5px;color:var(--crust2);line-height:1.4;}
+        .bl-scald-call b{color:var(--ink);}
+        .cs-confirm{font-size:12.5px;color:var(--ink);} .cs-deducted{font-size:12.5px;color:var(--ink2);} .cs-empty{font-size:13px;color:var(--ink2);padding:6px 0 12px;}
+        .bl-hyd-readout b{font-size:15px;color:#155;}
+        .bl-hyd-note{font-family:'DM Sans';font-size:10.5px;color:var(--ink2);margin-left:6px;}
+        .brc-ai{margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);}
+        .brc-ai-row{display:flex;align-items:center;gap:8px;}
+        .brc-ai-row label{font-size:11px;color:var(--ink2);display:flex;align-items:center;gap:4px;}
+        .brc-ai-row label input{width:46px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;padding:3px 5px;border:1px solid var(--line);border-radius:5px;text-align:right;background:#fff;}
+        .brc-ai-btn{font-family:'DM Sans';font-size:12px;font-weight:600;padding:5px 12px;border-radius:7px;border:1.5px solid var(--crust);background:var(--crust);color:#fff;cursor:pointer;}
+        .brc-ai-btn:disabled{opacity:.6;cursor:default;}
+        .brc-ai-err{margin-top:7px;font-size:11.5px;color:var(--alert);line-height:1.35;}
+        .brc-ai-out{margin-top:8px;font-size:12px;color:var(--ink);line-height:1.42;}
+        .brc-ai-sum{font-weight:600;margin-bottom:6px;}
+        .brc-ai-sec{margin-top:6px;}
+        .brc-ai-h{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--crust2);margin-bottom:2px;}
+        .brc-ai-li{margin:2px 0;padding-left:11px;position:relative;}
+        .brc-ai-li:before{content:"·";position:absolute;left:3px;color:var(--ink2);}
+        .brc-ai-raw{white-space:pre-wrap;}
+        .bl-bass{margin:2px 0 10px;padding:9px 11px;background:var(--paper);border:1px solid var(--line);border-radius:9px;display:flex;flex-wrap:wrap;align-items:center;gap:9px;}
+        .bl-bass-tog{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--ink2);cursor:pointer;}
+        .bl-bass-tog input{width:15px;height:15px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .bl-bass-pct{display:flex;align-items:center;gap:4px;}
+        .bl-bass-pct input{width:56px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;padding:3px 6px;border:1.5px solid var(--line);border-radius:6px;text-align:right;background:#fff;color:var(--ink);}
+        .bl-bass-pct em{font-size:10.5px;color:var(--ink2);font-style:normal;}
+        .bl-bass-read{flex-basis:100%;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--crust2);}
+        .bl-notes-ta{width:100%;font-family:'DM Sans';font-size:13px;line-height:1.45;padding:9px 11px;border:1.5px solid var(--line);border-radius:9px;background:var(--cream);color:var(--ink);resize:vertical;box-sizing:border-box;}
+        .bl-notes-row{padding:9px 0;border-top:1px solid var(--line);}
+        .bl-notes-row:first-of-type{border-top:none;padding-top:2px;}
+        .bl-notes-hd{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin-bottom:5px;}
+        .bl-notes-nm{font-family:'DM Sans';font-size:13px;font-weight:600;color:var(--ink);}
+        .bl-notes-warn{font-size:10.5px;color:var(--ink2);font-style:italic;}
+        .bl-dbuf{margin:0 0 14px;padding:10px 12px;background:var(--paper);border:1px solid var(--line);border-radius:9px;display:flex;flex-wrap:wrap;align-items:center;gap:9px;}
+        .bl-dbuf-tog{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink2);cursor:pointer;}
+        .bl-dbuf-tog input{width:15px;height:15px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .bl-dbuf-pct{display:flex;align-items:center;gap:4px;}
+        .bl-dbuf-pct input{width:56px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;padding:3px 6px;border:1.5px solid var(--line);border-radius:6px;text-align:right;background:#fff;color:var(--ink);}
+        .bl-dbuf-pct em{font-size:11px;color:var(--ink2);font-style:normal;}
+        .bl-dbuf-warn{flex-basis:100%;font-size:11.5px;color:var(--alert);line-height:1.35;}
+        .bl-levcombine{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink);cursor:pointer;padding:6px 0;}
+        .bl-levcombine input{width:15px;height:15px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .dc-body .dc-bake{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--sand);}
+        .dc-body .dc-open{margin-top:4px;font-family:'DM Sans';font-size:13px;font-weight:600;color:var(--crust);}
+        .bl-dayhd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;}
+        .bl-back{display:inline-flex;align-items:center;justify-content:center;order:0;color:var(--crust2);background:#fff;border:1.5px solid var(--line);border-radius:8px;width:40px;height:40px;padding:0;cursor:pointer;flex:none;}
+        .bl-back:hover{background:var(--paper2);color:var(--crust);}
+        .bl-dayid{display:flex;align-items:center;gap:10px;flex-wrap:wrap;flex:1;min-width:0;}
+        .bl-dayname{order:1;font-family:'Fraunces',serif;font-weight:600;font-size:24px;color:var(--chrome-t);background:transparent;border:none;border-bottom:1.5px solid transparent;padding:2px 2px;min-width:120px;flex:1;}
+        .bl-dayname:hover{border-bottom-color:rgba(245,239,227,.25);} .bl-dayname:focus{outline:none;border-bottom-color:var(--crust);}
+        .bl-dayname::placeholder{color:var(--chrome-m);}
+        .bl-daydate{order:2;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;color:var(--ink2);background:#fff;border:1.5px solid var(--line);border-radius:8px;padding:0 10px;height:40px;flex:none;}
+        .bl-unittoggle-hd{order:3;}
+        .bl-mininav.show{transform:translateY(0);}
+        .bl-mininav button{font-family:'DM Sans';font-weight:600;font-size:12px;letter-spacing:.2px;color:var(--chrome-m);background:transparent;border:none;border-radius:7px;padding:7px 15px;cursor:pointer;}
+        .bl-mininav button:hover{color:var(--chrome-t);}
+        .bl-mininav button.on{background:var(--crust);color:var(--chrome-t);}
+        .bl-builds{display:grid;grid-template-columns:repeat(auto-fill,minmax(248px,1fr));gap:14px;}
+        .bl-build{border:1.5px solid var(--line);border-radius:12px;background:var(--cream);overflow:hidden;box-shadow:0 2px 8px rgba(26,15,7,.04);}
+        .bl-build .bh{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:11px 14px;background:var(--chrome2);border-bottom:none;}
+        .bl-build .bh .bn{font-family:'Fraunces',serif;font-weight:600;font-size:16px;color:var(--chrome-t);}
+        .bl-build .bh .bt{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--chrome-m);font-weight:600;}
+        .bl-build .meta{display:flex;gap:16px;padding:9px 13px;border-bottom:1px dashed var(--line);font-size:11px;color:var(--ink2);}
+        .bl-build .meta b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;color:var(--crust2);}
+        .bl-build .ing{display:flex;justify-content:space-between;gap:10px;padding:6px 13px;font-size:13px;border-bottom:1px solid var(--paper2);}
+        .bl-build .ing:last-child{border-bottom:none;}
+        .bl-build .ing .nm{color:var(--ink);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+        .bl-build .ing .g{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:600;color:var(--ink);flex:none;}
+        .bl-build .ing.tot{background:var(--paper);font-weight:600;border-top:1.5px solid var(--ink);}
+        .bl-build .ing.tot .nm{color:var(--crust2);}
+        .bl-emptytab{text-align:center;padding:48px 20px;color:var(--ink2);font-size:13px;}
+        .bl-shape{display:flex;gap:6px;flex-wrap:wrap;}
+        .shp{flex:1 1 calc(50% - 6px);font-family:'DM Sans';font-weight:600;font-size:13px;padding:8px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink2);cursor:pointer;}
+        .shp.on{background:var(--crust2);border-color:var(--crust2);color:var(--paper);}
+        .bl-build{cursor:pointer;transition:box-shadow .12s,border-color .12s,opacity .12s;min-width:0;}
+        .bl-build:hover{border-color:var(--crust);}
+        .bl-build.active{grid-column:span 2;border-color:var(--crust);box-shadow:0 5px 18px rgba(140,74,20,.2);}
+        .bl-build.active .bh .bn{font-size:23px;}
+        .bl-build.active .ing{font-size:15px;padding:9px 16px;}
+        .bl-build.active .meta{font-size:13px;padding:11px 16px;}
+        .bl-build.done{opacity:.5;}
+        .bl-build.done .bh{background:var(--line);}
+        .bl-donebtn{display:block;width:100%;font-family:'DM Sans';font-weight:700;font-size:14px;padding:13px;border:none;background:var(--crust);color:var(--paper);cursor:pointer;}
+        .bl-donebtn:hover{background:var(--crust2);}
+        .bl-mixwater-bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px;}
+        .bl-mixwater-btn{display:inline-flex;align-items:center;gap:8px;font-family:'DM Sans';font-weight:600;font-size:14px;color:var(--chrome-t);background:var(--chrome2);border:none;border-radius:10px;padding:11px 16px;cursor:pointer;}
+        .bl-mixwater-btn:hover{background:var(--chrome);}
+        .bl-mixwater-cur{display:inline-flex;align-items:center;gap:8px;font-family:'DM Sans';font-size:13px;color:var(--ink2);background:#eef4f6;border:1px solid #cfe0e6;border-radius:8px;padding:7px 8px 7px 12px;}
+        .bl-mixwater-cur b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;color:#1f6f86;}
+        .bl-mixwater-cur button{border:none;background:rgba(31,111,134,.12);color:#1f6f86;border-radius:6px;width:22px;height:22px;cursor:pointer;font-size:14px;line-height:1;}
+        .bl-watertemp{font-style:normal;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;color:#1f6f86;}
+        .bl-build-ddt{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 13px;font-size:12px;color:#2a5c6e;background:#eef4f6;border-bottom:1px solid var(--paper2);}
+        .bl-build-ddt b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:13px;color:#1f6f86;}
+        .bl-modal-overlay{position:fixed;inset:0;z-index:200;background:rgba(26,15,7,.55);display:flex;align-items:center;justify-content:center;padding:18px;backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);}
+        .bl-modal{background:var(--cream);border-radius:16px;width:100%;max-width:440px;max-height:90vh;overflow-y:auto;box-shadow:0 24px 70px -14px rgba(0,0,0,.55);}
+        .dtc{padding:20px;}
+        .dtc-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:16px;}
+        .dtc-head h3{font-family:'Fraunces',serif;font-weight:600;font-size:21px;color:var(--ink);margin:0;}
+        .dtc-head p{font-size:12.5px;color:var(--ink2);margin:4px 0 0;line-height:1.4;}
+        .dtc-close{flex:none;border:none;background:var(--paper2);color:var(--ink2);border-radius:8px;width:32px;height:32px;font-size:18px;line-height:1;cursor:pointer;}
+        .dtc-close:hover{background:var(--line);}
+        .dtc-grid{display:flex;flex-direction:column;gap:11px;margin-bottom:16px;}
+        .dtc-field{display:flex;flex-direction:column;gap:5px;}
+        .dtc-lbl{font-size:12.5px;font-weight:600;color:var(--ink2);}
+        .dtc-inwrap{position:relative;display:flex;align-items:center;}
+        .dtc-inwrap input{width:100%;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:16px;padding:10px 36px 10px 12px;border:1.5px solid var(--line);border-radius:9px;background:#fff;color:var(--ink);text-align:right;}
+        .dtc-inwrap input:focus{outline:none;border-color:var(--crust);}
+        .dtc-inwrap em{position:absolute;right:12px;font-style:normal;font-size:13px;color:var(--ink2);pointer-events:none;}
+        .dtc-hint{font-size:11px;color:var(--sand);}
+        .dtc-result{display:flex;flex-direction:column;align-items:center;gap:3px;padding:16px;border-radius:12px;background:linear-gradient(180deg,#eef4f6,#fffdf8);border:1.5px solid #cfe0e6;margin-bottom:16px;}
+        .dtc-rlabel{font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--ink2);font-weight:600;}
+        .dtc-rval{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:38px;line-height:1;color:#1f6f86;}
+        .dtc-rformula{font-size:10.5px;color:var(--sand);font-family:'BL Punct','B612 Mono',ui-monospace,monospace;margin-top:4px;text-align:center;}
+        .dtc-apply{display:block;width:100%;font-family:'DM Sans';font-weight:700;font-size:15px;padding:14px;border:none;border-radius:10px;background:var(--crust);color:var(--paper);cursor:pointer;}
+        .dtc-apply:hover{background:var(--crust2);}
+        .bl-confirm{max-width:380px;padding:22px;}
+        .bl-confirm h3{font-family:'Fraunces',serif;font-weight:600;font-size:20px;color:var(--ink);margin:0 0 8px;}
+        .bl-confirm p{font-size:14px;color:var(--ink2);line-height:1.5;margin:0 0 20px;}
+        .bl-confirm-acts{display:flex;gap:10px;}
+        .bl-confirm-acts button{flex:1;font-family:'DM Sans';font-weight:700;font-size:14px;padding:12px;border-radius:9px;cursor:pointer;}
+        .bl-confirm-cancel{border:1.5px solid var(--line);background:#fff;color:var(--ink2);}
+        .bl-confirm-cancel:hover{background:var(--paper2);}
+        .bl-confirm-del{border:none;background:var(--alert);color:#fff;}
+        .bl-confirm-del:hover{background:#8f231c;}
+        .bl-progress{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;font-size:12px;color:var(--ink2);}
+        .bl-progress button{font-family:'DM Sans';font-size:11px;font-weight:600;border:1.5px solid var(--line);background:#fff;border-radius:6px;padding:5px 10px;cursor:pointer;color:var(--ink2);}
+        .bl-progress button:hover{border-color:var(--crust);color:var(--crust2);}
+        @media (max-width:560px){.bl-build.active{grid-column:1 / -1;}}
+        .bl-rep-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(108px,1fr));gap:1px;background:var(--line);border:1.5px solid var(--line);border-radius:9px;overflow:hidden;margin-bottom:18px;}
+        .bl-rep-stat{background:#fffdf8;padding:12px 14px;}
+        .bl-rep-stat .v{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:18px;font-weight:600;color:var(--ink);}
+        .bl-rep-stat .l{font-size:10px;letter-spacing:.8px;text-transform:uppercase;color:var(--ink2);margin-top:2px;}
+        .bl-rep-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start;}
+        .bl-rep-grid>*{min-width:0;}
+        @media (max-width:760px){.bl-rep-grid{grid-template-columns:1fr;}}
+        .bl-card{border:1.5px solid var(--line);border-radius:9px;overflow:hidden;background:#fffdf8;}
+        .bl-card .ch{font-family:'Fraunces',serif;font-weight:600;font-size:14px;padding:10px 13px;background:var(--paper2);border-bottom:1.5px solid var(--line);color:var(--crust2);}
+        .bl-line{display:flex;justify-content:space-between;gap:10px;padding:7px 13px;font-size:13px;border-bottom:1px solid var(--paper2);}
+        .bl-line:last-child{border-bottom:none;}
+        .bl-line .nm{color:var(--ink);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+        .bl-line .v{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:600;color:var(--ink);flex:none;}
+        .bl-line.cat{background:var(--paper);font-size:9.5px;letter-spacing:1px;text-transform:uppercase;color:var(--ink2);font-weight:600;padding:5px 13px;}
+        .bl-line.hi{background:#fff4e6;} .bl-line.hi .v{color:var(--crust);}
+        .bl-live-top{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:18px;}
+        .bl-clock{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:600;font-size:26px;color:var(--ink);}
+        .bl-clock small{display:block;font-family:'DM Sans';font-size:11px;color:var(--ink2);font-weight:400;letter-spacing:.3px;margin-top:2px;}
+        .bl-anchor{font-family:'DM Sans';font-weight:600;font-size:12px;border:1.5px solid var(--crust2);background:var(--crust2);color:var(--paper);border-radius:7px;padding:9px 14px;cursor:pointer;}
+        .bl-anchor:hover{background:var(--crust);}
+        .bl-hero{border:2px solid var(--crust);border-radius:11px;background:linear-gradient(180deg,#fff7ee,#fffdf8);padding:18px 20px;margin-bottom:16px;}
+        .bl-hero.idle{border-color:var(--line);background:#fffdf8;}
+        .bl-hero.now{background:linear-gradient(180deg,#fbe3d6,#fff7ee);}
+        .bl-hero .lab{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--crust2);font-weight:600;}
+        .bl-hero .big{font-family:'Fraunces',serif;font-weight:700;font-size:25px;color:var(--ink);margin:6px 0 5px;line-height:1.12;}
+        .bl-hero .when{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:14px;color:var(--ink2);}
+        .bl-hero .when b{color:var(--crust);}
+        .bl-sech{font-family:'Fraunces',serif;font-weight:600;font-size:14px;margin:0 0 10px;color:var(--ink);}
+        .bl-then{display:flex;flex-direction:column;gap:2px;margin-bottom:18px;}
+        .bl-then .row{display:grid;grid-template-columns:74px 1fr auto;gap:10px;align-items:center;padding:8px 12px;border-radius:7px;background:var(--paper);border:1px solid var(--line);}
+        .bl-then .row.hit{border-color:var(--alert);background:var(--alert-bg);}
+        .bl-then .cd{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:600;font-size:13px;color:var(--crust2);}
+        .bl-then .nm{font-size:13px;} .bl-then .nm b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--crust2);}
+        .bl-then .ck{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--ink2);}
+        .bl-statgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(152px,1fr));gap:8px;}
+        .bl-bstat{border:1.5px solid var(--line);border-radius:8px;padding:9px 11px;background:#fffdf8;}
+        .bl-bstat .bn{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;font-weight:600;color:var(--crust2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .bl-bstat .st{font-size:13px;color:var(--ink);margin-top:3px;}
+        .bl-bstat .sub{font-size:10px;color:var(--ink2);font-family:'BL Punct','B612 Mono',ui-monospace,monospace;margin-top:2px;}
+        .bl-bstat.attn{border-color:var(--crust);background:#fff3e6;}
+        .bl-bstat.idle{opacity:.5;} .bl-bstat.done{opacity:.55;}
+        .bl-anchor.ghost{background:transparent;color:var(--crust2);}
+        .bl-anchor.ghost:hover{background:var(--paper2);}
+        .bl-livestatus{font-family:'DM Sans';font-size:14px;color:var(--ink);margin-bottom:14px;display:flex;align-items:center;gap:7px;}
+        .bl-livestatus b{color:var(--crust2);}
+        .bl-livestatus .dot{width:8px;height:8px;border-radius:50%;background:var(--alert);display:inline-block;}
+        .lv-wrap{overflow-x:auto;overflow-y:hidden;border:1.5px solid var(--line);border-radius:10px;background:var(--paper);min-width:0;max-width:100%;-webkit-overflow-scrolling:touch;}
+        .lv-inner{position:relative;}
+        .lv-axis{position:relative;height:22px;border-bottom:1px solid var(--line);}
+        .lv-tick{position:absolute;top:6px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;color:var(--ink2);transform:translateX(-50%);}
+        .lv-tick::before{content:'';position:absolute;left:50%;top:-6px;width:1px;height:6px;background:var(--line);}
+        .lv-row{position:relative;border-bottom:1px solid var(--paper2);}
+        .lv-row:last-child{border-bottom:none;}
+        .lv-label{position:sticky;left:0;z-index:5;width:96px;height:100%;display:flex;flex-direction:column;justify-content:center;padding-left:10px;background:var(--paper);box-shadow:6px 0 7px -4px rgba(42,29,18,.14);}
+        .lv-label .b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;font-weight:600;color:var(--crust2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .lv-label .s{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:9px;color:var(--ink2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .lv-bar{position:absolute;top:16px;height:24px;border-radius:4px;display:flex;align-items:center;justify-content:center;overflow:hidden;}
+        .lv-bar.a{background:var(--active);} .lv-bar.p{background:var(--passive);border:1px solid var(--passive-line);}
+        .lv-lab.in{font-size:9.5px;font-weight:600;white-space:nowrap;padding:0 4px;}
+        .lv-bar.a .lv-lab.in{color:#fff;} .lv-bar.p .lv-lab.in{color:var(--ink2);}
+        .lv-lab.above{position:absolute;transform:translateX(-50%);font-size:9px;font-weight:600;white-space:nowrap;color:var(--crust2);pointer-events:none;z-index:2;}
+        .lv-now{position:absolute;top:0;width:2px;background:var(--alert);z-index:3;pointer-events:none;}
+        .lv-nowtag{position:absolute;top:0;left:50%;transform:translateX(-50%);background:var(--alert);color:#fff;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:9px;font-weight:600;padding:1px 5px;border-radius:0 0 5px 5px;white-space:nowrap;}
+        .bl-livebtns{display:flex;gap:8px;flex-wrap:wrap;}
+        .lv-screen.full{position:fixed;inset:0;z-index:100;margin:0;border:none;border-radius:0;background:var(--paper);padding:12px 14px 8px;display:flex;flex-direction:column;}
+        .lv-screen.full .bl-note{display:none;}
+        .lv-screen.full .bl-livestatus{margin-bottom:10px;}
+        .lv-screen.full .lv-wrap{flex:1;min-height:0;overflow:auto;}
+        /* bake Gantt — same engine as live timeline, ember palette */
+        .lv-wrap.bake{background:#fbf3e4;border-color:#e4c9a0;}
+        .lv-bar.pre{background:#cba24a;}
+        .lv-bar.steam{background:#d98841;}
+        .lv-bar.dry{background:#a0501a;}
+        .lv-bar.pre .lv-lab.in{color:#3a2410;}
+        .lv-bar.steam .lv-lab.in,.lv-bar.dry .lv-lab.in{color:#fff;}
+        .bl-bakegantt-wrap{margin:10px 0 4px;}
+        .bl-bakegantt-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:9px;}
+        .bg-foot-note{font-family:'DM Sans';font-size:12px;color:var(--ink2);}
+        .bgleg{display:flex;gap:13px;}
+        .bgk{font-family:'DM Sans';font-size:10.5px;color:var(--ink2);display:flex;align-items:center;gap:5px;}
+        .bgk::before{content:"";width:11px;height:11px;border-radius:3px;display:inline-block;}
+        .bgk.pre::before{background:#cba24a;}
+        .bgk.steam::before{background:#d98841;}
+        .bgk.dry::before{background:#a0501a;}
+        .lv-row.recal{cursor:grab;touch-action:none;background:rgba(196,82,31,.05);}
+        .lv-row.recal:active{cursor:grabbing;}
+        .bl-recalhint{font-size:11.5px;color:var(--crust2);background:#fff4e6;border:1px solid #f0d6b0;border-radius:7px;padding:8px 11px;margin-bottom:12px;line-height:1.4;}
+        .bl-cond{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-bottom:16px;padding-bottom:14px;border-bottom:1.5px solid var(--line);}
+        .bl-unitwrap{display:flex;flex-direction:column;gap:5px;}
+        .bl-unittoggle-hd{margin-left:auto;align-self:center;flex:none;height:38px;}
+        .bl-unitwrap label{font-size:11px;color:var(--ink2);font-family:'DM Sans';}
+        .bl-unittoggle{display:inline-flex;border:1.5px solid var(--line);border-radius:7px;overflow:hidden;height:38px;}
+        .bl-unittoggle button{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;font-weight:600;padding:0 13px;border:none;background:#fff;color:var(--ink2);cursor:pointer;}
+        .bl-unittoggle button.on{background:var(--crust2);color:var(--paper);}
+        .bl-inoccal{border:1.5px solid var(--line);border-radius:9px;background:#fffdf8;padding:12px 14px;margin-bottom:16px;}
+        .bl-inoccal-hd{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--crust2);font-weight:600;margin-bottom:10px;}
+        .bl-inoccal-rows{display:flex;flex-direction:column;gap:8px;}
+        .bl-inoccal .ic-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+        .bl-inoccal .ic-lab{font-family:'Fraunces',serif;font-weight:600;font-size:14px;color:var(--ink);width:54px;flex:none;}
+        .bl-inoccal .ic-mid{font-size:12.5px;color:var(--ink2);}
+        .bl-inoccal input{width:64px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:15px;padding:7px 8px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);}
+        .bl-inoccal .ic-derived{margin-top:10px;font-size:12.5px;line-height:1.4;color:var(--crust2);font-weight:600;}
+        .bl-inoccal .ic-derived.est{color:var(--ink2);font-weight:400;font-style:italic;}
+        .bl-feedmode{display:flex;flex-direction:column;gap:5px;}
+        .bl-feedmode>label{font-size:11px;color:var(--ink2);font-family:'DM Sans';}
+        .bl-calbtn{font-family:'DM Sans';font-size:13px;font-weight:600;height:38px;padding:0 14px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--crust2);cursor:pointer;}
+        .bl-calbtn.on{background:var(--crust2);color:var(--paper);border-color:var(--crust2);}
+        .bl-feed em{font-style:normal;font-size:11px;color:var(--crust2);font-family:'BL Punct','B612 Mono',ui-monospace,monospace;margin-top:2px;}
+        .bl-feed em.autoref{color:var(--ink2);opacity:.75;}
+        .bl-levcard.caution{border-color:#c9961f;}
+        .bl-levcard .lcaution{font-size:11px;color:#8a6a14;background:#fbf2da;padding:8px 13px;line-height:1.4;}
+        .bl-levcard.retarded{border-color:#3a6ea5;}
+        .bl-levcard.retarded .lwater{background:linear-gradient(180deg,#e7eff5,#fffdf8);}
+        .bl-levcard.retarded .lwater .wt{color:#2f6090;}
+        .lretard{margin-left:auto;display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--ink2);font-family:'DM Sans';cursor:pointer;white-space:nowrap;}
+        .lretard input{width:15px;height:15px;accent-color:#3a6ea5;cursor:pointer;}
+        .bl-levcard .lrow.retardrow{color:#2f6090;}
+        .bl-levcard .lrow.retardrow b,.bl-levcard .lrow.retardrow em{color:#2f6090;font-style:normal;}
+        .bl-levcard .lretardnote{font-size:11px;color:#2f6090;background:#eaf1f8;padding:8px 13px;line-height:1.4;}
+        .bl-cond .bl-field2{width:150px;}
+        .bl-feed{margin-left:auto;font-family:'DM Sans';font-size:13px;color:var(--ink2);display:flex;flex-direction:column;align-items:flex-end;}
+        .bl-feed b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:22px;font-weight:600;color:var(--crust);}
+        .bl-levparams{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px;}
+        .bl-levread{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;padding:8px 12px;background:var(--paper);border:1px solid var(--line);border-radius:8px;margin-bottom:8px;}
+        .bl-levread .lr-nm{font-family:'Fraunces',serif;font-weight:600;font-size:15px;color:var(--ink);}
+        .bl-levread .lr-spec{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11.5px;color:var(--crust2);font-weight:600;}
+        .bl-levread .lr-exp{font-size:11px;color:var(--ink2);font-style:italic;}
+        .bl-levparams .nm{font-family:'Fraunces',serif;font-weight:600;font-size:14px;color:var(--ink);width:90px;flex:none;padding-bottom:6px;}
+        .bl-levparams .bl-field2{width:96px;}
+        .bl-levbuilds{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px;margin-top:16px;}
+        /* Food safety — matrix: rows = fridges/stations, 3 reading columns */
+        .bl-fsmatrix{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1.5px solid var(--line);border-radius:11px;background:var(--cream);margin-bottom:12px;box-shadow:0 2px 8px rgba(26,15,7,.04);}
+        .fsm-head,.fsm-row{display:grid;grid-template-columns:minmax(132px,1.1fr) repeat(3,minmax(112px,1fr));min-width:520px;}
+        .fsm-head{background:var(--chrome2);}
+        .fsm-head span{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--chrome-m);font-weight:600;padding:10px 11px;}
+        .fsm-head .fsm-rl{color:var(--chrome-t);}
+        .fsm-row{border-top:1px solid var(--line);}
+        .fsm-row .fsm-rl{display:flex;flex-direction:column;gap:2px;justify-content:center;padding:9px 11px;border-right:1px solid var(--line);position:relative;}
+        .fsm-name{font-family:'Fraunces',serif;font-weight:600;font-size:15px;color:var(--ink);background:transparent;border:none;border-bottom:1.5px solid transparent;padding:1px 0;width:100%;}
+        .fsm-name:focus{outline:none;border-bottom-color:var(--crust);}
+        .fsm-name::placeholder{color:var(--ink2);}
+        .fsm-sub{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:9px;letter-spacing:.3px;text-transform:uppercase;color:var(--sand);font-weight:600;}
+        .fsm-rl .ing-x{position:absolute;top:5px;right:5px;width:24px;height:24px;font-size:14px;}
+        .fsm-cell{display:flex;flex-direction:column;align-items:center;gap:5px;padding:10px 8px;border-right:1px solid var(--line);}
+        .fsm-cell:last-child{border-right:none;}
+        .fsm-cell.ok{background:#f1f7ec;}
+        .fsm-cell.bad{background:#fdf3f1;}
+        .fsm-input{display:flex;align-items:center;gap:3px;}
+        .fsm-input input{width:62px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:15px;font-weight:600;padding:6px 7px;border:1.5px solid var(--line);border-radius:7px;text-align:right;background:#fff;color:var(--ink);}
+        .fsm-input span{font-size:11px;color:var(--ink2);}
+        .fsm-meta{display:flex;align-items:center;gap:7px;min-height:18px;}
+        .fsm-ts{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--crust2);background:transparent;border:none;cursor:pointer;padding:1px 5px;border-radius:5px;font-weight:600;}
+        .fsm-ts:hover{background:var(--paper2);}
+        .fsm-ts.none{color:var(--ink2);opacity:.45;cursor:default;}
+        .fsm-flag{font-family:'DM Sans';font-size:11px;font-weight:700;}
+        .fsm-flag.ok{color:#3f7a2e;}
+        .fsm-flag.bad{color:var(--alert);}
+        /* Levain Gantt */
+        .bl-lev-gantt{margin-top:18px;background:var(--chrome2);border-radius:12px;padding:16px 16px 12px;}
+        .lg-title{font-family:'Fraunces',serif;font-weight:600;font-size:16px;color:var(--chrome-t);margin-bottom:14px;display:flex;align-items:center;gap:8px;}
+        .lg-title::before{content:'◆';font-size:8px;color:var(--crust);}
+        .lg-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+        .lg-inner{min-width:520px;position:relative;}
+        .lg-axis{position:relative;height:18px;margin-left:96px;border-bottom:1px solid rgba(245,239,227,.14);}
+        .lg-tick{position:absolute;top:0;transform:translateX(-50%);font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:9px;color:var(--chrome-m);}
+        .lg-tick::after{content:'';position:absolute;top:14px;left:50%;width:1px;height:6px;background:rgba(245,239,227,.14);}
+        .lg-row{display:flex;align-items:center;height:46px;}
+        .lg-rowlabel{width:96px;flex:none;display:flex;flex-direction:column;line-height:1.2;padding-right:8px;}
+        .lg-rowlabel b{font-family:'Fraunces',serif;font-size:13px;color:var(--chrome-t);font-weight:600;}
+        .lg-rowlabel span{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:9px;color:var(--chrome-m);}
+        .lg-track{position:relative;flex:1;height:100%;}
+        .lg-bar{position:absolute;top:50%;transform:translateY(-50%);height:13px;border-radius:3px;}
+        .lg-bar.build{background:linear-gradient(90deg,#8a4a14,var(--crust));}
+        .lg-bar.retard{background:repeating-linear-gradient(45deg,#2f6090,#2f6090 5px,#3a6ea5 5px,#3a6ea5 10px);}
+        .lg-mark{position:absolute;top:0;height:100%;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;justify-content:center;}
+        .lg-mark .lg-dot{width:8px;height:8px;border-radius:50%;border:1.5px solid var(--chrome2);}
+        .lg-mark.feed .lg-dot{background:var(--chrome-m);}
+        .lg-mark.peak .lg-dot{background:#f0c000;}
+        .lg-mark.mix .lg-dot{background:var(--crust);}
+        .lg-mlab{position:absolute;top:-2px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:8.5px;color:var(--chrome-m);white-space:nowrap;transform:translateX(-50%);}
+        .lg-mark.feed .lg-mlab{left:50%;}
+        .lg-mark.peak .lg-mlab{top:auto;bottom:-2px;left:50%;color:#e8c44a;}
+        .lg-mark.mix .lg-mlab{left:50%;color:var(--crust);}
+        .lg-legend{display:flex;gap:14px;margin-top:8px;margin-left:96px;}
+        .lg-key{font-family:'DM Sans';font-size:10px;color:var(--chrome-m);display:flex;align-items:center;gap:5px;}
+        .lg-key.build::before{content:'';width:14px;height:8px;border-radius:2px;background:var(--crust);}
+        .lg-key.retard::before{content:'';width:14px;height:8px;border-radius:2px;background:repeating-linear-gradient(45deg,#2f6090,#2f6090 3px,#3a6ea5 3px,#3a6ea5 6px);}
+        .lg-key.peakk{color:#e8c44a;}
+        /* Bake Gantt */
+        .bl-bake-gantt{margin:10px 14px 4px;background:var(--chrome2);border-radius:10px;padding:14px 14px 10px;}
+        .bg-axis{position:relative;height:16px;margin-left:84px;border-bottom:1px solid rgba(245,239,227,.14);margin-bottom:4px;}
+        .bg-tick{position:absolute;top:0;transform:translateX(-50%);font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:9px;color:var(--chrome-m);}
+        .bg-tick::after{content:'';position:absolute;top:12px;left:50%;width:1px;height:5px;background:rgba(245,239,227,.14);}
+        .bg-preheat{position:absolute;height:9px;margin-top:2px;background:repeating-linear-gradient(45deg,rgba(176,144,112,.3),rgba(176,144,112,.3) 4px,transparent 4px,transparent 8px);border-radius:2px;margin-left:84px;display:none;}
+        .bg-row{display:flex;align-items:center;height:30px;}
+        .bg-rowlabel{width:84px;flex:none;display:flex;flex-direction:column;line-height:1.15;padding-right:8px;}
+        .bg-rowlabel b{font-family:'Fraunces',serif;font-size:12px;color:var(--chrome-t);font-weight:600;}
+        .bg-rowlabel span{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:9px;color:var(--chrome-m);}
+        .bg-track{position:relative;flex:1;height:100%;}
+        .bg-bar{position:absolute;top:50%;transform:translateY(-50%);height:13px;}
+        .bg-bar.steam{background:repeating-linear-gradient(45deg,#5a86a8,#5a86a8 4px,#6f97b5 4px,#6f97b5 8px);border-radius:3px 0 0 3px;}
+        .bg-bar.dry{background:linear-gradient(90deg,var(--crust),#8a4a14);border-radius:0 3px 3px 0;}
+        .bg-vent{position:absolute;top:50%;transform:translateY(-50%);width:2px;height:18px;background:var(--chrome-t);}
+        .bg-legend{display:flex;gap:14px;margin-top:8px;margin-left:84px;}
+        .bg-key{font-family:'DM Sans';font-size:10px;color:var(--chrome-m);display:flex;align-items:center;gap:5px;}
+        .bg-key.steam::before{content:'';width:14px;height:8px;border-radius:2px;background:repeating-linear-gradient(45deg,#5a86a8,#5a86a8 3px,#6f97b5 3px,#6f97b5 6px);}
+        .bg-key.dry::before{content:'';width:14px;height:8px;border-radius:2px;background:var(--crust);}
+        .bl-levcard{border:1.5px solid var(--line);border-radius:12px;overflow:hidden;background:var(--cream);min-width:0;box-shadow:0 2px 8px rgba(26,15,7,.04);}
+        .bl-levcard.warn{border-color:var(--alert);}
+        .bl-levcard .lh{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:11px 14px;background:var(--chrome2);border-bottom:none;}
+        .bl-levcard .lh .nm{font-family:'Fraunces',serif;font-weight:600;font-size:15px;color:var(--chrome-t);}
+        .bl-levcard .lh .sv{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:10px;color:var(--chrome-m);font-weight:600;}
+        .bl-levcard .lwater{display:flex;flex-direction:column;align-items:center;padding:14px 8px 12px;background:linear-gradient(180deg,#eef4f6,#fffdf8);border-bottom:1px dashed var(--line);}
+        .bl-levcard .lwater .wt{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:30px;color:#1f6f86;line-height:1;}
+        .bl-levcard .lwater .wl{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--ink2);margin-top:4px;}
+        .bl-levcard.warn .lwater{background:var(--alert-bg);} .bl-levcard.warn .lwater .wt{color:var(--alert);}
+        .bl-levcard .lrows{padding:4px 0;border-bottom:1px dashed var(--line);}
+        .bl-levcard .lrow{display:flex;justify-content:space-between;gap:8px;padding:5px 13px;font-size:12px;color:var(--ink2);}
+        .bl-levcard .lrow b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;color:var(--crust2);font-weight:600;}
+        .bl-levcard .lrow em{font-style:normal;color:var(--ink2);font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;}
+        .bl-levcard .lmix{padding:4px 0;}
+        .bl-levcard .ing{display:flex;justify-content:space-between;gap:10px;padding:6px 13px;font-size:13px;}
+        .bl-levcard .ing span:last-child{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:600;}
+        .bl-levcard .ing.tot{background:var(--paper);font-weight:600;border-top:1.5px solid var(--ink);color:var(--crust2);}
+        .bl-levcard .lbuffer{display:flex;align-items:center;flex-wrap:wrap;gap:9px;padding:5px 13px 7px;font-size:11px;color:var(--ink2);font-family:'DM Sans';}
+        .bl-levcard .lbuffer-tog{display:flex;align-items:center;gap:7px;cursor:pointer;}
+        .bl-levcard .lbuffer-tog input{width:15px;height:15px;accent-color:var(--crust);cursor:pointer;flex:none;}
+        .bl-levcard .lbuffer-pct{display:flex;align-items:center;gap:3px;color:var(--crust2);font-weight:600;}
+        .bl-levcard .lbuffer-pct input{width:50px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;padding:3px 6px;border:1.5px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);text-align:right;}
+        .bl-levcard .lwarn{font-size:11px;color:var(--alert);background:var(--alert-bg);padding:8px 13px;line-height:1.4;}
+        @media (max-width:600px){
+          .bl-root{padding:0 12px 34px;}
+          .bl-head{margin:0 -12px;padding:12px 12px 0;}
+          .bl-tabs{margin:0 -12px 20px;padding:11px 14px;}
+          .bl-brandstrip{flex-wrap:wrap;} .bl-runnav{width:100%;margin-left:0;margin-top:2px;} .bl-runnav button{flex:1 1 auto;min-width:0;min-height:40px;padding:8px 6px;font-size:12px;white-space:nowrap;}
+          .bl-title{font-size:20px;} .bl-title small{font-size:9px;letter-spacing:1.8px;} .bl-hap-logo{height:33px;} .bl-prodname{font-size:21px;}
+          .bl-hap-logo-sm{height:32px;} .bl-prodname-sm{font-size:20px;}
+          .bl-panel{padding:13px;}
+          /* 16px inputs stop iOS zoom-on-tap; taller targets for fingers */
+          .bl-root input, .bl-root select{font-size:16px;min-height:40px;}
+          .ing-pct.main{min-height:40px;}
+          .bl-tab{padding:12px 20px;font-size:15px;}
+          /* sticky nav slides up out of the way on scroll-down, returns on scroll-up */
+          .bl-tabs.navhidden{transform:translateY(-100%);}
+          /* day name drops to its own full-width row; home + date + units align above it */
+          .bl-dayname{order:5;flex:1 0 100%;font-size:21px;min-width:0;}
+          /* home header: stack so the toggle + new-day button never clip */
+          .bl-home-hd{flex-direction:column;align-items:stretch;gap:14px;}
+          .bl-home-tabs{display:flex;width:100%;}
+          .bl-home-tabs button{flex:1;text-align:center;padding:12px 8px;font-size:15px;}
+          .bl-newday{width:100%;padding:13px 18px;font-size:15px;}
+          /* food safety: narrower columns so two readings show before scroll */
+          .fsm-head,.fsm-row{grid-template-columns:minmax(104px,1fr) repeat(3,minmax(96px,1fr));min-width:440px;}
+          /* lift the smallest labels off the floor for scannability */
+          .bl-subhead{font-size:11.5px;}
+          .bl-note{font-size:13px;}
+          .lr-spec,.dc-bake,.dc-date{font-size:12px;}
+          .ing-pct.main b{font-size:8.5px;}
+          .fsm-sub{font-size:10px;}
+          .fsm-ts{font-size:12px;}
+          .bl-field2 label{font-size:11.5px;}
+          .bl-fixed .cell label{font-size:11px;}
+          .bl-lev-exp label,.bl-lev-grid label{font-size:11px;}
+          .bl-rec-top{grid-template-columns:1fr 1fr;}
+          .bl-rec-top > div:first-child{grid-column:1 / -1;}
+          .ing-x{width:38px;height:40px;font-size:17px;}
+          .bl-rep-grid{grid-template-columns:1fr;}
+          .bl-hero .big{font-size:21px;} .bl-clock{font-size:23px;}
+          .bl-types{gap:14px;}
+        }
+
+        /* ---- mix toolbar alt button + label generator ---- */
+        .bl-mixwater-btn.alt{background:#2a3c44;}
+        .bl-mixwater-btn.alt:hover{background:#1f2d33;}
+        .bl-mixwater-btn:disabled{opacity:.45;cursor:not-allowed;}
+        .label-print-overlay{position:fixed;inset:0;z-index:300;background:#241811;overflow:auto;}
+        .label-print-ui{position:sticky;top:0;z-index:3;display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:13px 18px;background:#1a0f07;color:#f5efe3;font-family:'DM Sans',sans-serif;}
+        .label-print-ui .lpu-title{font-family:'Fraunces',serif;font-weight:600;font-size:18px;display:flex;flex-direction:column;line-height:1.15;}
+        .label-print-ui .lpu-title small{font-family:'DM Sans';font-weight:500;font-size:11px;color:#b09070;}
+        .lpu-ctl{display:flex;align-items:center;gap:7px;font-size:12px;color:#b09070;font-weight:600;}
+        .lpu-ctl select{font-family:'DM Sans';font-size:13px;padding:8px 10px;border-radius:8px;border:1.5px solid rgba(245,239,227,.18);background:#2f1c0f;color:#f5efe3;cursor:pointer;}
+        .lpu-ctl.sm input{width:58px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:13px;padding:7px 8px;border-radius:7px;border:1.5px solid rgba(245,239,227,.18);background:#2f1c0f;color:#f5efe3;text-align:right;}
+        .lpu-ctl.sm em{font-style:normal;font-size:11px;}
+        .lpu-spacer{flex:1;}
+        .lpu-print{font-family:'DM Sans';font-weight:700;font-size:14px;padding:11px 18px;border:none;border-radius:9px;background:#b5651d;color:#fff;cursor:pointer;}
+        .lpu-print:hover{background:#8a4a14;}
+        .lpu-close{flex:none;border:none;background:rgba(245,239,227,.12);color:#f5efe3;border-radius:8px;width:36px;height:36px;font-size:19px;line-height:1;cursor:pointer;}
+        .label-print-hint{font-family:'DM Sans';font-size:12px;color:#d8c4a8;background:#2f1c0f;padding:9px 18px;line-height:1.45;}
+        .label-print-hint b{color:#f5efe3;}
+        .label-stage{display:flex;justify-content:center;padding:24px 12px 48px;zoom:.62;}
+        .label-sheets{display:flex;flex-direction:column;gap:22px;}
+        .label-sheet{background:#fff;box-shadow:0 6px 30px rgba(0,0,0,.45);}
+        .label-copies{max-width:340px;margin:0 auto 8px;padding:9px 12px;background:rgba(255,255,255,.06);border:1px solid rgba(245,239,227,.16);border-radius:10px;display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;}
+        .lcp-hd{font-family:'DM Sans';font-size:11.5px;color:#b09070;}
+        .lcp-item{display:flex;align-items:center;gap:5px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:#f5efe3;}
+        .lcp-item input{width:44px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12px;padding:3px 5px;border:1px solid rgba(245,239,227,.3);border-radius:5px;background:rgba(245,239,227,.1);color:#f5efe3;text-align:center;}
+        .label-skipmap{max-width:340px;margin:0 auto 4px;padding:10px 12px;background:rgba(255,255,255,.06);border:1px solid rgba(245,239,227,.16);border-radius:10px;}
+        .lsm-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:'DM Sans';font-size:11.5px;color:#b09070;margin-bottom:8px;}
+        .lsm-reset{font-family:'DM Sans';font-size:11px;font-weight:600;padding:3px 9px;border-radius:6px;border:1px solid rgba(245,239,227,.28);background:transparent;color:#f5efe3;cursor:pointer;white-space:nowrap;}
+        .lsm-grid{display:grid;gap:5px;}
+        .lsm-cell{position:relative;display:flex;align-items:center;justify-content:center;gap:5px;height:30px;border:1.5px solid rgba(245,239,227,.3);border-radius:5px;background:rgba(245,239,227,.1);cursor:pointer;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:#f5efe3;}
+        .lsm-cell.off{background:transparent;border-style:dashed;border-color:rgba(245,239,227,.16);color:rgba(245,239,227,.32);}
+        .lsm-cell input{width:14px;height:14px;accent-color:#b5651d;cursor:pointer;margin:0;}
+        .label-cell{box-sizing:border-box;width:100%;height:100%;overflow:hidden;padding:0.13in 0.16in;display:flex;flex-direction:row;gap:0.16in;color:#1a1a1a;font-family:'DM Sans',sans-serif;}
+        .lc-left{flex:none;width:1.55in;display:flex;flex-direction:column;justify-content:center;border-right:1pt solid #1a1a1a;padding-right:0.14in;overflow:hidden;}
+        .lc-left .lc-n{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:11pt;color:#fff;background:#1a1a1a;border-radius:3pt;padding:1.5pt 6pt;align-self:flex-start;margin-bottom:5pt;letter-spacing:.5pt;}
+        .lc-left .lc-name{font-family:'Fraunces',serif;font-weight:600;font-size:17pt;line-height:1.04;}
+        .lc-left .lc-tot{margin-top:auto;display:flex;flex-direction:column;gap:1pt;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:7.5pt;line-height:1.25;color:#333;border-top:0.5pt solid #bbb;padding-top:2.5pt;}
+        .lc-left .lc-tot b{font-weight:400;color:#1a1a1a;}
+        .lc-right{flex:1;display:flex;flex-direction:column;min-width:0;}
+        .lc-lines{flex:1;display:flex;flex-direction:column;gap:1pt;justify-content:center;}
+        .lc-line{display:flex;justify-content:space-between;align-items:baseline;gap:6pt;font-size:9pt;line-height:1.3;}
+        .lc-line .lc-ing{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
+        .lc-line .lc-g{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;flex:none;}
+        .pnum{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;}
+        .lc-foot{font-size:7pt;color:#555;border-top:0.5pt solid #ccc;padding-top:2pt;margin-top:3pt;}
+        .ms-crop{position:absolute;background:#1a1a1a;}
+        .ms-form{position:relative;box-sizing:border-box;width:4in;height:6.5in;overflow:hidden;background:#fff;color:#1a1a1a;font-family:'DM Sans',sans-serif;}
+        .ms-clip{height:0.5in;}
+        .ms-top{box-sizing:border-box;height:2.95in;padding:0.1in 0.16in 0.06in;border-bottom:1pt solid #1a1a1a;display:flex;flex-direction:column;gap:0.06in;overflow:hidden;}
+        .ms-hd{display:flex;align-items:center;gap:0.1in;}
+        .ms-n{flex:none;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:15.6pt;color:#fff;background:#1a1a1a;border-radius:3pt;padding:2pt 7pt;}
+        .ms-title{flex:1;min-width:0;}
+        .ms-name{font-family:'Fraunces',serif;font-weight:600;font-size:14.4pt;line-height:1.05;}
+        .ms-name.sm{font-size:12.6pt;}
+        .ms-name.xs{font-size:10.8pt;}
+        .ms-sub{font-family:'DM Sans',sans-serif;font-weight:500;font-size:7.6pt;color:#444;margin-top:2pt;}
+        .ms-cols{flex:1;display:flex;gap:0.12in;min-height:0;overflow:hidden;}
+        .ms-ing{flex:none;width:1.7in;display:flex;flex-direction:column;}
+        .ms-right{flex:1;min-width:0;display:flex;flex-direction:column;gap:calc(4pt * var(--ms-t,1));}
+        .ms-ddt{display:flex;justify-content:space-between;align-items:center;gap:4pt;border:1.25pt solid #1a1a1a;border-radius:4pt;padding:2pt 6pt;line-height:1.1;}
+        .ms-ddt span{font-size:calc(6.5pt * var(--ms-t,1));text-transform:uppercase;letter-spacing:.5pt;color:#444;}
+        .ms-ddt b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:calc(15.6pt * var(--ms-t,1));}
+        .ms-bh{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:calc(7pt * var(--ms-s,1));font-weight:700;letter-spacing:.6pt;text-transform:uppercase;color:#fff;background:#4a4a4a;padding:1pt 4pt;margin-top:2pt;}
+        .ms-row{display:flex;justify-content:space-between;align-items:baseline;gap:4pt;font-size:calc(9.4pt * var(--ms-s,1));line-height:1.2;border-bottom:0.4pt solid #d6d6d6;}
+        .ms-rn{min-width:0;overflow-wrap:anywhere;}
+        .ms-row.has-sub{flex-wrap:wrap;}
+        .ms-rsub{flex:1 0 100%;text-align:right;font-size:.74em;line-height:1.1;color:#444;margin-top:-1pt;padding-bottom:1pt;}
+        .ms-rg{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;flex:none;font-size:.94em;}
+        .ms-rg em{font-style:normal;font-weight:500;font-size:.8em;color:#444;margin-left:3pt;}
+        .ms-steps{margin:0;padding:0 0 0 0.15in;font-size:calc(8.9pt * var(--ms-t,1));line-height:1.3;}
+        .ms-steps li{margin-bottom:calc(2.5pt * var(--ms-t,1));}
+        .ms-bot{box-sizing:border-box;height:3.05in;padding:0.05in 0.16in 0.06in;display:flex;flex-direction:column;gap:0.035in;overflow:hidden;}
+        .ms-fr{display:flex;gap:0.12in;}
+        .ms-f{flex:1;min-width:0;display:flex;flex-direction:column;font-size:7.2pt;line-height:1.1;color:#444;}
+        .ms-f i{display:block;height:0.19in;border-bottom:0.75pt solid #1a1a1a;}
+        .ms-prog{border-collapse:collapse;width:100%;table-layout:fixed;}
+        .ms-prog th{font-size:7pt;line-height:1.1;font-weight:600;color:#444;text-align:left;padding:0 0 1pt 2pt;border-bottom:0.75pt solid #1a1a1a;}
+        .ms-prog td{padding:0;height:0.22in;border-bottom:0.5pt solid #999;border-right:0.5pt solid #ccc;}
+        .ms-prog td:last-child{border-right:none;}
+        .ms-prog td.lbl{padding-left:2pt;font-size:8pt;font-weight:600;color:#1a1a1a;vertical-align:middle;}
+        .ms-notes{flex:none;display:flex;flex-direction:column;font-size:7.2pt;line-height:1.1;color:#444;}
+        .ms-rules{flex:none;height:0.66in;overflow:hidden;}
+        .ms-rules i{display:block;height:0.22in;border-bottom:0.5pt solid #999;}
+        @media print { .ms-form, .ms-form *, .ms-crop { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+        @media (max-width:600px){ .label-stage{zoom:.42;} .label-print-ui{gap:9px;padding:11px 12px;} .lpu-spacer{flex-basis:100%;height:0;} }
+        @media print {
+          @page { size: 8.5in 11in; margin: 0; }
+          html, body { background:#fff !important; }
+          .bl-root { display: none !important; }
+          .label-print-overlay { position: static !important; inset:auto !important; background:#fff !important; overflow:visible !important; }
+          .label-print-ui, .label-print-hint, .label-skipmap, .label-copies { display: none !important; }
+          .label-stage { zoom:1 !important; padding:0 !important; display:block !important; }
+          .label-sheets { gap:0 !important; display:block !important; }
+          .label-sheet { box-shadow:none !important; margin:0 !important; break-after:page; page-break-after:always; }
+          .label-sheet:last-child { break-after:auto; page-break-after:auto; }
+        }
+        .bl-optimize{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:10px 0 2px;padding:9px 11px;background:var(--paper);border:1px solid var(--line);border-radius:8px;}
+        .bl-optimize.warn{font-size:12px;color:var(--alert);background:var(--alert-bg);border-color:var(--alert);}
+        .bl-optimize .opt-stat{display:flex;gap:9px;align-items:center;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--ink2);margin-right:2px;white-space:nowrap;}
+        .bl-optimize .opt-stat span:first-child{font-weight:700;color:var(--crust2);}
+        .opt-chip{font-family:'DM Sans';font-size:12px;font-weight:600;cursor:pointer;border:1px solid var(--line);background:var(--cream);color:var(--ink);border-radius:7px;padding:7px 11px;display:inline-flex;align-items:center;gap:5px;}
+        .opt-chip:hover{border-color:var(--crust);color:var(--crust2);}
+        .opt-chip em{font-style:normal;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--ink2);}
+        .bl-timer-done{background:var(--alert-bg);border:1.5px solid var(--alert);animation:tflash 1.1s steps(1) infinite;}
+        @keyframes tflash{50%{background:var(--cream);}}
+        .bl-timer-done .td-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:7px 2px;flex-wrap:wrap;}
+        .td-info{display:flex;align-items:center;gap:11px;flex-wrap:wrap;}
+        .td-info .td-b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:17px;color:var(--ink);}
+        .td-info .td-ph{font-family:'Fraunces',serif;font-size:18px;color:var(--ink);}
+        .td-info .td-done{font-family:'DM Sans';font-weight:700;font-size:12px;letter-spacing:1.5px;color:var(--alert);}
+        .td-stop{font-family:'DM Sans';font-weight:700;font-size:14px;cursor:pointer;border:none;border-radius:8px;padding:11px 20px;background:var(--alert);color:#fff;flex:none;}
+        .td-acts{display:flex;align-items:center;gap:9px;flex:none;flex-wrap:wrap;}
+        .td-next{font-family:'DM Sans';font-weight:700;font-size:14px;cursor:pointer;border:none;border-radius:8px;padding:11px 18px;background:var(--ink);color:var(--paper);}
+        .td-next:hover{background:var(--chrome2);}
+        .bl-timer-empty{font-size:13px;color:var(--ink2);}
+        .bl-timer-active{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;}
+        .ta-card{border:none;border-radius:16px;padding:26px 28px;background:var(--chrome);box-shadow:0 4px 16px rgba(26,15,7,.18);}
+        .ta-top{display:flex;align-items:center;gap:12px;margin-bottom:10px;}
+        .ta-top .ta-b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:22px;color:var(--chrome-t);}
+        .ta-top .ta-ph{font-family:'Fraunces',serif;font-size:21px;color:var(--chrome-m);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+        .ta-time{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:68px;color:var(--chrome-t);letter-spacing:-3px;line-height:1;}
+        .ta-bar{height:9px;background:rgba(245,239,227,.16);border-radius:5px;margin-top:14px;overflow:hidden;}
+        .ta-fill{height:100%;background:var(--crust);transition:width 1s linear;}
+        .ta-cancel{margin-top:16px;width:100%;font-family:'DM Sans';font-weight:700;font-size:14px;cursor:pointer;border:1.5px solid rgba(245,239,227,.3);background:transparent;color:var(--chrome-t);border-radius:10px;padding:13px;}
+        .ta-cancel:hover{background:rgba(245,239,227,.1);border-color:var(--chrome-t);}
+        .bl-timer-durnote{font-size:13px;color:var(--ink2);margin-bottom:10px;}
+        .bl-timer-durs{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:10px;margin-bottom:12px;align-items:end;}
+        .dur-cell{display:flex;flex-direction:column;gap:4px;}
+        .dur-cell span{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink2);font-weight:700;}
+        .dur-cell input{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:15px;padding:9px 11px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);width:100%;}
+        .dur-custom{gap:6px;}
+        .dur-label{font-family:'DM Sans';font-weight:600;font-size:13px;padding:8px 10px;border:1.5px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);width:100%;}
+        .dur-cw{display:flex;gap:6px;align-items:stretch;}
+        .dur-cw input{flex:1;min-width:0;}
+        .dur-x{flex:none;width:40px;border:1.5px solid var(--line);border-radius:8px;background:var(--paper);color:var(--ink2);font-size:18px;cursor:pointer;line-height:1;}
+        .dur-x:hover{border-color:var(--alert);color:var(--alert);}
+        .bl-addphase{margin:0 0 18px;font-family:'DM Sans';font-weight:600;font-size:13px;cursor:pointer;border:1.5px dashed var(--line);border-radius:8px;background:transparent;color:var(--crust2);padding:11px 16px;}
+        .bl-addphase:hover{border-color:var(--crust);background:var(--cream);}
+        .bl-timer-grid{display:flex;flex-direction:column;gap:11px;}
+        .tg-row{display:flex;align-items:center;gap:13px;flex-wrap:wrap;}
+        .tg-bn{display:flex;align-items:baseline;gap:7px;min-width:118px;}
+        .tg-bn .tg-b{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-weight:700;font-size:16px;color:var(--ink);}
+        .tg-bn .tg-nm{font-size:13px;color:var(--ink2);}
+        .tg-cells{display:flex;gap:6px;flex-wrap:wrap;flex:1;}
+        .tg-cell{display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer;border:1.5px solid var(--line);border-radius:8px;background:var(--cream);color:var(--ink);padding:8px 9px;min-width:62px;font-family:'DM Sans';}
+        .tg-cell .tg-ph{font-size:12px;font-weight:600;}
+        .tg-cell .tg-d{font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:11px;color:var(--ink2);}
+        .tg-cell.running{border-color:var(--crust);background:#fff;}
+        .tg-cell.running .tg-d{color:var(--crust2);font-weight:700;}
+        .tg-cell.ringing{border-color:var(--alert);background:var(--alert-bg);}
+        .tg-cell:disabled{opacity:.4;cursor:default;}
+        /* ===== iPad / large touch — landscape-first, bench use ===== */
+        @media (pointer: coarse) and (min-width: 768px){
+          .bl-root input, .bl-root select, .bl-root textarea{ font-size:16px; min-height:46px; }
+          .bl-root input[type=range]{ min-height:0; height:30px; }
+          .bl-btn{ min-height:46px; padding:12px 18px; font-size:14px; }
+          .bl-tab{ min-height:46px; padding:13px 22px; font-size:15px; }
+          .bl-tabs{ gap:10px; padding:13px 22px; }
+          .bl-back{ width:46px; height:46px; }
+          .bl-daydate{ min-height:46px; font-size:14px; }
+          .bl-unittoggle-hd{ height:46px; } .bl-unittoggle-hd button{ font-size:14px; padding:0 16px; }
+          .bl-unittoggle button{ min-height:44px; font-size:14px; padding:0 16px; }
+          .bl-ing-kindtoggle button{ min-height:44px; font-size:13px; padding:11px 16px; }
+          .bl-home-tabs button{ min-height:46px; padding:11px 20px; font-size:15px; }
+          .bl-addrec{ min-height:50px; padding:14px; font-size:15px; }
+          .bl-ing-row .ir-kind{ min-height:36px; padding:7px 12px; }
+          .ing-x{ width:40px; height:40px; font-size:18px; }
+          .bl-rmcard{ padding:8px 11px; font-size:13px; }
+          .opt-chip{ min-height:44px; font-size:13px; }
+          .tg-cell{ min-height:56px; min-width:72px; } .td-stop{ min-height:48px; } .td-next{ min-height:48px; } .ta-cancel{ min-height:52px; } .bl-addphase{ min-height:48px; } .dur-x{ min-height:46px; }
+          .bl-panel{ padding:22px 24px; }
+          .bl-panel h3{ font-size:22px; }
+          .bl-rec-title, .bl-load .lo-nm, .bl-pool-row .pr-nm, .bl-session-hd .ss-no{ font-size:17px; }
+          .bl-field label, .bl-field2 label, .bl-orders label, .bl-mixday-field label{ font-size:12.5px; }
+          .bl-mixday-note, .bl-calnote, .bl-preheat, .bl-item .lb{ font-size:14.5px; }
+          .bl-bakesum .v{ font-size:22px; } .bl-bakesum .l{ font-size:11px; }
+          .bl-item .tm{ font-size:16px; }
+        }
+      `}</style>
+
+      {view === "home" && (
+        <div className="bl-home">
+          <div className="bl-home-hd">
+            <div className="bl-title"><HapLogo className="bl-hap-logo" /><span className="bl-prodname">BakeLab</span><small>production studio</small><span className="bl-build-id" data-k="buildid">build {BUILD_ID}</span></div>
+            <div className="bl-home-tabs">
+              <button className={homeTab === "bakedays" ? "on" : ""} onClick={() => setHomeTab("bakedays")}>Runs</button>
+              <button className={homeTab === "recipes" ? "on" : ""} onClick={() => { setHomeTab("recipes"); setBuilderView("list"); }}>Recipes</button>
+              <button className={homeTab === "pantry" ? "on" : ""} onClick={() => setHomeTab("pantry")}>Pantry</button>
+              <button className={homeTab === "equipment" ? "on" : ""} data-f="home-equipment" onClick={() => setHomeTab("equipment")}>Equipment</button>
+              <button className={homeTab === "starter" ? "on" : ""} onClick={() => setHomeTab("starter")}>{(starter.name && starter.name.trim()) || "Starter"}</button>
+            </div>
+          </div>
+
+          {homeTab === "bakedays" && (<>
+          <div className="bl-home-actions"><button className="bl-newday" onClick={newDay}>+ New run</button></div>
+          {days.length === 0 ? (
+            <div className="bl-emptytab">No runs yet — create your first.</div>
+          ) : (
+            <div className="bl-daygrid">
+              {[...days].sort((a, b) => ((b.date || "").localeCompare(a.date || "")) || ((b.updatedAt || 0) - (a.updatedAt || 0))).map((d) => {
+                const sl = Array.isArray(d.day && d.day.slots) ? d.day.slots : [];
+                const active = sl.filter((s) => (s.loaves || 0) > 0);
+                const loaves = active.reduce((a, s) => a + (s.loaves || 0), 0);
+                const names = active.map((s) => (s.draft && s.draft.name) || "—").join(" · ");
+                const sess = Array.isArray(d.day && d.day.slots) ? d.day.slots.flatMap((s) => (s.sessions || [])) : [];
+                const bakeDates = [...new Set(sess.map((s) => s.date).filter(Boolean))].sort();
+                const bakeLine = bakeDates.length ? (bakeDates.length === 1 ? ("bake " + bakeDates[0]) : (bakeDates.length + " bake dates · " + bakeDates.map((d) => d.slice(5)).join(", "))) : "";
+                const done = !!d.complete;
+                return (
+                  <div className={"bl-daycard" + (done ? " done" : "")} key={d.id} onClick={() => openDay(d.id)}>
+                    <div className="dc-band">
+                      <div className="dc-top">
+                        <span className="dc-date">{d.date || "—"}</span>
+                        <div className="dc-acts">
+                          <button className={"dc-status" + (done ? " done" : "")} title="Toggle active / complete" onClick={(e) => { e.stopPropagation(); toggleComplete(d.id); }}>{done ? "✓ Done" : "● Active"}</button>
+                          <button title="Duplicate" onClick={(e) => { e.stopPropagation(); dupDay(d.id); }}>⧉</button>
+                          <button title="Delete" onClick={(e) => { e.stopPropagation(); setDelTarget({ id: d.id, name: d.name, kind: "day" }); }}>×</button>
+                        </div>
+                      </div>
+                      <div className="dc-name">{d.name || "Untitled"}</div>
+                    </div>
+                    <div className="dc-body">
+                      <div className="dc-sum">{active.length ? (active.length + (active.length === 1 ? " recipe · " : " recipes · ") + loaves + " loaves") : "empty"}</div>
+                      <div className="dc-recipes">{names || "No recipes set yet"}</div>
+                      {bakeLine && <div className="dc-bake">{bakeLine}</div>}
+                      <div className="dc-open">Open →</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div className="bl-note">Each run saves its own recipes, loaf counts, schedule, temperatures and levain feed plan. Your recipe library and starter settings are shared across every run.</div>
+          </>)}
+
+          {homeTab === "recipes" && (<>
+          {builderView === "edit" && editingDraft ? (
+            <div className="bl-recipe-editor">
+              <div className="bl-re-hd">
+                <button className="bl-back" onClick={cancelEdit} title="Back to recipes"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M15 18l-6-6 6-6"/></svg></button>
+                <span className="bl-re-title">{editingIsRemix ? "Remix" : (editingRecipeId ? "Edit core recipe" : "New core recipe")}</span>
+                <button className="bl-newday" style={{marginLeft:"auto"}} onClick={saveEdit}>Save</button>
+              </div>
+              <RecipeAssistPanel
+                draft={editingDraft}
+                hasExisting={!!editingRecipeId}
+                onApplyFull={(r) => { const tidy = (xs) => (Array.isArray(xs) ? xs.map((x) => ({ ...x, id: x.id || uid(), when: cleanWhen(x.when) })) : undefined); setEditingDraft((d) => ({ ...blankRecipe(), ...r, ...(tidy(r.liquids) ? { liquids: tidy(r.liquids) } : {}), ...(tidy(r.inclusions) ? { inclusions: tidy(r.inclusions) } : {}), id: (d && d.id) || uid() })); }}
+                onApplyPatch={(changes) => setEditingDraft((d) => (d ? { ...d, ...changes } : d))}
+              />
+              <div className="bl-re-form">
+                <div className="bl-field"><label>Recipe name</label><BufferedInput className="bl-re-name-input" value={editingDraft.name || ""} onCommit={(v) => patchEdit({ name: v })} placeholder="Name this recipe" /></div>
+                <div className="bl-re-row">
+                  <div className="bl-field2"><label>Loaf weight (g)</label><input type="number" min="0" value={editingDraft.loafWeight || 850} onChange={(e) => patchEdit({ loafWeight: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Autolyse (min)</label><input type="number" min="0" value={editingDraft.autolyse ?? 45} onChange={(e) => patchEdit({ autolyse: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Proofing container</label><select data-f="shape" value={proofInfo(editingDraft.shape).key} onChange={(e) => patchEdit({ shape: e.target.value })}>{PROOF_CONTAINERS.map((c) => <option key={c.key} value={c.key}>{c.label}</option>)}</select></div>
+                </div>
+                <div className="bl-re-row">
+                  <div className="bl-field2"><label>Wholesale price / loaf ($)</label><input type="number" min="0" step="0.25" value={editingDraft.price ?? 0} onChange={(e) => patchEdit({ price: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                </div>
+                <div className="bl-subhead">Flours · main balances to 100%</div>
+                {(editingDraft.flours || []).map((f, idx) => (
+                  <div className="ing-row" key={f.id}>
+                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchEditFlour(idx, { name: v })} placeholder={"Flour " + (idx + 1)} ingredients={ingOptions} onNewName={ensurePantryIng} />
+                    {idx === 0
+                      ? <div className="ing-pct main"><b>main</b><span>{Math.max(0, 100 - (editingDraft.flours.slice(1).reduce((a, x) => a + (+x.pct || 0), 0)))}</span><em>%</em></div>
+                      : <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => patchEditFlour(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>}
+                    {idx === 0 ? <span className="ing-x ph" /> : <button className="ing-x" onClick={() => removeEditFlour(idx)}>×</button>}
+                  </div>
+                ))}
+                <button className="bl-add" onClick={addEditFlour}>+ Flour</button>
+                <div className="bl-subhead">Water · Salt · Levain</div>
+                <div className="bl-re-row">
+                  <div className="bl-field2"><label>Water %</label><input type="number" min="0" value={editingDraft.water || 0} onChange={(e) => patchEdit({ water: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Salt %</label><input type="number" min="0" value={editingDraft.salt || 0} onChange={(e) => patchEdit({ salt: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Levain %</label><input type="number" min="0" value={editingDraft.levain || 0} onChange={(e) => patchEdit({ levain: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                </div>
+                <div className="bl-bass">
+                  <label className="bl-bass-tog"><input type="checkbox" checked={!!editingDraft.bassinage} onChange={(e) => patchEdit({ bassinage: e.target.checked })} /><span>Bassinage — hold water back, work in after gluten development</span></label>
+                  {editingDraft.bassinage && (
+                    <span className="bl-bass-pct"><input type="number" min="0" max="50" step="0.5" value={editingDraft.bassinagePct ?? 8} onChange={(e) => patchEdit({ bassinagePct: Math.max(0, Math.min(50, Number(e.target.value) || 0)) })} /><em>% of water held back</em></span>
+                  )}
+                  {editingDraft.bassinage && (() => {
+                    const wAll = +editingDraft.water || 0, scx = scaldInfo(editingDraft), sw = (scx.on && scx.isWater) ? scx.S : 0, w = Math.max(0, wAll - sw), bp = Math.max(0, Math.min(50, +(editingDraft.bassinagePct ?? 8) || 0)), bw = w * bp / 100;
+                    return <div className="bl-bass-read">main {Math.round((w - bw) * 10) / 10}% · bassinage {Math.round(bw * 10) / 10}%{sw > 0 ? " · scald " + Math.round(sw * 10) / 10 + "%" : ""} · total still {Math.round(wAll * 10) / 10}%</div>;
+                  })()}
+                </div>
+                <div className="bl-subhead">Liquids <span className="bl-sub-note">milk 88% · egg 75% · cream 60% · tangzhong liquid counts too</span></div>
+                {(editingDraft.liquids || []).map((l, idx) => (
+                  <div className="liq-row" key={l.id}>
+                    <IngredientInput className="ing-name" value={l.name} onCommit={(v) => patchEditLiq(idx, { name: v })} placeholder="Milk / egg / tangzhong liquid" ingredients={ingOptions} onNewName={ensurePantryIng} kind="liquid" />
+                    <div className="liq-cell"><input type="number" min="0" value={l.pct} onChange={(e) => patchEditLiq(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
+                    <div className="liq-cell"><input type="number" min="0" max="100" value={l.factor} onChange={(e) => patchEditLiq(idx, { factor: Math.max(0, Math.min(100, Number(e.target.value) || 0)) })} /><em>% water</em></div>
+                    <span className="when-end">
+                      <WhenSelect kind="liquid" value={isScaldLiquid(editingDraft, l) ? "scald" : cleanWhen(l.when)} def="autolyse" onChange={(v) => setEditingDraft((d) => (d ? applyLiqWhen(d, idx, v) : d))} />
+                      <button className="ing-x" onClick={() => removeEditLiq(idx)}>×</button>
+                    </span>
+                  </div>
+                ))}
+                <button className="bl-add" onClick={addEditLiq}>+ Liquid</button>
+                <HydrationLine t={editingDraft} onSetWater={(w) => patchEdit({ water: w })} />
+                <ScaldEditor t={editingDraft} onPatch={patchEdit} />
+                <div className="bl-subhead">Inclusions</div>
+                {(editingDraft.inclusions || []).map((f, idx) => (
+                  <div className="ing-row" key={f.id}>
+                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchEditInc(idx, { name: v })} placeholder={"Inclusion " + (idx + 1)} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" />
+                    <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => patchEditInc(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
+                    <span className="when-end">
+                      <WhenSelect kind="inclusion" value={cleanWhen(f.when)} def={defaultWhen("inclusion", f.name, groupOf)} onChange={(v) => patchEditInc(idx, { when: cleanWhen(v) })} />
+                      <button className="ing-x" onClick={() => removeEditInc(idx)}>×</button>
+                    </span>
+                  </div>
+                ))}
+                <button className="bl-add" onClick={addEditInc}>+ Inclusion</button>
+                <div className="bl-subhead">Dough</div>
+                <div className="bl-re-row">
+                  <div className="bl-field2"><label>Target dough temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(editingDraft.ddt ?? DDT_DEFAULT_C))} onChange={(e) => patchEdit({ ddt: uToC(Number(e.target.value) || 0) })} /></div>
+                </div>
+                <div className="bl-subhead">Bake</div>
+                <div className="bl-re-row">
+                  <div className="bl-field2"><label>Temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(editingDraft.bakeTemp ?? 245))} onChange={(e) => patchEdit({ bakeTemp: uToC(Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Bake time (min)</label><input type="number" min="1" value={editingDraft.bakeMin ?? 45} onChange={(e) => patchEdit({ bakeMin: Math.max(1, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Steam (min)</label><input type="number" min="0" value={editingDraft.steamMin ?? 20} onChange={(e) => patchEdit({ steamMin: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                </div>
+                <div className="bl-subhead">Levain build</div>
+                <div className="bl-re-row">
+                  <div className="bl-field2"><label>Hydration %</label><input type="number" min="0" value={editingDraft.levHyd ?? 100} onChange={(e) => patchEdit({ levHyd: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Inoculation %</label><input type="number" min="0" value={editingDraft.levInoc ?? 10} onChange={(e) => patchEdit({ levInoc: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Build to peak (h)</label><input type="number" min="0" step="0.25" value={editingDraft.levBuildHrs ?? 5} onChange={(e) => patchEdit({ levBuildHrs: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Ref temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(editingDraft.levRefTemp ?? 24))} onChange={(e) => patchEdit({ levRefTemp: uToC(Number(e.target.value) || 0) })} /></div>
+                </div>
+                <div className="bl-re-row" data-k="levsugar">
+                  <div className="bl-field2"><label>Sugar in levain % <span className="bl-sub-note">of levain flour · on top of the dough's sugar</span></label><input data-f="levSugar" type="number" min="0" step="0.5" value={editingDraft.levSugar ?? 0} onChange={(e) => patchEdit({ levSugar: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  {(+editingDraft.levSugar || 0) > 0 && <div className="bl-field2"><label>Which sugar</label><IngredientInput className="ing-name" value={editingDraft.levSugarName || ""} placeholder="Granulated sugar" onCommit={(v) => patchEdit({ levSugarName: v })} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" /></div>}
+                </div>
+                <div className="bl-subhead">Notes <span className="bl-sub-note">carries between bakes · shared with the Prep tab</span></div>
+                <BufferedInput className="bl-notes-ta" rows={4} value={editingDraft.notes || ""} onCommit={(v) => patchEdit({ notes: v })} placeholder="What happened last time, what to change…" />
+                {editingIsRemix && <button className="bl-promote-btn" onClick={() => { promoteRemixToCore(editingRecipeId); setBuilderView("list"); }}>↑ Save as core recipe</button>}
+              </div>
+            </div>
+          ) : (
+            <div className="bl-builder-list">
+              <div className="bl-home-actions"><button className="bl-newday" onClick={openNewCore}>+ New recipe</button></div>
+              <div className="bl-subhead bl-builder-sh">Core recipes</div>
+              {coreRecipes.length === 0 && <div className="bl-emptytab">No core recipes yet — create your first.</div>}
+              <div className="bl-recipe-grid">
+                {coreRecipes.map((r) => (
+                  <div className="bl-recipe-card" key={r.id} onClick={() => openEditCore(r.id)}>
+                    <div className="brc-band">
+                      <div className="brc-name">{r.name}</div>
+                      <button className="brc-del" title="Delete" onClick={(e) => { e.stopPropagation(); setDelTarget({ id: r.id, name: r.name, kind: "core" }); }}>×</button>
+                    </div>
+                    <div className="brc-body">
+                      <div className="brc-meta">{r.flours && r.flours.map((f, i) => (i === 0 ? `${Math.max(0, 100 - (r.flours.slice(1).reduce((a, x) => a + (+x.pct || 0), 0)))}% ${f.name}` : `${f.pct}% ${f.name}`)).join(" · ")}</div>
+                      <div className="brc-meta">{r.loafWeight}g · {r.water}% water · {r.levain}% levain @ {r.levHyd ?? 80}% · <b>{Math.round(trueHydration(r) * 10) / 10}% true hyd</b></div>
+                      <div className="brc-ai" onClick={(e) => e.stopPropagation()}>
+                        <div className="brc-ai-row">
+                          <label>loaves <input type="number" min="1" value={aiLoaves[r.id] ?? 24} onChange={(e) => setAiLoaves((st) => ({ ...st, [r.id]: Math.max(1, Number(e.target.value) || 1) }))} /></label>
+                          <button className="brc-ai-btn" disabled={aiState[r.id] && aiState[r.id].loading} onClick={() => runAnalysis(r)}>{aiState[r.id] && aiState[r.id].loading ? "Analyzing…" : "✦ Analyze"}</button>
+                        </div>
+                        {aiState[r.id] && aiState[r.id].error && <div className="brc-ai-err">{aiState[r.id].error}</div>}
+                        {aiState[r.id] && aiState[r.id].result && (() => {
+                          const a = aiState[r.id].result;
+                          if (a.raw && !a.expected && !a.optimizations) return <div className="brc-ai-out"><div className="brc-ai-raw">{a.raw}</div></div>;
+                          return (
+                            <div className="brc-ai-out">
+                              {a.summary && <div className="brc-ai-sum">{a.summary}</div>}
+                              {a.expected && a.expected.length > 0 && <div className="brc-ai-sec"><div className="brc-ai-h">Expected</div>{a.expected.map((x, i) => <div className="brc-ai-li" key={i}>{x}</div>)}</div>}
+                              {a.optimizations && a.optimizations.length > 0 && <div className="brc-ai-sec"><div className="brc-ai-h">Optimize</div>{a.optimizations.map((o, i) => <div className="brc-ai-li" key={i}><b>{o.issue}</b> {o.note}</div>)}</div>}
+                            </div>
+                          );
+                        })()}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="bl-subhead bl-builder-sh">Remixes</div>
+              {remixes.length === 0 && <div className="bl-emptytab" style={{marginBottom:8}}>No remixes yet — adjust a recipe on a run and hit Remix →</div>}
+              <div className="bl-recipe-grid">
+                {remixes.map((r) => (
+                  <div className="bl-recipe-card remix" key={r.id} onClick={() => openEditRemix(r.id)}>
+                    <div className="brc-band">
+                      <div className="brc-name">{r.name}</div>
+                      <button className="brc-del" onClick={(e) => { e.stopPropagation(); setDelTarget({ id: r.id, name: r.name, kind: "remix" }); }}>×</button>
+                    </div>
+                    <div className="brc-body">
+                      <div className="brc-meta">{r.loafWeight}g · {r.water}% water · {r.levain}% levain @ {r.levHyd ?? 80}% · <b>{Math.round(trueHydration(r) * 10) / 10}% true hyd</b></div>
+                      <div className="brc-acts">
+                        <button className="brc-promote" onClick={(e) => { e.stopPropagation(); promoteRemixToCore(r.id); }}>↑ Core</button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="bl-subhead bl-builder-sh">Ingredients</div>
+              <div className="bl-ing-manager">
+                <div className="bl-note">Ingredients now live in the Pantry tab, grouped and sorted A to Z. The flour, liquid and inclusion dropdowns in Plan and Recipes read from there.</div>
+                <button className="bl-add" data-f="openPantryFromRecipes" style={{ marginTop: 8 }} onClick={() => setHomeTab("pantry")}>Open Pantry</button>
+              </div>
+            </div>
+          )}
+          </>)}
+
+          {homeTab === "equipment" && <EquipmentTab equipment={equipment} setEquipment={setEquipment} />}
+          {homeTab === "pantry" && <PantryTab pantry={pantry} setPantry={setPantry} costSettings={costSettings} setCostSettings={setCostSettings} coreRecipes={coreRecipes} />}
+          {homeTab === "starter" && (() => {
+            const S = Math.max(0, +starter.mSeed || 0);
+            const ratio = Math.max(0, +starter.mFlourRatio || 10);
+            const flourTotal = S * ratio;
+            const mflours = (starter.mFlour || []);
+            const mPctSum = mflours.reduce((a, f) => a + (+f.pct || 0), 0);
+            const waterG = flourTotal * (Math.max(0, +starter.mHyd || 0) / 100);
+            const totalG = S + flourTotal + waterG;
+            const nextDue = addDaysISO(starter.lastFed || todayISO(), Math.max(1, +starter.mIntervalDays || 7));
+            const daysUntil = dateDiffDays(todayISO(), nextDue);
+            const fedAgo = dateDiffDays(starter.lastFed || todayISO(), todayISO());
+            const status = daysUntil < 0 ? "overdue" : daysUntil <= 1 ? "due" : "fresh";
+            return (
+            <div className="bl-starter">
+              <div className="bl-st-hero">
+                <div className="bl-st-id">
+                  <div className="bl-st-name">◆ {starter.name}</div>
+                  <div className="bl-st-est">EST {starter.est}</div>
+                </div>
+                <div className={"bl-st-status " + status}>
+                  <div className="sts-dot" />
+                  <div className="sts-text">
+                    <b>{status === "overdue" ? `Overdue ${-daysUntil}d` : status === "due" ? (daysUntil === 0 ? "Due today" : "Due tomorrow") : `Fresh · ${daysUntil}d left`}</b>
+                    <span>fed {fedAgo === 0 ? "today" : fedAgo === 1 ? "yesterday" : `${fedAgo}d ago`}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bl-st-panel">
+                <h3>Character</h3>
+                <div className="bl-re-row">
+                  <div className="bl-field"><label>Name</label><BufferedInput className="bl-re-name-input" value={starter.name} onCommit={(v) => patchStarter({ name: v })} /></div>
+                  <div className="bl-field2"><label>Established</label><input value={starter.est || ""} onChange={(e) => patchStarter({ est: e.target.value })} /></div>
+                </div>
+                <div className="bl-field"><label>Notes</label><BufferedInput className="bl-lev-expnote" rows={2} value={starter.notes || ""} onCommit={(v) => patchStarter({ notes: v })} placeholder="History, quirks, character…" /></div>
+              </div>
+
+              <div className="bl-st-panel">
+                <h3>Maintenance feed</h3>
+                <div className="bl-st-feedtop">
+                  <div className="bl-field2"><label>Keep (seed) g</label><input type="number" min="0" value={starter.mSeed} onChange={(e) => patchStarter({ mSeed: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Flour ×seed</label><input type="number" min="0" step="0.5" value={starter.mFlourRatio} onChange={(e) => patchStarter({ mFlourRatio: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Hydration %</label><input type="number" min="0" value={starter.mHyd} onChange={(e) => patchStarter({ mHyd: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Water temp °{tempUnit}</label><input type="number" value={Math.round(cToU(starter.mWaterTemp ?? 33))} onChange={(e) => patchStarter({ mWaterTemp: uToC(Number(e.target.value) || 0) })} /></div>
+                </div>
+                <div className="bl-st-subhead">Flour blend {mPctSum !== 100 ? <span className="bl-warn">· sums to {mPctSum}%, should be 100</span> : null}</div>
+                {mflours.map((f, idx) => (
+                  <div className="ing-row" key={f.id}>
+                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchStarterMFlour(idx, { name: v })} placeholder="Flour" ingredients={ingOptions} onNewName={ensurePantryIng} />
+                    <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => patchStarterMFlour(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
+                    <button className="ing-x" onClick={() => removeStarterMFlour(idx)}>×</button>
+                  </div>
+                ))}
+                <button className="bl-add" onClick={addStarterMFlour}>+ Flour</button>
+
+                <div className="bl-st-recipe">
+                  <div className="str-hd">Tonight's feed for {starter.name}</div>
+                  <div className="str-row"><span>Mature {starter.name} (keep)</span><b>{fmtG(S)} g</b></div>
+                  {mflours.map((f) => <div className="str-row sub" key={f.id}><span>{f.name} ({f.pct}%)</span><b>{fmtG(flourTotal * (+f.pct || 0) / 100)} g</b></div>)}
+                  <div className="str-row"><span>Water @ {showTemp(starter.mWaterTemp ?? 33)}</span><b>{fmtG(waterG)} g</b></div>
+                  <div className="str-row tot"><span>Total after feed</span><b>{fmtG(totalG)} g</b></div>
+                </div>
+                <div className="bl-st-fridgenote">Build at {showTemp(starter.mWaterTemp ?? 33)} for a quick peak, then refrigerate at <b>~{starter.mFridgeAt}% of peak rise</b> — she walks off the rest as she cools. <input className="bl-st-inline-num" type="number" min="0" max="100" value={starter.mFridgeAt} onChange={(e) => patchStarter({ mFridgeAt: Math.max(0, Math.min(100, Number(e.target.value) || 0)) })} />% peak</div>
+              </div>
+
+              <div className="bl-st-panel">
+                <h3>Feeding schedule</h3>
+                <div className="bl-st-feedtop">
+                  <div className="bl-field2"><label>Last fed</label><input type="date" value={starter.lastFed || todayISO()} onChange={(e) => patchStarter({ lastFed: e.target.value })} /></div>
+                  <div className="bl-field2"><label>Every (days)</label><input type="number" min="1" value={starter.mIntervalDays} onChange={(e) => patchStarter({ mIntervalDays: Math.max(1, Number(e.target.value) || 1) })} /></div>
+                  <div className="bl-field2"><label>Next due</label><input type="text" readOnly value={nextDue} /></div>
+                  <button className="bl-feed-btn" onClick={markFedToday}>Fed today ✓</button>
+                </div>
+                <div className="bl-note" style={{ marginTop: 8 }}>The status badge up top tracks this. Real push reminders arrive when BakeLab becomes a full app; for now the badge is your nudge whenever you open the home screen.</div>
+              </div>
+
+              <div className="bl-st-panel">
+                <h3>Fermentation calibration</h3>
+                <div className="bl-st-caltext">All measured against {starter.name} specifically. These constants drive the Levain tab's timing and water-temp math.</div>
+                <div className="bl-st-subhead">Reference build</div>
+                <div className="bl-st-feedtop">
+                  <div className="bl-field2"><label>Ref temp °{tempUnit}</label><input type="number" value={Math.round(cToU(starter.refTemp ?? 24))} onChange={(e) => patchStarter({ refTemp: uToC(Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Ref inoc %</label><input type="number" min="0" value={starter.refInoc} onChange={(e) => patchStarter({ refInoc: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Ref hydration %</label><input type="number" min="0" value={starter.refHyd} onChange={(e) => patchStarter({ refHyd: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Q10</label><input type="number" min="1" step="0.05" value={starter.q10} onChange={(e) => patchStarter({ q10: Math.max(1, Number(e.target.value) || 1) })} /></div>
+                </div>
+                <div className="bl-st-subhead">Hydration response · two builds, vary only hydration</div>
+                <div className="bl-st-cal">
+                  <div className="ic-row"><span className="ic-lab">Test A</span><input type="number" min="0" value={(starter.hydCal || [])[0]?.hyd || 0} onChange={(e) => patchStarterHydCal(0, { hyd: Math.max(0, Number(e.target.value) || 0) })} /><span className="ic-mid">% hyd → peaked in</span><input type="number" min="0" step="0.25" value={(starter.hydCal || [])[0]?.hrs || 0} onChange={(e) => patchStarterHydCal(0, { hrs: Math.max(0, Number(e.target.value) || 0) })} /><span className="ic-mid">h</span></div>
+                  <div className="ic-row"><span className="ic-lab">Test B</span><input type="number" min="0" value={(starter.hydCal || [])[1]?.hyd || 0} onChange={(e) => patchStarterHydCal(1, { hyd: Math.max(0, Number(e.target.value) || 0) })} /><span className="ic-mid">% hyd → peaked in</span><input type="number" min="0" step="0.25" value={(starter.hydCal || [])[1]?.hrs || 0} onChange={(e) => patchStarterHydCal(1, { hrs: Math.max(0, Number(e.target.value) || 0) })} /><span className="ic-mid">h</span></div>
+                </div>
+                <div className={"ic-derived" + (hydResp.valid ? "" : " est")}>{hydResp.valid ? `→ each halving of hydration adds about ${Math.round(hydResp.hrs * 10) / 10} h` : "→ enter two real builds (same temp & seed) to calibrate"}</div>
+                <div className="bl-st-subhead">Flour response · two builds, vary only whole-grain in levain</div>
+                <div className="bl-st-cal">
+                  <div className="ic-row"><span className="ic-lab">Test A</span><input type="number" min="0" value={(starter.wholeCal || [])[0]?.whole || 0} onChange={(e) => patchStarterWholeCal(0, { whole: Math.max(0, Number(e.target.value) || 0) })} /><span className="ic-mid">% whole → peaked in</span><input type="number" min="0" step="0.25" value={(starter.wholeCal || [])[0]?.hrs || 0} onChange={(e) => patchStarterWholeCal(0, { hrs: Math.max(0, Number(e.target.value) || 0) })} /><span className="ic-mid">h</span></div>
+                  <div className="ic-row"><span className="ic-lab">Test B</span><input type="number" min="0" value={(starter.wholeCal || [])[1]?.whole || 0} onChange={(e) => patchStarterWholeCal(1, { whole: Math.max(0, Number(e.target.value) || 0) })} /><span className="ic-mid">% whole → peaked in</span><input type="number" min="0" step="0.25" value={(starter.wholeCal || [])[1]?.hrs || 0} onChange={(e) => patchStarterWholeCal(1, { hrs: Math.max(0, Number(e.target.value) || 0) })} /><span className="ic-mid">h</span></div>
+                </div>
+                <div className={"ic-derived" + (wholeResp.valid ? "" : " est")}>{wholeResp.valid ? `→ each +25% whole grain speeds the build by about ${Math.round(wholeResp.hrs * 10) / 10} h` : "→ enter two real builds (same temp, seed & hydration) to calibrate"}</div>
+                <div className="bl-note" style={{ marginTop: 10 }}>Levain builds use straight bread flour as the baseline (0% whole). The flour response is calibrated against that, so the 5% rye pre-ferment you're testing will read as a small speed-up once you log it.</div>
+              </div>
+            </div>
+            );
+          })()}
+
+        </div>
+      )}
+
+      {view === "editor" && (<>
+      <div className="bl-head">
+        <div className="bl-brandstrip"><HapLogo className="bl-hap-logo-sm" /><span className="bl-prodname-sm">BakeLab</span><span className="bl-build-id" data-k="buildid">build {BUILD_ID}</span>
+          <div className="bl-runnav" data-k="runnav">
+            <button data-f="nav-bakedays" onClick={() => goHomeTab("bakedays")}>Runs</button>
+            <button data-f="nav-recipes" onClick={() => goHomeTab("recipes")}>Recipes</button>
+            <button data-f="nav-pantry" onClick={() => goHomeTab("pantry")}>Pantry</button>
+            <button data-f="nav-equipment" onClick={() => goHomeTab("equipment")}>Equipment</button>
+            <button data-f="nav-starter" onClick={() => goHomeTab("starter")}>{(starter.name && starter.name.trim()) || "Starter"}</button>
+          </div>
+        </div>
+        <div className="bl-dayhd">
+          <button className="bl-back" onClick={backHome} title="Runs" aria-label="Home"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 11.5 12 4l9 7.5" /><path d="M5 10v9h5v-5h4v5h5v-9" /></svg></button>
+          <BufferedInput className="bl-dayname" value={dayName} onCommit={(v) => setDayName(v)} placeholder="Run name" />
+          <input className="bl-daydate" type="date" value={dayDate} onChange={(e) => handleDayDateChange(e.target.value)} />
+          <div className="bl-unittoggle bl-unittoggle-hd">
+            <button className={tempUnit === "C" ? "on" : ""} onClick={() => setTempUnit("C")}>°C</button>
+            <button className={tempUnit === "F" ? "on" : ""} onClick={() => setTempUnit("F")}>°F</button>
+          </div>
+        </div>
+      </div>
+
+      <div className={"bl-tabs" + (navHidden ? " navhidden" : "")} ref={tabsRef}>
+        <button className={"bl-tab" + (tab === "plan" ? " on" : "")} onClick={() => goTab("plan")}><span className="num">1</span><span className="tlabel">Plan</span><span className="tshort">Plan</span></button>
+        <button className={"bl-tab" + (tab === "prep" ? " on" : "")} onClick={() => goTab("prep")}><span className="num">2</span><span className="tlabel">Prep &amp; Shop</span><span className="tshort">Prep</span></button>
+        <button className={"bl-tab" + (tab === "levain" ? " on" : "")} onClick={() => goTab("levain")}><span className="num">3</span><span className="tlabel">Levain</span><span className="tshort">Levain</span></button>
+        <button className={"bl-tab" + (tab === "safety" ? " on" : "")} onClick={() => goTab("safety")}><span className="num">4</span><span className="tlabel">Food Safety</span><span className="tshort">Safety</span></button>
+        <button className={"bl-tab" + (tab === "build" ? " on" : "")} onClick={() => goTab("build")}><span className="num">5</span><span className="tlabel">Mix</span><span className="tshort">Mix</span></button>
+        <button className={"bl-tab" + (tab === "fold" ? " on" : "")} onClick={() => goTab("fold")}><span className="num">6</span><span className="tlabel">Bulk/Shape</span><span className="tshort">Bulk/Shape</span></button>
+        <button className={"bl-tab" + (tab === "bake" ? " on" : "")} onClick={() => goTab("bake")}><span className="num">7</span><span className="tlabel">Bake</span><span className="tshort">Bake</span></button>
+        <button className={"bl-tab" + (tab === "timers" ? " on" : "")} onClick={() => goTab("timers")}><span className="num">8</span><span className="tlabel">Timers</span><span className="tshort">Timers</span></button>
+        <button className={"bl-tab" + (tab === "costs" ? " on" : "")} onClick={() => goTab("costs")}><span className="num">9</span><span className="tlabel">Costs</span><span className="tshort">Costs</span></button>
+      </div>
+
+      {/* ---------- TAB 1: PLANNING ---------- */}
+      {tab === "plan" && (<>
+      <div className="bl-panel">
+        <h3>Run timing</h3>
+        <div className="bl-mixday">
+          <div className="bl-mixday-field">
+            <label>Mix day</label>
+            <input type="date" value={dayDate} onChange={(e) => handleDayDateChange(e.target.value)} />
+          </div>
+          <p className="bl-mixday-note">Bakes snap to the next two days and the run renames itself — e.g. <strong>{buildRunName(dayDate, slots.length ? Math.max(1, ...slots.map((s) => (s.sessions || []).length || 1)) : 2)}</strong>.</p>
+        </div>
+      </div>
+      <div className="bl-panel">
+        <h3>Recipes & quantities — baker's %</h3>
+        <div className="bl-types">
+          {types.map((t, ti) => {
+            const sm = plan.summaries[ti];
+            return (
+              <div className="bl-type" key={ti}>
+                <div className="bl-card-hd">
+                  <span className="cardno">Recipe {ti + 1}</span>
+                  {types.length > 1 && <button className="bl-rmcard" title="Remove this recipe from the day" onClick={() => removeSlot(ti)}>× Remove</button>}
+                </div>
+                <div className="bl-rec-load">
+                  <div className="bl-rec-title">{t.name || <em className="bl-rec-none">No recipe loaded</em>}</div>
+                  <select className="bl-loadsel-core" value={slots[ti].coreRecipeId || ""} onChange={(e) => { if (e.target.value) loadCoreRecipe(ti, e.target.value); }}>
+                    <option value="">Load core recipe…</option>
+                    {coreRecipes.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
+                  </select>
+                </div>
+                {(() => {
+                  const core = slots[ti].coreRecipeId ? coreRecipes.find((x) => x.id === slots[ti].coreRecipeId) : null;
+                  if (!core || sameFormula(slots[ti].draft, core)) return null;
+                  return (
+                    <div className="bl-detach">
+                      <div className="bl-detach-msg">Edited here — differs from <b>{core.name}</b> in your library.</div>
+                      <div className="bl-detach-acts">
+                        <button className="bl-detach-up" onClick={() => updateCoreFromSlot(ti)}>Update main recipe</button>
+                        <button className="bl-detach-remix" onClick={() => saveSlotAsRemix(ti)}>Save as remix</button>
+                        <button className="bl-detach-dismiss" onClick={() => loadCoreRecipe(ti, slots[ti].coreRecipeId)}>Dismiss changes</button>
+                      </div>
+                    </div>
+                  );
+                })()}
+                <div className="bl-rec-top">
+                  <div><label>Loaves</label><input className="n" type="number" min="0" value={t.loaves} onChange={(e) => setLoaves(ti, e.target.value)} /></div>
+                  <div><label>Loaf g</label><input className="n" type="number" min="0" value={t.loafWeight} onChange={(e) => setDraft(ti, { loafWeight: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div><label>Autolyse min</label><input className="n" type="number" min="0" value={t.autolyse ?? 45} onChange={(e) => setDraft(ti, { autolyse: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                </div>
+                {(() => {
+                  const N = sm.loaves, mx = sm.maxLPB, bc = sm.batchCount;
+                  if (N <= 0) return null;
+                  if (mx <= 0) return <div className="bl-optimize warn">⚡ {sm.byFlour ? <>One loaf puts {fmtG(sm.fplG)} g of flour in the mixer, more than the {fmtKg(mixerFlourCapG)} flour capacity of the {mixer.name}</> : <>One loaf ({fmtG(sm.W)} g) is heavier than the {maxBatch / 1000}kg mixer cap</>} — lower loaf weight or raise capacity.</div>;
+                  const full = bc * mx, fillPct = Math.round((100 * N) / full), maxed = N === full, trimTo = (bc - 1) * mx;
+                  return (
+                    <div className="bl-optimize">
+                      <div className="opt-stat"><span>⚡ {mx}/mix</span><span>{bc} mix{bc > 1 ? "es" : ""} · {fillPct}% full{maxed ? " ✓" : ""}</span></div>
+                      {!maxed && <button className="opt-chip up" onClick={() => setLoaves(ti, full)}>↑ {full} fills {bc} mix{bc > 1 ? "es" : ""} <em>+{full - N}</em></button>}
+                      {bc >= 2 && <button className="opt-chip down" onClick={() => setLoaves(ti, trimTo)}>↓ {trimTo} drops a mix <em>−{N - trimTo}</em></button>}
+                    </div>
+                  );
+                })()}
+                <div className="bl-rec-sessions">
+                  {(slots[ti].sessions || []).map((sess, si) => {
+                    const lv = sessionLoaves(slots[ti], si);
+                    const isMain = si === 0;
+                    const over = (slots[ti].sessions || []).slice(1).reduce((a, s) => a + Math.max(0, +(s.loaves) || 0), 0) > t.loaves;
+                    return (
+                      <div className={"bl-sess-row" + (isMain && over ? " over" : "")} key={sess.id}>
+                        <span className="ss-no">Bake {si + 1}{isMain ? " ←" : ""}</span>
+                        <input type="date" value={sess.date || todayISO()} onChange={(e) => setSlotSessionDate(ti, si, e.target.value)} />
+                        {isMain
+                          ? <span className="ss-lv-auto">{lv} loaves</span>
+                          : <><input className="n ss-lv" type="number" min="0" value={sess.loaves || 0} onChange={(e) => setSlotSessionLoaves(ti, si, e.target.value)} /><span className="ss-lvu">loaves</span><button className="ing-x" onClick={() => removeSlotSession(ti, si)}>×</button></>
+                        }
+                      </div>
+                    );
+                  })}
+                  <button className="bl-addrow" onClick={() => addSlotSession(ti)}>+ Bake session</button>
+                </div>
+                {types.length > 1 && (
+                  <div className="bl-orders">
+                    <div><label>Mix order</label>
+                      <select value={t.mixOrder || ti + 1} onChange={(e) => setMixOrder(ti, Number(e.target.value))}>
+                        {types.map((_, k) => <option key={k} value={k + 1}>{k + 1}</option>)}
+                      </select>
+                    </div>
+                    <div><label>Bake order</label>
+                      <select value={t.bakeOrder || ti + 1} onChange={(e) => setBakeOrder(ti, Number(e.target.value))}>
+                        {types.map((_, k) => <option key={k} value={k + 1}>{k + 1}</option>)}
+                      </select>
+                    </div>
+                  </div>
+                )}
+
+                <div className="bl-subhead">Flours · main flour balances to 100%</div>
+                {t.flours.map((f, idx) => (
+                  <div className="ing-row" key={f.id}>
+                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => setFlourName(ti, idx, v)} placeholder={"Flour " + (idx + 1)} ingredients={ingOptions} onNewName={ensurePantryIng} />
+                    {idx === 0
+                      ? <div className="ing-pct main"><b>main</b><span>{mainPct(t)}</span><em>%</em></div>
+                      : <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => setFlourPct(ti, idx, e.target.value)} /><em>%</em></div>}
+                    {idx === 0 ? <span className="ing-x ph" /> : <button className="ing-x" title="Remove flour" onClick={() => removeFlour(ti, idx)}>×</button>}
+                  </div>
+                ))}
+                <button className="bl-add" onClick={() => addFlour(ti)}>+ Flour</button>
+
+                <div className="bl-subhead">Water · Salt</div>
+                <div className="bl-fixed">
+                  <div className="cell"><label>Water</label><div className="wrap"><input type="number" min="0" value={t.water} onChange={(e) => setFixed(ti, "water", e.target.value)} /><span className="pc">%</span></div></div>
+                  <div className="cell"><label>Salt</label><div className="wrap"><input type="number" min="0" value={t.salt} onChange={(e) => setFixed(ti, "salt", e.target.value)} /><span className="pc">%</span></div></div>
+                </div>
+
+                <div className="bl-subhead bl-lev-sh">Levain <span className="bl-lev-starter">◆ {starter.name}</span></div>
+                <div className="bl-lev-section">
+                  <div className="bl-fixed">
+                    <div className="cell"><label>Levain</label><div className="wrap"><input type="number" min="0" value={t.levain} onChange={(e) => setFixed(ti, "levain", e.target.value)} /><span className="pc">%</span></div></div>
+                    <div className="cell"><label>Hydration</label><div className="wrap"><input type="number" min="0" value={t.levHyd ?? 80} onChange={(e) => setDraft(ti, { levHyd: Math.max(0, Number(e.target.value) || 0) })} /><span className="pc">%</span></div></div>
+                    <div className="cell"><label>Inoculation</label><div className="wrap"><input type="number" min="0" value={t.levInoc ?? 10} onChange={(e) => setDraft(ti, { levInoc: Math.max(0, Number(e.target.value) || 0) })} /><span className="pc">%</span></div></div>
+                  </div>
+                  <div className="bl-lev-grid">
+                    <div className="bl-field2"><label>Build to peak (h)</label><input type="number" min="0" step="0.25" value={t.levBuildHrs ?? 5} onChange={(e) => setDraft(ti, { levBuildHrs: Math.max(0, Number(e.target.value) || 0) })} /></div>
+                    <div className="bl-field2"><label>Ref temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(t.levRefTemp ?? 24))} onChange={(e) => setDraft(ti, { levRefTemp: uToC(Number(e.target.value) || 0) })} /></div>
+                    <div className="bl-field2"><label>Whole grain in levain</label><div className="wrap2"><input type="number" min="0" value={t.levWhole ?? 0} onChange={(e) => setDraft(ti, { levWhole: Math.max(0, Number(e.target.value) || 0) })} /><span className="pc">%</span></div></div>
+                  </div>
+                  <div className="bl-lev-sugar" data-k="levsugar">
+                    <div className="bl-field2"><label>Sugar in levain <span className="bl-sub-note">% of levain flour · on top of the dough's sugar</span></label><div className="wrap2"><input data-f="levSugar" type="number" min="0" step="0.5" value={t.levSugar ?? 0} onChange={(e) => setDraft(ti, { levSugar: Math.max(0, Number(e.target.value) || 0) })} /><span className="pc">%</span></div></div>
+                    {(+t.levSugar || 0) > 0 && <div className="bl-field2"><label>Which sugar</label><IngredientInput className="ing-name" value={t.levSugarName || ""} placeholder="Granulated sugar" onCommit={(v) => setDraft(ti, { levSugarName: v })} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" /></div>}
+                  </div>
+                  {(() => {
+                    const bks = levBuildsFor(ti); if (!bks.length || !((+t.levain || 0) > 0)) return null;
+                    const nOn = bks.filter((bd) => bd.buffered).length, all = nOn === bks.length;
+                    const shared = bks.some((bd) => bd.items.some((x) => plan.list[x.gi] && plan.list[x.gi].ti !== ti));
+                    const totalG = bks.reduce((a, bd) => a + bd.M + (bd.sugarL || 0), 0);
+                    const raw = levBufferPct[bks[0].key], pctVal = (raw === undefined || raw === null) ? 2 : raw;
+                    return (
+                      <div className="sc-buf lev-buf" data-k="levbufplan">
+                        <label className="lev-buf-tog"><input type="checkbox" data-f="levBufPlan" checked={all} onChange={() => setLevBufferFor(ti, !all)} /><span>Buffer — spillage / bucket loss</span></label>
+                        {nOn > 0 && <span className="lbuffer-pct"><input type="number" data-f="levBufPctPlan" min="0" step="0.5" value={pctVal} onChange={(e) => setLevBufferPctFor(ti, e.target.value)} /><span>%</span></span>}
+                        <span className="lev-buf-note" data-k="levbufnote">Builds {fmtG(totalG)} g levain{nOn > 0 ? " incl. +" + (bks.find((bd) => bd.buffered) || {}).bufPct + "%" : ""}{shared ? " · shared build" : ""}{nOn > 0 && !all ? " · only some builds buffered (see Levain tab)" : ""}</span>
+                      </div>
+                    );
+                  })()}
+                  <div className="bl-lev-exp"><label>Levain flour / experiment note</label><BufferedInput className="bl-lev-expnote" value={t.levExpNote || ""} onCommit={(v) => setDraft(ti, { levExpNote: v })} placeholder="e.g. straight bread flour · or 5% rye pre-ferment" /></div>
+                  <div className="bl-lev-hint">Timing, water temp and the build recipe are computed on the <b>Levain</b> tab from {starter.name}'s calibration.</div>
+                </div>
+                <div className="bl-subhead" data-k="liquids">Liquids <span className="bl-sub-note">milk 88% · egg 75% · cream 60% · tangzhong liquid counts too</span></div>
+                {(t.liquids || []).length === 0 && <div className="ing-empty">No liquids besides water</div>}
+                {(t.liquids || []).map((l, idx) => (
+                  <div className="liq-row" data-k="liq-row" key={l.id}>
+                    <IngredientInput className="ing-name" value={l.name} onCommit={(v) => setLiq(ti, idx, { name: v })} placeholder="Milk / egg / tangzhong liquid" ingredients={ingOptions} onNewName={ensurePantryIng} kind="liquid" />
+                    <div className="liq-cell"><input type="number" min="0" data-f="liq-pct" value={l.pct} onChange={(e) => setLiq(ti, idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
+                    <div className="liq-cell"><input type="number" min="0" max="100" data-f="liq-factor" value={l.factor} onChange={(e) => setLiq(ti, idx, { factor: Math.max(0, Math.min(100, Number(e.target.value) || 0)) })} /><em>% water</em></div>
+                    <span className="when-end">
+                      <WhenSelect kind="liquid" value={isScaldLiquid(t, l) ? "scald" : cleanWhen(l.when)} def="autolyse" folds={Math.floor(+params.folds || 0)} onChange={(v) => patchDraft(ti, (d) => applyLiqWhen(d, idx, v))} />
+                      <button className="ing-x" title="Remove liquid" onClick={() => removeLiq(ti, idx)}>×</button>
+                    </span>
+                  </div>
+                ))}
+                <button className="bl-add" data-f="add-liq" onClick={() => addLiq(ti)}>+ Liquid</button>
+                <HydrationLine t={t} onSetWater={(w) => setFixed(ti, "water", w)} />
+                <ScaldEditor t={t} onPatch={(p) => setDraft(ti, p)} buf={{ on: !!t.scaldBuf, pct: t.scaldBufPct ?? SCALD_BUF_DEFAULT, onToggle: () => patchSlot(ti, (sl) => ({ ...sl, scaldBuf: !sl.scaldBuf })), onPct: (v) => patchSlot(ti, (sl) => ({ ...sl, scaldBufPct: v })) }} />
+
+                <div className="bl-subhead">Inclusions</div>
+                {t.inclusions.length === 0 && <div className="ing-empty">No inclusions</div>}
+                {t.inclusions.map((f, idx) => (
+                  <div className="ing-row" key={f.id}>
+                    <IngredientInput className="ing-name" value={f.name} onCommit={(v) => setIncName(ti, idx, v)} placeholder={"Inclusion " + (idx + 1)} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" />
+                    <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => setIncPct(ti, idx, e.target.value)} /><em>%</em></div>
+                    <span className="when-end">
+                      <WhenSelect kind="inclusion" value={cleanWhen(f.when)} def={defaultWhen("inclusion", f.name, groupOf)} folds={Math.floor(+params.folds || 0)} onChange={(v) => setIncWhen(ti, idx, v)} />
+                      <button className="ing-x" title="Remove inclusion" onClick={() => removeInc(ti, idx)}>×</button>
+                    </span>
+                  </div>
+                ))}
+                <button className="bl-add" onClick={() => addInc(ti)}>+ Inclusion</button>
+
+                <div className="bl-subhead">Proofing container</div>
+                <div className="bl-shape" data-k="container">
+                  {PROOF_CONTAINERS.map((c) => <button key={c.key} data-f={"container-" + c.key} className={"shp" + (proofInfo(t.shape).key === c.key ? " on" : "")} onClick={() => setDraft(ti, { shape: c.key })}>{c.label}</button>)}
+                </div>
+
+                <div className="bl-typesum">
+                  {sm.loaves > 0 ? (<>
+                    <b>{sm.loaves}</b> loaves × <b>{sm.W}g</b> = <b>{fmtKg(sm.totalDough)}</b> dough → {sm.impossible
+                      ? <span className="bl-warn">loaf heavier than batch cap — raise capacity</span>
+                      : <><b>{sm.batchCount}</b> {sm.batchCount === 1 ? "batch" : "batches"} ({sm.sizes.join(", ")} loaves)</>}
+                    {sm.floursOver && <div className="bl-warn">⚠ other flours exceed 100% — main flour pinned at 0%</div>}
+                  </>) : <span style={{ opacity: .6 }}>0 loaves — type inactive</span>}
+                </div>
+                <button className="bl-remix-btn" onClick={() => remixRecipe(ti)} title="Save current adjustments as a dated remix in the Recipe Builder">Remix →</button>
+              </div>
+            );
+          })}
+        </div>
+        <button className="bl-addrec" onClick={addSlot}>+ Add another recipe</button>
+
+        <div className="bl-cap bl-equip" data-k="equipcard">
+          <div className="eq-pick">
+            <div className="bl-field"><label>Mixer</label>
+              <select data-f="mixerSel" value={mixer ? mixer.id : ""} onChange={(e) => setMixerId(e.target.value || null)}>
+                <option value="">Manual (max dough per batch)</option>
+                {equipment.mixers.map((x) => <option key={x.id} value={x.id}>{x.name}{eqNum(x.flourKg) > 0 ? " · " + eqNum(x.flourKg) + " kg flour" : " · no capacity set"}</option>)}
+              </select></div>
+            {(!mixer || mixerFlourCapG <= 0) && <div className="bl-field"><label>Max dough per batch (kg)</label>
+              <input type="number" min="0" step="0.5" value={maxBatch / 1000} onChange={(e) => setMaxBatch(Math.max(0, (Number(e.target.value) || 0) * 1000))} /></div>}
+            <div className="bl-field"><label>Oven</label>
+              <select data-f="ovenSel" value={oven ? oven.id : ""} onChange={(e) => setOvenId(e.target.value || null)}>
+                <option value="">Manual (loaves per load, Bake tab)</option>
+                {equipment.ovens.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+              </select></div>
+          </div>
+          <div className="note eq-notes" data-k="equipnote">
+            {mixer && mixerFlourCapG > 0 && types.map((t, ti) => { const sm = plan.summaries[ti]; return (sm && sm.loaves > 0 && sm.byFlour) ? <div key={"m" + ti}>{t.name}: about {fmtG(sm.fplG)} g of gross flour per loaf, so up to <b>{sm.maxLPB}</b> {sm.maxLPB === 1 ? "loaf" : "loaves"} per mix ({fmtKg(mixerFlourCapG)} flour limit).</div> : null; })}
+            {mixer && mixerFlourCapG <= 0 && <div className="eq-warn">{mixer.name} has no flour capacity yet, so the manual max dough applies. Set it on the Equipment tab.</div>}
+            {(!mixer || mixerFlourCapG <= 0) && <div>This capacity — your mixer / bulk vessel — decides the batch count, not the loaf total. At {maxBatch / 1000}kg you can mix ~{Math.floor(maxBatch / 850)} loaves at 850g per batch. Per-batch weights appear under Batch builds.</div>}
+            {oven && <div data-k="ovenplansum">{oven.name} holds per load: {oven.boule || "–"} boules/ovals · {oven.pullman1 || "–"} 1 lb Pullmans · {oven.pullman2 || "–"} 2 lb Pullmans.</div>}
+            <button className="eq-link" data-f="openEquipment" onClick={() => goHomeTab("equipment")}>Edit equipment</button>
+          </div>
+        </div>
+      </div>
+
+      {/* ---------- SETUP + CHART ---------- */}
+      <div className="bl-grid">
+        <div>
+          <div className="bl-panel">
+            <h3>Day setup</h3>
+            <div className="bl-field"><label>Start time (earliest cycle)</label><input type="time" value={startTime} onChange={(e) => setStartTime(e.target.value)} /></div>
+            <div className="bl-field"><label>Batches (from planner)</label><div className="bl-ro">{plan.list.length} batch{plan.list.length === 1 ? "" : "es"}</div></div>
+            <div className="bl-field"><label>Even spacing <span className="bl-slider-val">{stagger}m</span></label>
+              <input type="range" min="0" max={cycleMin} step={SNAP} value={stagger} onChange={(e) => distribute(Number(e.target.value))} /></div>
+            <button className="bl-btn block" onClick={autoSpace} disabled={totalBatches < 2} style={totalBatches < 2 ? { opacity: .45, cursor: "not-allowed" } : {}}>⚡ Auto-space to clear collisions</button>
+            <div className="bl-note">Slider/auto-space sets even gaps. Then <b>drag any row</b> on the chart to fine-tune one cycle — stage lengths stay fixed.</div>
+          </div>
+
+          <div className="bl-panel">
+            <h3>Cycle timing — shared (autolyse is per recipe)</h3>
+            <div className="bl-recipe">
+              {NUM("Mix (min)", "mix")}
+              {NUM("# of folds", "folds")}{NUM("Fold (min)", "fold")}
+              {NUM("Rest between folds", "restBetween", true)}{NUM("Bulk rest (final)", "bulkRest", true)}
+              {NUM("Pre-shape (min)", "preShape")}{NUM("Bench rest (min)", "benchRest")}{NUM("Shape (min)", "shape")}
+            </div>
+            <div className="bl-note">One cycle = {fmtDur(cycleMin)}. Same timing for every batch. Hands-on: Mix, Folds, Pre-shape, Shape.</div>
+          </div>
+        </div>
+
+        <div>
+          <div className="bl-legend">
+            <span><span className="sw a" /> hands-on (constraint)</span>
+            <span><span className="sw p" /> passive (overlaps freely)</span>
+            <span><span className="sw x" /> collision — two batches need you</span>
+          </div>
+          <p className="bl-hint">↔ Grab a row and drag to slide that whole cycle.</p>
+          <div className="bl-chart-wrap">
+            <div style={{ minWidth: 108 + span * PX + 30 }}>
+              <div className="bl-axis" style={{ width: span * PX }}>
+                {axisTicks.map((t) => <div key={t} className="bl-tick" style={{ left: t * PX }}>{fmtClock(startMin + t)}</div>)}
+              </div>
+              {schedule.map((row) => {
+                const info = plan.list[row.batch];
+                return (
+                  <div className="bl-rowline" key={row.batch}>
+                    <div className="bl-rowlabel">
+                      <div className="b">B{row.batch + 1}{info ? ` · ${info.name}` : ""}</div>
+                      <div className="t">{fmtClock(startMin + row.base)}{info ? ` · ${info.size}×` : ""}</div>
+                    </div>
+                    <div className={"bl-track" + (drag && drag.b === row.batch ? " grabbing" : "")} style={{ width: span * PX }}
+                      onPointerDown={(e) => onDown(e, row.batch)} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}>
+                      {axisTicks.map((t) => <div key={t} className="bl-gridcol" style={{ left: t * PX }} />)}
+                      {row.blocks.map((bl, i) => {
+                        const hit = bl.active && collisionSet.has(`${bl.batch}-${i}`);
+                        const cls = hit ? "x" : bl.active ? "a" : "p"; const w = bl.min * PX;
+                        return (
+                          <div key={i} className={"bl-bar " + cls} style={{ left: bl.startOff * PX, width: Math.max(w, 2) }}
+                            onPointerDown={(e) => onDown(e, row.batch)} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}
+                            onMouseEnter={(e) => !drag && setHover({ batch: bl.batch, type: info ? info.name : "", name: bl.name, min: bl.min, s: bl.startOff, e: bl.endOff, hit, x: e.clientX, y: e.clientY })}
+                            onMouseMove={(e) => setHover((h) => (h ? { ...h, x: e.clientX, y: e.clientY } : h))}
+                            onMouseLeave={() => setHover(null)}>
+                            {w > 34 ? bl.name : ""}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="bl-sched">
+            <h3>Schedule overview</h3>
+            <div className="sub">{collisionCount > 0 ? `${collisionCount} step(s) collide — drag a cycle apart, or hit Auto-space.` : "No collisions — this run is workable as scheduled."}</div>
+          </div>
+        </div>
+      </div>
+      </>)}
+
+      {/* ---------- TAB 2: PREP & SHOPPING ---------- */}
+      {tab === "prep" && (
+        <div className="bl-panel">
+          <h3>Prep &amp; shopping — production-week snapshot</h3>
+          <div className="bl-rep-stats">
+            <div className="bl-rep-stat"><div className="v">{report.totalLoaves}</div><div className="l">Loaves</div></div>
+            <div className="bl-rep-stat"><div className="v">{plan.list.length}</div><div className="l">Batches</div></div>
+            <div className="bl-rep-stat"><div className="v">{fmtKg(report.totalDough)}</div><div className="l">Total dough</div></div>
+            <div className="bl-rep-stat"><div className="v">{fmtClock(startMin)}</div><div className="l">First start</div></div>
+            <div className="bl-rep-stat"><div className="v">{fmtClock(startMin + lastEnd)}</div><div className="l">Shaping done</div></div>
+            <div className="bl-rep-stat"><div className="v">{fmtDur(totalActiveMin)}</div><div className="l">Hands-on</div></div>
+          </div>
+          <div className="bl-dbuf">
+            <label className="bl-dbuf-tog"><input type="checkbox" checked={doughBuffer} onChange={(e) => setDoughBuffer(e.target.checked)} /><span>Dough buffer — mix extra to cover bowl / bench loss</span></label>
+            {doughBuffer && <span className="bl-dbuf-pct"><input type="number" min="0" max="25" step="0.5" value={doughBufferPct} onChange={(e) => setDoughBufferPct(Math.max(0, Math.min(25, Number(e.target.value) || 0)))} /><em>%</em></span>}
+            {doughBuffer && (() => {
+              const flourMode = mixerFlourCapG > 0;
+              const over = plan.list.map((b, i) => (flourMode ? b.grossFlour > mixerFlourCapG + 0.5 : (maxBatch > 0 && b.dough > maxBatch)) ? ("B" + (i + 1)) : null).filter(Boolean);
+              return over.length > 0 ? <div className="bl-dbuf-warn">Over the {flourMode ? fmtKg(mixerFlourCapG) + " flour limit" : fmtKg(maxBatch) + " mixer"} at this buffer: {over.join(" · ")} — trim the buffer or split the batch.</div> : null;
+            })()}
+          </div>
+          <div className="bl-card sc-card" data-k="stock">
+            <div className="ch">Stock check <span className="ch-sub">this run vs your Pantry counts</span></div>
+            {pantry.length === 0 ? (
+              <div className="sc-empty">Nothing in the Pantry yet, so there’s nothing to check. <button className="pt-link" onClick={goPantry}>Open Pantry</button></div>
+            ) : (<>
+              {deduction && <div className="sc-note">This run is already deducted from stock, so this shows your counts as they were before it.</div>}
+              {stockRows.length === 0 ? <div className="sc-empty">No Pantry items are used by this run yet.</div> : stockRows.map((r) => (
+                <div className={"sc-row " + r.status} key={r.id} data-row={r.item.name} data-status={r.status}>
+                  <span className="sc-name">{r.item.name}</span>
+                  <span className="sc-nums">need {qtyText(r.need, r.item)} · have {qtyText(r.have, r.item)}</span>
+                  <span className="sc-flag">
+                    {r.status === "short" && <>short — buy {r.packs > 0 ? r.packs + " × " + r.item.packSize + " " + r.item.packUnit : qtyText(r.buyBase, r.item)}</>}
+                    {r.status === "low" && <>low after run — buy {r.packs > 0 ? r.packs + " × " + r.item.packSize + " " + r.item.packUnit : qtyText(r.buyBase, r.item)}</>}
+                    {r.status === "ok" && "ok"}
+                    {r.orderBy && <em className={r.overdue ? "late" : ""}> · order by {r.orderBy}{r.overdue ? " (past)" : ""}</em>}
+                  </span>
+                </div>
+              ))}
+              {(() => {
+                const un = runCosts.missing.filter((m) => m.reason === "not in Pantry" && m.name.indexOf("Levain flour") !== 0);
+                const lv = runCosts.missing.some((m) => m.name.indexOf("Levain flour") === 0);
+                return (<>
+                  {un.length > 0 && <div className="sc-missing" data-k="unmatched">Not in Pantry (not checked or costed): {un.map((m) => m.name + " " + fmtG(m.grams) + " g").join(", ")}. <button className="pt-link" onClick={() => addMissingToPantry(un.map((m) => m.name))}>Add to Pantry</button></div>}
+                  {lv && <div className="sc-missing">The levain build’s flour isn’t counted yet — choose what your levain is fed with in <button className="pt-link" onClick={goPantry}>Pantry</button>.</div>}
+                </>);
+              })()}
+            </>)}
+          </div>
+          {scaldPrep.length > 0 && (
+            <div className="bl-card sc-card" data-k="scaldprep">
+              <div className="ch">Make ahead — scalds <span className="ch-sub">cook, cool, then fold into the mix</span></div>
+              {scaldPrep.map((p) => (
+                <div className="sc-row ok" key={p.ti}>
+                  <span className="sc-name">{p.name}</span>
+                  <span className="sc-nums">{fmtG(p.fl)} g {p.flourName} + {fmtG(p.lq)} g {p.liquidName.toLowerCase()}{p.k > 1 ? " · " + fmtG(p.dough) + " g goes in the dough" : ""}</span>
+                  <span className="sc-flag">{p.method === "poured" ? "pour boiling liquid over, mix" : "cook to " + showTemp(65) + ", stirring"}</span>
+                  <label className="sc-buf" data-k="scaldbuf">
+                    <input type="checkbox" data-f="scaldBuf" checked={p.on} onChange={() => patchSlot(p.ti, (sl) => ({ ...sl, scaldBuf: !sl.scaldBuf }))} />
+                    <span>Buffer — pot loss</span>
+                    {p.on && <span className="lbuffer-pct"><input type="number" data-f="scaldBufPct" min="0" step="0.5" value={p.pct ?? SCALD_BUF_DEFAULT} onChange={(e) => patchSlot(p.ti, (sl) => ({ ...sl, scaldBufPct: e.target.value }))} /><span>%</span></span>}
+                  </label>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="bl-rep-grid">
+            <div className="bl-card">
+              <div className="ch">Ingredients to have on hand</div>
+              {report.ingList.length === 0 ? <div className="bl-line"><span className="nm" style={{ opacity: .6 }}>No ingredients yet</span></div> : (() => {
+                let lastCat = null; const catName = { flour: "Flours", liquid: "Water · Salt · Levain", inc: "Inclusions" };
+                return report.ingList.map((x, idx) => {
+                  const head = x.cat !== lastCat; lastCat = x.cat;
+                  return (<React.Fragment key={idx}>
+                    {head && <div className="bl-line cat">{catName[x.cat]}</div>}
+                    <div className={"bl-line" + (x.name.toLowerCase() === "levain" ? " hi" : "")}><span className="nm">{x.name}</span><span className="v">{fmtWt(x.g)}{eggCount(x.name, x.g) ? <em className="bl-eggnote"> · {eggCount(x.name, x.g)}</em> : null}</span></div>
+                  </React.Fragment>);
+                });
+              })()}
+            </div>
+            <div>
+              <div className="bl-card" style={{ marginBottom: 16 }}>
+                <div className="ch">Proofing containers (one per loaf)</div>
+                {Object.keys(report.bann).length === 0 ? <div className="bl-line"><span className="nm" style={{ opacity: .6 }}>—</span></div> :
+                  Object.entries(report.bann).map(([sh, n]) => <div className="bl-line" key={sh}><span className="nm">{proofInfo(sh).count}</span><span className="v">{n}</span></div>)}
+              </div>
+              <div className="bl-card">
+                <div className="ch">Hand-mix / bulk vessels</div>
+                {report.vessels.length === 0 ? <div className="bl-line"><span className="nm" style={{ opacity: .6 }}>—</span></div> :
+                  report.vessels.map((v) => <div className="bl-line" key={v.i}><span className="nm">B{v.i + 1} · {v.name} ({v.size} loaves)</span><span className="v">≥ {v.liters} L</span></div>)}
+              </div>
+            </div>
+          </div>
+          <div className="bl-card" style={{ marginTop: 16 }}>
+            <div className="ch">Bake notes — saved to the recipe</div>
+            {types.map((t, ti) => (
+              <div className="bl-notes-row" key={ti}>
+                <div className="bl-notes-hd">
+                  <span className="bl-notes-nm">{t.name}</span>
+                  {!(slots[ti] && slots[ti].coreRecipeId) && <span className="bl-notes-warn">this run only — not linked to a core recipe</span>}
+                </div>
+                <BufferedInput className="bl-notes-ta" rows={3} value={t.notes || ""} onCommit={(v) => setRecipeNotes(ti, v)} placeholder="What happened, what to change next time…" />
+              </div>
+            ))}
+          </div>
+          <div className="bl-note">Vessel size assumes ~{BULK_HEADROOM}× dough volume for bulk expansion plus hand-mixing room, at ~{DOUGH_DENSITY} g/mL dough density — both adjustable. Levain total is what you’ll need to build ahead. Banneton counts assume one per loaf with no reuse across staggered proofs.</div>
+        </div>
+      )}
+
+      {/* ---------- TAB 3: LEVAIN ---------- */}
+      {tab === "levain" && (
+        <div className="bl-panel">
+          <h3>Levain — build timing &amp; recipe</h3>
+          <div className="bl-cond">
+            <div className="bl-field2"><label>Ambient / flour temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(ambientTemp))} onChange={(e) => setAmbientTemp(uToC(Number(e.target.value) || 0))} /></div>
+            <div className="bl-field2"><label>Mature starter temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(starterTemp))} onChange={(e) => setStarterTemp(uToC(Number(e.target.value) || 0))} /></div>
+            <div className="bl-feedmode">
+              <label>Feed timing</label>
+              <div className="bl-unittoggle">
+                <button className={feedMode === "auto" ? "on" : ""} onClick={() => setFeedMode("auto")}>Auto</button>
+                <button className={feedMode === "manual" ? "on" : ""} onClick={() => setFeedMode("manual")}>I'll pick</button>
+              </div>
+            </div>
+            <div className="bl-feedmode">
+              <label>Builds</label>
+              <label className="bl-levcombine"><input type="checkbox" checked={levCombine} onChange={(e) => setLevCombine(e.target.checked)} /><span>Combine into one</span></label>
+            </div>
+            <div className="bl-feedmode">
+              <label>Calibration</label>
+              <button className={"bl-calbtn" + (showCal ? " on" : "")} onClick={() => setShowCal((v) => !v)}>{showCal ? "Hide" : "Calibrate"}</button>
+            </div>
+            {feedMode === "manual" && (
+              <div className="bl-field2"><label>Feed at</label><input type="time" value={feedTime} onChange={(e) => setFeedTime(e.target.value)} /></div>
+            )}
+            <div className="bl-feed">
+              <span>Feed all levains at</span>
+              <b>{fmtClock(startMin + levainPlan.feedOff)}</b>
+              {levainPlan.feedOff < 0 && <em>night before</em>}
+              {feedMode === "manual" && <em className="autoref">auto would be {fmtClock(startMin + levainPlan.autoFeed)}</em>}
+            </div>
+          </div>
+
+          {feedMode === "manual" && (
+            <div className="bl-recalhint">Pick when you actually want to feed — the app sets each levain's water temp (colder = peaks later) so the first one is ripe right when your mix day starts. A cold starter lets the water run warmer. The earliest-needed levain caps how late you can feed; later builds get the coldest water.</div>
+          )}
+
+          {showCal && (
+          <div className="bl-inoccal">
+            <div className="bl-inoccal-hd">How inoculation affects timing — calibrate from a test</div>
+            <div className="bl-inoccal-rows">
+              <div className="ic-row"><span className="ic-lab">Test A</span><input type="number" min="0" value={inocCal[0].inoc} onChange={(e) => setCal(0, "inoc", e.target.value)} /><span className="ic-mid">% seed → peaked in</span><input type="number" min="0" step="0.25" value={inocCal[0].hrs} onChange={(e) => setCal(0, "hrs", e.target.value)} /><span className="ic-mid">h</span></div>
+              <div className="ic-row"><span className="ic-lab">Test B</span><input type="number" min="0" value={inocCal[1].inoc} onChange={(e) => setCal(1, "inoc", e.target.value)} /><span className="ic-mid">% seed → peaked in</span><input type="number" min="0" step="0.25" value={inocCal[1].hrs} onChange={(e) => setCal(1, "hrs", e.target.value)} /><span className="ic-mid">h</span></div>
+            </div>
+            <div className={"ic-derived" + (inocResp.valid ? "" : " est")}>{inocResp.valid ? `→ each time you halve the seed, the levain runs about ${Math.round(inocResp.hrs * 10) / 10} h slower` : "→ enter two real builds at the same temperature to calibrate (using a 1.5 h estimate until then)"}</div>
+          </div>
+          )}
+
+          {types.map((t, ti) => (plan.summaries[ti].loaves > 0 ? (
+            <div className="bl-levread" key={ti}>
+              <span className="lr-nm">{t.name}</span>
+              <span className="lr-spec">{t.levInoc ?? 10}% seed · {t.levHyd ?? 80}% hyd{(t.levWhole ?? 0) > 0 ? ` · ${t.levWhole}% whole` : ""} · ref {showTemp(t.levRefTemp ?? 24)} / {t.levBuildHrs ?? 5}h</span>
+              {t.levExpNote ? <span className="lr-exp">{t.levExpNote}</span> : null}
+            </div>
+          ) : null))}
+          <div className="bl-note" style={{ marginTop: 0 }}>Levain parameters live on each recipe card in <b>Plan</b>. This tab is read-only output: it solves feed time, water temp and the build recipe from those parameters and {starter.name}'s calibration.</div>
+
+          {levainPlan.builds.length === 0 ? (
+            <div className="bl-emptytab">Set loaf counts in Planning to schedule levain builds.</div>
+          ) : (
+            <div className="bl-levbuilds">
+              {levainPlan.builds.map((bd, i) => {
+                const tooCold = !bd.retarded && (bd.Tlev < 2 || bd.Twater < 1);
+                const slowZone = !bd.retarded && !tooCold && bd.Tlev < 10;
+                const tooWarm = !bd.retarded && (bd.Tlev > 30 || bd.Twater > 45);
+                const serves = bd.items.map((x) => "B" + (x.gi + 1)).join(", ");
+                return (
+                  <div className={"bl-levcard" + (tooCold || tooWarm || bd.retardLate ? " warn" : "") + (slowZone ? " caution" : "") + (bd.retarded ? " retarded" : "")} key={i}>
+                    <div className="lh">
+                      <span className="nm">{bd.name} levain</span>
+                      <span className="sv">serves {serves}</span>
+                      <label className="lretard"><input type="checkbox" checked={bd.retarded} onChange={() => toggleRetard(bd.key)} /> cold retard</label>
+                    </div>
+                    <div className="lwater"><span className="wt">{showTemp(bd.Twater)}</span><span className="wl">build water temp{bd.retarded ? " · then fridge" : ""}</span></div>
+                    <div className="lrows">
+                      <div className="lrow"><span>Feed</span><b>{fmtClock(startMin + levainPlan.feedOff)}</b></div>
+                      <div className="lrow"><span>{bd.retarded ? "Peaks" : "Peak by"}</span><b>{fmtClock(startMin + bd.peakOff)}</b>{!bd.retarded && bd.holdMin > 0 ? <em> · hold {fmtDur(bd.holdMin)}</em> : null}</div>
+                      {bd.retarded && <div className="lrow retardrow"><span>❄ Retard</span><b>{fmtDur(bd.retardHold)}</b><em> → mix {fmtClock(startMin + bd.targetPeak)}</em></div>}
+                      <div className="lrow"><span>Build time</span><b>{fmtDur(bd.retarded ? bd.baseAdjMin : bd.desired)}</b></div>
+                      <div className="lrow"><span>Seed {Math.round(bd.I * 10) / 10}% → @ref</span><b>{fmtDur(bd.baseAdjMin)}</b></div>
+                      <div className="lrow"><span>Levain temp</span><b>~{showTemp(bd.Tlev)}</b></div>
+                    </div>
+                    <div className="lmix">
+                      <div className="ing"><span>Mature starter</span><span>{fmtG(bd.seedL)} g</span></div>
+                      <div className="ing"><span>Flour</span><span>{fmtG(bd.flourL)} g</span></div>
+                      <div className="ing"><span>Water</span><span>{fmtG(bd.waterL)} g</span></div>
+                      {bd.sugarL > 0 && <div className="ing" data-k="levsugarrow"><span>{bd.sugarName}</span><span>{fmtG(bd.sugarL)} g</span></div>}
+                      <div className="lbuffer">
+                        <label className="lbuffer-tog"><input type="checkbox" checked={bd.buffered} onChange={() => toggleLevBuffer(bd.key)} /><span>Buffer — spillage / bucket loss</span></label>
+                        {bd.buffered && <span className="lbuffer-pct"><input type="number" min="0" step="0.5" value={levBufferPct[bd.key] ?? 2} onChange={(e) => setLevBufferPct((r) => ({ ...r, [bd.key]: e.target.value }))} /><span>%</span></span>}
+                      </div>
+                      <div className="ing tot"><span>Total levain{bd.buffered ? " · +" + bd.bufPct + "%" : ""}</span><span>{fmtG(bd.M + (bd.sugarL || 0))} g</span></div>
+                    </div>
+                    {bd.retarded && bd.retardLate && <div className="lwarn">⚠ Even at room temp this peaks after the mix — it won't be ready in time. Feed earlier.</div>}
+                    {bd.retarded && !bd.retardLate && <div className="lretardnote">Built at normal temp to peak, then held cold to preserve it until mix — no extreme water or seed needed.</div>}
+                    {tooCold && <div className="lwarn">⚠ Needs a near-freezing build to peak this late. Feed earlier, or tick <b>cold retard</b> to build normally and fridge-hold it instead.</div>}
+                    {!tooCold && tooWarm && <div className="lwarn">⚠ Feed time is too late for this build — it would need a hot levain ({showTemp(bd.Tlev)}). Feed earlier.</div>}
+                    {!tooCold && !tooWarm && slowZone && <div className="lcaution">Below ~10°C the doubling-per-10°C model gets loose — calibrate it, or tick <b>cold retard</b> to sidestep the cold build entirely.</div>}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {levainPlan.builds.length > 0 && (() => {
+            const blds = levainPlan.builds;
+            const minOff = Math.min(levainPlan.feedOff, ...blds.map((b) => levainPlan.feedOff));
+            const maxOff = Math.max(...blds.map((b) => Math.max(b.targetPeak, b.peakOff)));
+            const span = Math.max(60, maxOff - minOff);
+            const pad = span * 0.04;
+            const lo = minOff - pad, hi = maxOff + pad, totalSpan = hi - lo;
+            const pct = (off) => ((off - lo) / totalSpan) * 100;
+            const tickStep = totalSpan > 720 ? 120 : 60;
+            const firstTick = Math.ceil(lo / tickStep) * tickStep;
+            const ticks = []; for (let tk = firstTick; tk <= hi; tk += tickStep) ticks.push(tk);
+            return (
+              <div className="bl-lev-gantt">
+                <div className="lg-title">Levain timeline</div>
+                <div className="lg-scroll">
+                  <div className="lg-inner">
+                    <div className="lg-axis">
+                      {ticks.map((tk) => <div className="lg-tick" key={tk} style={{ left: pct(tk) + "%" }}><span>{fmtClock(startMin + tk)}</span></div>)}
+                    </div>
+                    {blds.map((b, i) => {
+                      const feedX = pct(levainPlan.feedOff), peakX = pct(b.peakOff), mixX = pct(b.targetPeak);
+                      return (
+                        <div className="lg-row" key={i}>
+                          <div className="lg-rowlabel"><b>{b.name}</b><span>{b.items.map((x) => "B" + (x.gi + 1)).join(",")}</span></div>
+                          <div className="lg-track">
+                            {/* build phase: feed → peak */}
+                            <div className="lg-bar build" style={{ left: feedX + "%", width: Math.max(0.5, peakX - feedX) + "%" }} title="building" />
+                            {/* retard hold: peak → mix */}
+                            {b.retarded && b.retardHold > 0 && <div className="lg-bar retard" style={{ left: peakX + "%", width: Math.max(0.5, mixX - peakX) + "%" }} title="cold retard" />}
+                            {/* feed marker */}
+                            <div className="lg-mark feed" style={{ left: feedX + "%" }}><span className="lg-dot" /><span className="lg-mlab">feed {fmtClock(startMin + levainPlan.feedOff)}</span></div>
+                            {/* peak marker */}
+                            <div className="lg-mark peak" style={{ left: peakX + "%" }}><span className="lg-dot" /><span className="lg-mlab">{b.retarded ? "peak" : "peak/use"} {fmtClock(startMin + b.peakOff)}</span></div>
+                            {/* mix marker (only distinct when retarded) */}
+                            {b.retarded && <div className="lg-mark mix" style={{ left: mixX + "%" }}><span className="lg-dot" /><span className="lg-mlab">mix {fmtClock(startMin + b.targetPeak)}</span></div>}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div className="lg-legend"><span className="lg-key build">build</span><span className="lg-key retard">❄ retard hold</span><span className="lg-key peakk">● peak</span></div>
+              </div>
+            );
+          })()}
+          <div className="bl-note">In <b>Auto</b>, the app feeds whenever the schedule demands. In <b>I'll pick</b>, you choose the feed time and it solves each build's water temp so the first ripens when your mix day starts. <b>Inoculation, hydration and levain flour all drive timing</b> via {starter.name}'s calibration; lower seed or stiffer levain stretches the natural rise, whole grain shortens it. Retarded builds peak naturally then hold cold (blue) until mix. Speed scales by Q10 per 10°C; below ~10°C it's approximate. Builds auto-split past a 90-min mix spread.</div>
+        </div>
+      )}
+
+      {/* ---------- TAB 4: BATCH BUILDS / AUTOLYSE ---------- */}
+      {tab === "build" && (
+        <div className="bl-panel">
+          <div className="bl-mixwater-bar">
+            <button className="bl-mixwater-btn" onClick={() => setCalcOpen(true)}>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 14.76V5a2 2 0 0 0-4 0v9.76a4 4 0 1 0 4 0Z"/></svg>
+              Dough temp calculator
+            </button>
+            <button className="bl-mixwater-btn alt" onClick={() => setLabelOpen(true)} disabled={!plan.list || plan.list.length === 0}>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8" rx="1"/></svg>
+              Print labels
+            </button>
+            <button className="bl-mixwater-btn alt" data-f="printMixSheets" onClick={() => setMixSheetOpen(true)} disabled={!plan.list || plan.list.length === 0}>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></svg>
+              Print mix sheets
+            </button>
+            <button className={"bl-mixwater-btn awake" + (stayAwake ? " on" : "")} aria-pressed={stayAwake} onClick={() => setStayAwake((v) => !v)}>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+              Stay awake{stayAwake ? ": on" : ""}
+            </button>
+            {mixWaterTemp != null && (
+              <span className="bl-mixwater-cur">Mix water <b>{showTemp(mixWaterTemp)}</b><button onClick={() => setMixWaterTemp(null)} title="Clear" aria-label="Clear mix water">×</button></span>
+            )}
+          </div>
+          {stayAwake && (
+            <div className={"bl-awake-note" + (wakeMode === "none" ? " bad" : "")}>
+              {wakeMode === "lock" && "Screen stays on while this page is open."}
+              {wakeMode === "video" && "Screen stays on while this page is open (compatibility mode)."}
+              {wakeMode === "" && "Starting…"}
+              {wakeMode === "none" && "Couldn’t keep the screen on from here. On iPhone: Settings › Display & Brightness › Auto-Lock › Never, while you mix."}
+            </div>
+          )}
+          <h3>Batch builds · Autolyse — tap a batch to focus</h3>
+          {baseDoughGroups.length > 0 && (
+            <div className="bl-basedough">
+              <div className="bl-bd-hd"><span className="bl-bd-title">Shared base doughs</span><span className="bl-bd-sub">mix together · split at shaping</span></div>
+              {baseDoughGroups.map((g, gi) => (
+                <div className="bl-bd-group" key={gi}>
+                  <div className="bl-bd-total">{fmtG(g.totalBase)} g base · {g.nBatches} {g.nBatches === 1 ? "mix" : "mixes"}{g.nBatches > 1 ? " (÷ evenly · " + (g.byFlour ? g.flourCapKg + " kg flour cap" : (g.cap / 1000) + " kg cap") + ")" : ""}</div>
+                  <div className="bl-bd-weigh">{g.weighOut.map((w, wi) => <span className="bl-bd-ing" key={wi}>{w.name} <b>{fmtG(w.g)} g</b>{eggCount(w.name, w.g) ? <em className="bl-eggnote"> · {eggCount(w.name, w.g)}</em> : null}</span>)}</div>
+                  <div className="bl-bd-split">
+                    {g.members.map((m, mi) => (
+                      <div className="bl-bd-member" key={mi}>
+                        <span className="bl-bd-mname">{m.loaves} × {m.name}</span>
+                        {m.inc.length > 0
+                          ? <span className="bl-bd-inc">+ {m.inc.map((x) => fmtG(x.g) + " g " + x.name).join(" · ")} at shape</span>
+                          : <span className="bl-bd-inc plain">plain</span>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          {plan.list.length === 0 ? (
+            <div className="bl-emptytab">Set loaf counts in Planning to generate batches.</div>
+          ) : (<>
+            <div className="bl-progress">
+              <span>{doneBatches.filter((d) => d < plan.list.length).length} of {plan.list.length} batches built</span>
+              {doneBatches.length > 0 && <button onClick={() => { setDoneBatches([]); setActiveBatch(null); }}>Reset progress</button>}
+            </div>
+            <div className="bl-builds">
+              {plan.list.map((_, idx) => idx).sort((a, b) => (doneBatches.includes(a) ? 1 : 0) - (doneBatches.includes(b) ? 1 : 0)).map((i) => {
+                const b = plan.list[i];
+                const t = types[b.ti];
+                const sa = scaldAmounts(t, b);
+                // the scald is pre-made, so it is ONE ingredient at the bench: flour + liquid together
+                const cols = (() => { const L = benchLines(t, b); if (!sa) return L; const out = []; let put = false; L.forEach((l) => { if (l.key === "scf" || l.key === "scw" || l.key === "scl") { if (!put) { out.push({ key: "scald", name: "Scald", g: sa.dough, premade: true }); put = true; } } else out.push(l); }); return out; })();
+                const base = schedule[i] ? schedule[i].base : 0;
+                const mixStart = base + ((t && t.autolyse != null ? +t.autolyse : +params.autolyse) || 0);
+                const isA = activeBatch === i, isD = doneBatches.includes(i);
+                return (
+                  <div className={"bl-build" + (isA ? " active" : "") + (isD ? " done" : "")} key={i} onClick={() => setActiveBatch(isA ? null : i)}>
+                    <div className="bh"><span className="bn">B{i + 1}</span><span className="bt">{t.name}{isD ? " · ✓ built" : ""}</span></div>
+                    <div className="meta"><span>Autolyse <b>{fmtClock(startMin + base)}</b></span><span>Mix <b>{fmtClock(startMin + mixStart)}</b></span></div>
+                    <div className="meta"><span><b>{b.size}</b> loaves</span><span><b>{fmtG(b.dough)}</b> g dough</span><span>{proofInfo(t.shape).label}</span></div>
+                    <div className="bl-build-ddt">Target dough temp<b>{showTemp(t.ddt ?? DDT_DEFAULT_C)}</b></div>
+                    {(() => {
+                      if (!sa) return null; const sc = sa.sc;
+                      return (
+                        <div className="bl-scald-call" data-k="scaldcall">
+                          <b>Cook first — scald.</b> {fmtG(sa.cookFl)} g {sc.flourName} + {fmtG(sa.cookLq)} g {sc.liquidName.toLowerCase()}{sa.buf > 0 ? " (includes a " + sa.buf + "% buffer; " + fmtG(sa.dough) + " g goes in the dough)" : ""}.{" "}
+                          {sc.method === "poured" ? "Pour the just-boiled liquid over the flour and mix to a paste." : "Whisk over medium heat to " + showTemp(65) + " until it thickens like pudding."} Cool fully before mixing (make it ahead; the fridge is fine).
+                        </div>
+                      );
+                    })()}
+                    {cols.map((l) => <div className="ing" key={l.key}><span className="nm">{l.name}</span><span className="g">{fmtG(l.g)} g{l.key === "water" && mixWaterTemp != null ? <em className="bl-watertemp"> · {showTemp(mixWaterTemp)}</em> : null}{l.sugarG ? <em className="bl-when" data-k="levsugartag"> · incl. {fmtG(l.sugarG)} g sugar</em> : null}{l.premade ? <em className="bl-when" data-k="scaldtag"> · pre-made</em> : null}{eggCount(l.name, l.g) ? <em className="bl-eggnote"> · {eggCount(l.name, l.g)}</em> : null}{(() => { const pl = placeLine(t, l, groupOf, Math.floor(+params.folds || 0)); return (/^fold/.test(pl.w) || pl.w === "end") ? <em className="bl-when" data-k="whentag"> · {pl.w === "end" ? "end of mix" : WHEN_LABEL[pl.w]}</em> : null; })()}</span></div>)}
+                    <div className="ing tot"><span className="nm">Total flour</span><span className="g">{fmtG(b.totalFlour)} g</span></div>
+                    <div className="ing tot"><span className="nm">Total water</span><span className="g">{fmtG(b.totalWater)} g</span></div>
+                    <button className="bl-helpbtn" data-f="help" onClick={(e) => { e.stopPropagation(); setHelpOpen(i); }}>✦ Help{(helpChats[helpKey(plan, i)] || []).length ? " · " + (helpChats[helpKey(plan, i)] || []).length : ""}</button>
+                    {isA && <button className="bl-donebtn" onClick={(e) => { e.stopPropagation(); completeAndNext(i); }}>Done — built ✓</button>}
+                  </div>
+                );
+              })}
+            </div>
+          </>)}
+          <div className="bl-note">Tap a batch to scale it up and focus; “Done” greys it and jumps to the next. Weights in grams (raw); times follow the Planning schedule. The water % is the water line only. Levain adds its own flour and water, so true hydration moves the other way from a stiff levain: wetter than your water line raises it, stiffer lowers it. Each recipe’s true hydration is on its Plan card and in the editor.</div>
+          {calcOpen && <DoughTempCalc tempUnit={tempUnit} uToC={uToC} cToU={cToU} initial={calcInputs} current={mixWaterTemp} onApply={(c, inputs) => { setMixWaterTemp(c); setCalcInputs(inputs); }} onClose={() => setCalcOpen(false)} />}
+        </div>
+      )}
+
+      {/* ---------- TAB 4: BAKE · NOW & NEXT ---------- */}
+      {tab === "fold" && (() => {
+        const liveSpan = Math.max(lastEnd, 60);
+        const nowOff = nowMin - startMin;
+        const nowX = LIVE_LABEL + Math.min(Math.max(nowOff, 0), liveSpan) * LIVE_PX;
+        const ticks = []; for (let t = 0; t <= liveSpan + 30; t += 30) ticks.push(t);
+        const rows = schedule.length;
+        const rowH = liveFull ? Math.max(36, Math.min(110, Math.floor((vh - 165) / Math.max(rows, 1)))) : LIVE_ROW;
+        const barH = Math.max(22, Math.min(42, rowH - 18));
+        const barTop = (rowH - barH) / 2;
+        const innerH = LIVE_AXIS + rows * rowH;
+        const status = nowOff < 0
+          ? <>Day starts at <b>{fmtClock(startMin)}</b> — in {fmtDelta(-nowOff)}</>
+          : !live.hero ? <>All folding &amp; shaping complete</>
+          : (live.hero.startOff - live.nowOff <= 0
+            ? <><span className="dot" />Now: <b>B{live.hero.batch + 1} {live.hero.name}</b></>
+            : <>Next: <b>B{live.hero.batch + 1} {live.hero.name}</b> in {fmtDelta(live.hero.startOff - live.nowOff)}</>);
+        return (
+          <div className={"bl-panel lv-screen" + (liveFull ? " full" : "")}>
+            <div className="bl-live-top">
+              <div className="bl-clock">{fmtClock(nowMin)}<small>now · day start {fmtClock(startMin)}</small></div>
+              <div className="bl-livebtns">
+                <button className={"bl-anchor" + (follow ? " ghost" : "")} onClick={() => { setFollow(true); centerNow(); }}>{follow ? "● Live" : "Jump to now"}</button>
+                <button className="bl-anchor ghost" onClick={() => setLiveFull((f) => !f)}>{liveFull ? "⤡ Minimize" : "⤢ Full screen"}</button>
+                {!mixed && <button className="bl-anchor" onClick={() => { anchorNow(); setMixed(true); setFollow(true); setRecal(false); }}>Mix Now</button>}
+                <button className={"bl-anchor" + (recal ? "" : " ghost")} onClick={() => { const nx = !recal; setRecal(nx); if (nx) setFollow(false); }}>{recal ? "✓ Done" : "↔ Recalibrate"}</button>
+              </div>
+            </div>
+            <div className="bl-livestatus">{status}</div>
+            {recal && <div className="bl-recalhint">↔ Drag a batch row to slide its cycle — line up the phase you’re actually in with the red now-line. Saves to the schedule.</div>}
+
+            <div className="lv-wrap" ref={liveRef} onScroll={onLiveScroll}>
+              <div className="lv-inner" style={{ width: LIVE_LABEL + liveSpan * LIVE_PX + 24, height: innerH }}>
+                <div className="lv-axis">
+                  {ticks.map((t) => <div className="lv-tick" key={t} style={{ left: LIVE_LABEL + t * LIVE_PX }}>{fmtClock(startMin + t)}</div>)}
+                </div>
+                {schedule.map((row, b) => {
+                  const info = plan.list[b];
+                  return (
+                    <div className={"lv-row" + (recal ? " recal" : "")} key={b} style={{ height: rowH }}
+                      onPointerDown={recal ? (e) => liveDown(e, b) : undefined} onPointerMove={recal ? liveMove : undefined}
+                      onPointerUp={recal ? liveUp : undefined} onPointerCancel={recal ? liveUp : undefined}>
+                      <div className="lv-label"><span className="b">B{b + 1}</span><span className="s">{info ? info.name : ""}</span></div>
+                      {row.blocks.map((bl, i) => {
+                        const w = bl.min * LIVE_PX;
+                        const cx = LIVE_LABEL + (bl.startOff + bl.min / 2) * LIVE_PX;
+                        const inside = w >= bl.name.length * 5.2 + 10;
+                        return (
+                          <React.Fragment key={i}>
+                            <div className={"lv-bar " + (bl.active ? "a" : "p")} style={{ left: LIVE_LABEL + bl.startOff * LIVE_PX, width: Math.max(w, 2), top: barTop, height: barH }}>
+                              {inside && <span className="lv-lab in">{bl.name}</span>}
+                            </div>
+                            {!inside && <span className="lv-lab above" style={{ left: cx, top: Math.max(1, barTop - 11) }}>{bl.name}</span>}
+                          </React.Fragment>
+                        );
+                      })}
+                    </div>
+                  );
+                })}
+                <div className="lv-now" style={{ left: nowX, height: innerH }}>
+                  <span className="lv-nowtag">{fmtClock(nowMin)}</span>
+                </div>
+              </div>
+            </div>
+            <div className="bl-note">Live view — the red line is now, held about a third in from the left. Full screen fits all batches at once; scroll to look around; “Jump to now” re-centers. Read-only.</div>
+          </div>
+        );
+      })()}
+
+      {/* ---------- TAB 6: BAKE ---------- */}
+      {tab === "bake" && (
+        <div className="bl-panel">
+          <h3>Bake — set dates on each recipe card in Plan</h3>
+          <div className="bl-cond">
+            {oven
+              ? <div className="bl-field2 eq-ro"><label>Loaves per load</label><div className="eq-roval" data-k="ovensum">{oven.name}: {oven.boule || "–"} boules/ovals · {oven.pullman1 || "–"} 1 lb Pullmans · {oven.pullman2 || "–"} 2 lb Pullmans <span>(change the oven on the Plan tab)</span></div></div>
+              : <div className="bl-field2"><label>Loaves per load</label><input type="number" min="1" value={params.ovenCap ?? 2} onChange={(e) => setP("ovenCap", e.target.value)} /></div>}
+            <div className="bl-field2"><label>Preheat (min)</label><input type="number" min="0" value={params.preheatMin ?? 45} onChange={(e) => setP("preheatMin", e.target.value)} /></div>
+            <div className="bl-field2"><label>Recover between (min)</label><input type="number" min="0" value={params.recoverMin ?? 7} onChange={(e) => setP("recoverMin", e.target.value)} /></div>
+            {bakePlan.notes.length > 0 && <div className="eq-warn eq-bakenote" data-k="ovennotes">{bakePlan.notes.join(" ")}</div>}
+          </div>
+          {types.map((t, ti) => (plan.summaries[ti] && plan.summaries[ti].loaves > 0 ? (
+            <div className="bl-levparams" key={ti}>
+              <span className="nm">{t.name} <em className="bl-ordbadge">bake #{t.bakeOrder || ti + 1}</em></span>
+              <div className="bl-field2"><label>Bake temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(t.bakeTemp ?? 245))} onChange={(e) => setDraft(ti, { bakeTemp: uToC(Number(e.target.value) || 0) })} /></div>
+              <div className="bl-field2"><label>Bake time (min)</label><input type="number" min="1" value={t.bakeMin ?? 45} onChange={(e) => setDraft(ti, { bakeMin: Math.max(1, Number(e.target.value) || 0) })} /></div>
+              <div className="bl-field2"><label>Steam (min)</label><input type="number" min="0" value={t.steamMin ?? 20} onChange={(e) => setDraft(ti, { steamMin: Math.max(0, Number(e.target.value) || 0) })} /></div>
+            </div>
+          ) : null))}
+
+          {bakePlan.pool.length > 0 && (
+            <div className="bl-pool">
+              <div className="bl-pool-hd">Shaped pool — loaves across all bake dates</div>
+              {bakePlan.pool.map((p) => (
+                <div className={"bl-pool-row" + (p.remaining < 0 ? " over" : "")} key={p.ti}>
+                  <span className="pr-nm">{p.name}</span>
+                  <span className="pr-fig">{p.allocated} / {p.shaped} scheduled</span>
+                  <span className={"pr-rem" + (p.remaining < 0 ? " over" : p.remaining === 0 ? " done" : "")}>{p.remaining < 0 ? `${-p.remaining} over` : p.remaining === 0 ? "all placed" : `${p.remaining} unplaced`}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {bakePlan.dateSchedules.length === 0 ? (
+            <div className="bl-emptytab">Add bake sessions to your recipe cards in Plan to build an oven schedule.</div>
+          ) : (
+            <div className="bl-date-schedules">
+              {bakePlan.dateSchedules.map((ds) => {
+                const bs = parseTime(bakeDateTimes[ds.date] || "08:00");
+                return (
+                  <div className="bl-datesect" key={ds.date}>
+                    <div className="bl-datesect-hd">
+                      <span className="ds-date">{ds.date}</span>
+                      <div className="ss-start"><label>Oven on</label><input type="time" value={bakeDateTimes[ds.date] || "08:00"} onChange={(e) => setOvenTime(ds.date, e.target.value)} /></div>
+                    </div>
+                    {ds.loadCount === 0 ? <div className="bl-sessempty">No loaves for this date.</div> : (<>
+                      <div className="bl-preheat">Oven on <b>{fmtClock(bs)}</b> · preheat {bakePlan.preheat} min → first load <b>{fmtClock(bs + ds.firstIn)}</b> · last out <b>{fmtClock(bs + ds.lastOut)}</b> · {fmtDur(ds.lastOut)} running · {ds.loadCount} {ds.loadCount === 1 ? "load" : "loads"} / {ds.totalLoaves} loaves</div>
+                      {ds.items && ds.items.length > 0 && (
+                        <div className="bl-profiles">
+                          <span className="bl-prof-lbl">bake profiles:</span>
+                          {ds.items.map((it, k) => (
+                            <span key={k} className="bl-prof">{it.name} ({it.loaves}) · {showTemp(it.temp)} · {it.bakeMin}m · {it.steamMin}m steam</span>
+                          ))}
+                        </div>
+                      )}
+                      <div className="bl-loads">
+                        {ds.sched.map((ld, idx) => (
+                          <React.Fragment key={idx}>
+                            {idx > 0 && bakePlan.recover > 0 && <div className="bl-recover">↻ recover {bakePlan.recover} min</div>}
+                            <div className="bl-load">
+                              <div className="lo-no">{ld.i + 1}</div>
+                              <div className="lo-body">
+                                <div className="lo-hd"><span className="lo-nm">{ld.label}</span><span className="lo-n">{ld.n} {ld.n === 1 ? "loaf" : "loaves"}{oven ? " · " + Math.round(ld.fill * 100) + "% full" : ""}</span><span className="lo-temp">{showTemp(ld.temp)}</span></div>
+                                <div className="lo-bar">
+                                  {ld.steamMin > 0 && <div className="seg steam" style={{ flexGrow: ld.steamMin }} title="steam" />}
+                                  {ld.bakeMin - ld.steamMin > 0 && <div className="seg vent" style={{ flexGrow: ld.bakeMin - ld.steamMin }} title="dry (steam released)" />}
+                                </div>
+                                <div className="lo-times">
+                                  <span>in <b>{fmtClock(bs + ld.startOff)}</b></span>
+                                  {ld.steamMin > 0 && ld.steamMin < ld.bakeMin && <span className="vent">release {fmtClock(bs + ld.ventOff)}</span>}
+                                  <span>out <b>{fmtClock(bs + ld.endOff)}</b></span>
+                                </div>
+                              </div>
+                            </div>
+                          </React.Fragment>
+                        ))}
+                      </div>
+                      {(() => {
+                        const isToday = ds.date === todayISO();
+                        const bakeSpan = Math.max(ds.lastOut, 60);
+                        const nowOff = nowMin - bs;
+                        const nowX = LIVE_LABEL + Math.min(Math.max(nowOff, 0), bakeSpan) * LIVE_PX;
+                        const ticks = []; for (let tk = 0; tk <= bakeSpan + 30; tk += 30) ticks.push(tk);
+                        const rows = [];
+                        if (bakePlan.preheat > 0) rows.push({ tag: "Oven", sub: "preheat", blocks: [{ startOff: 0, min: bakePlan.preheat, name: "preheat", type: "pre" }] });
+                        ds.sched.forEach((ld) => {
+                          const blocks = [{ startOff: ld.startOff, min: Math.max(1, ld.ventOff - ld.startOff), name: "steam", type: "steam" }];
+                          if (ld.endOff > ld.ventOff) blocks.push({ startOff: ld.ventOff, min: ld.endOff - ld.ventOff, name: "dry", type: "dry" });
+                          rows.push({ tag: "#" + (ld.i + 1), sub: ld.label + " · " + ld.n + "×", blocks });
+                        });
+                        const rowH = LIVE_ROW, barH = 24, barTop = (rowH - barH) / 2;
+                        const innerH = LIVE_AXIS + rows.length * rowH;
+                        return (
+                          <div className="bl-bakegantt-wrap">
+                            <div className="lv-wrap bake" ref={(el) => { bakeRefs.current[ds.date] = el; }}>
+                              <div className="lv-inner" style={{ width: LIVE_LABEL + bakeSpan * LIVE_PX + 24, height: innerH }}>
+                                <div className="lv-axis">
+                                  {ticks.map((tk) => <div className="lv-tick" key={tk} style={{ left: LIVE_LABEL + tk * LIVE_PX }}>{fmtClock(bs + tk)}</div>)}
+                                </div>
+                                {rows.map((row, ri) => (
+                                  <div className="lv-row" key={ri} style={{ height: rowH }}>
+                                    <div className="lv-label"><span className="b">{row.tag}</span><span className="s">{row.sub}</span></div>
+                                    {row.blocks.map((bl, i) => {
+                                      const w = bl.min * LIVE_PX;
+                                      const cx = LIVE_LABEL + (bl.startOff + bl.min / 2) * LIVE_PX;
+                                      const inside = w >= bl.name.length * 5.2 + 10;
+                                      return (
+                                        <React.Fragment key={i}>
+                                          <div className={"lv-bar " + bl.type} style={{ left: LIVE_LABEL + bl.startOff * LIVE_PX, width: Math.max(w, 2), top: barTop, height: barH }}>
+                                            {inside && <span className="lv-lab in">{bl.name}</span>}
+                                          </div>
+                                          {!inside && <span className="lv-lab above" style={{ left: cx, top: Math.max(1, barTop - 11) }}>{bl.name}</span>}
+                                        </React.Fragment>
+                                      );
+                                    })}
+                                  </div>
+                                ))}
+                                {isToday && (
+                                  <div className="lv-now" style={{ left: nowX, height: innerH }}>
+                                    <span className="lv-nowtag">{fmtClock(nowMin)}</span>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                            <div className="bl-bakegantt-foot">
+                              {isToday ? <button className="bl-anchor ghost" onClick={() => centerBake(ds.date, bs)}>Jump to now</button> : <span className="bg-foot-note">Scheduled for {ds.date}</span>}
+                              <div className="bgleg"><span className="bgk pre">preheat</span><span className="bgk steam">steam</span><span className="bgk dry">dry</span></div>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </>)}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div className="bl-note">Bake sessions are set on each recipe card in <b>Plan</b>: a date per session, loaves split across them (first session is the remainder). The Bake tab groups everything by date — if two recipes share a date, their loads are sequenced together on one oven that day. Oven-on time is set here per date. Loads pool recipes that bake identically (same temp, time, and steam) and fill up to your loaves-per-load capacity; recipes with different bake settings stay in separate loads.</div>
+        </div>
+      )}
+
+      {/* ---------- TAB 7: FOOD SAFETY ---------- */}
+      {tab === "timers" && <TimerTab batches={plan.list} types={types} params={params} dayId={currentDayId} />}
+      {tab === "costs" && (
+        <CostsTab res={costLock ? costLock.result : runCosts} locked={!!costLock} lockedAt={costLock ? costLock.at : 0}
+          hours={costLock ? costLock.result.inputs.rentalHours : rentalHours} setHours={setRentalHours}
+          rate={costLock ? costLock.result.inputs.rate : rentalRate} setRate={setRentalRate} defaultRate={costSettings.rentalRate}
+          setSold={(ti, v) => setSoldLoaves((m) => ({ ...m, [ti]: v }))} setPrice={(ti, v) => setDraft(ti, { price: v })}
+          onLock={lockCosts} onUnlock={unlockCosts} deduction={deduction} onDeduct={deductRun} onUndo={undoDeduction}
+          onOpenPantry={goPantry} pantryCount={pantry.length} />
+      )}
+      {tab === "safety" && (<>
+        <div className="bl-panel">
+          <h3>Refrigerator temperature log</h3>
+          <div className="bl-fsmatrix">
+            <div className="fsm-head">
+              <span className="fsm-rl">Fridge</span>
+              <span>Reading 1</span><span>Reading 2</span><span>Reading 3</span>
+            </div>
+            {foodSafety.fridges.map((fr, fi) => (
+              <div className="fsm-row" key={fr.id}>
+                <div className="fsm-rl">
+                  <BufferedInput className="fsm-name" value={fr.name} onCommit={(v) => setFridgeName(fi, v)} placeholder="Fridge name" />
+                  {foodSafety.fridges.length > 1 && <button className="ing-x" title="Remove fridge" onClick={() => removeFridge(fi)}>×</button>}
+                </div>
+                {fr.readings.map((r, ri) => {
+                  const has = r.temp != null && r.temp !== "";
+                  const safe = has && (+r.temp <= 4);
+                  return (
+                    <div className={"fsm-cell" + (has ? (safe ? " ok" : " bad") : "")} key={r.id}>
+                      <div className="fsm-input"><input type="number" step="0.1" placeholder="—" value={has ? Math.round(cToU(+r.temp) * 10) / 10 : ""} onChange={(e) => setTempVal(fi, ri, e.target.value)} /><span>°{tempUnit}</span></div>
+                      <div className="fsm-meta">
+                        {r.time ? <button className="fsm-ts" title="Tap to stamp current time" onClick={() => restampTemp(fi, ri)}>{r.time}</button> : <span className="fsm-ts none">— : —</span>}
+                        {has && <span className={"fsm-flag " + (safe ? "ok" : "bad")}>{safe ? "✓" : "✗"}</span>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+          <button className="bl-addrec" onClick={addFridge}>+ Add fridge</button>
+          <div className="bl-note">Cold-holding target is <b>4°C / 40°F or below</b>. The time stamps itself the moment you enter a reading — tap a stamp to reset it to now. Out-of-range readings flag red. Up to three readings per fridge per run.</div>
+        </div>
+
+        <div className="bl-panel">
+          <h3>Sanitizer log</h3>
+          <div className="bl-fsmatrix">
+            <div className="fsm-head">
+              <span className="fsm-rl">Station</span>
+              <span>Reading 1</span><span>Reading 2</span><span>Reading 3</span>
+            </div>
+            {foodSafety.sanitizers.map((s, si) => (
+              <div className="fsm-row" key={s.id}>
+                <div className="fsm-rl">
+                  <BufferedInput className="fsm-name" value={s.name} onCommit={(v) => setSaniName(si, v)} placeholder="Station" />
+                  <span className="fsm-sub">{s.kind} · {s.min}–{s.max} ppm</span>
+                  {foodSafety.sanitizers.length > 1 && <button className="ing-x" title="Remove station" onClick={() => removeSanitizer(si)}>×</button>}
+                </div>
+                {s.readings.map((r, ri) => {
+                  const has = r.ppm != null && r.ppm !== "";
+                  const pass = has && +r.ppm >= s.min && +r.ppm <= s.max;
+                  return (
+                    <div className={"fsm-cell" + (has ? (pass ? " ok" : " bad") : "")} key={r.id}>
+                      <div className="fsm-input"><input type="number" min="0" placeholder="—" value={has ? r.ppm : ""} onChange={(e) => setSaniVal(si, ri, e.target.value)} /><span>ppm</span></div>
+                      <div className="fsm-meta">
+                        {r.time ? <button className="fsm-ts" title="Tap to stamp current time" onClick={() => restampSani(si, ri)}>{r.time}</button> : <span className="fsm-ts none">— : —</span>}
+                        {has && <span className={"fsm-flag " + (pass ? "ok" : "bad")}>{pass ? "✓ Pass" : "✗ Fail"}</span>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+          <button className="bl-addrec" onClick={addSanitizer}>+ Add station</button>
+          <div className="bl-note">Chlorine sanitizer must read <b>100–200 ppm</b> to pass. The time stamps itself when you enter a reading — tap a stamp to reset it to now. Up to three readings per station per run.</div>
+        </div>
+      </>)}
+
+      {hover && !drag && (
+        <div className="bl-tip" style={{ left: hover.x, top: hover.y }}>
+          <div className="b">Batch {hover.batch + 1}{hover.type ? ` · ${hover.type}` : ""}</div>
+          <div className="n">{hover.name}</div>
+          <div className="d">{fmtDur(hover.min)} · {fmtClock(startMin + hover.s)}–{fmtClock(startMin + hover.e)}</div>
+          {hover.hit && <div className="x">⚠ collision</div>}
+        </div>
+      )}
+      </>)}
+
+      {delTarget && (
+        <div className="bl-modal-overlay" onClick={() => setDelTarget(null)}>
+          <div className="bl-modal bl-confirm" onClick={(e) => e.stopPropagation()}>
+            <h3>{delTarget.kind === "day" ? "Delete run?" : "Delete recipe?"}</h3>
+            <p>“<b>{delTarget.name || "Untitled"}</b>” will be permanently removed. This can’t be undone.</p>
+            <div className="bl-confirm-acts">
+              <button className="bl-confirm-cancel" onClick={() => setDelTarget(null)}>Cancel</button>
+              <button className="bl-confirm-del" onClick={() => { if (delTarget.kind === "day") delDay(delTarget.id); else if (delTarget.kind === "remix") deleteRemix(delTarget.id); else deleteCoreRecipe(delTarget.id); setDelTarget(null); }}>Delete</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+
+    {helpOpen !== null && plan.list[helpOpen] && (() => {
+      const i = helpOpen, b = plan.list[i], t = types[b.ti], key = helpKey(plan, i);
+      const bd = (levainPlan.builds || []).find((x) => x.items.some((it) => it.gi === i));
+      const lev = bd ? { feedAt: fmtClock(startMin + levainPlan.feedOff), peakBy: fmtClock(startMin + bd.peakOff), buildTime: fmtDur(Math.round(bd.retarded ? bd.baseAdjMin : bd.desired)), levainTemp: showTemp(bd.Tlev), buildWaterTemp: showTemp(bd.Twater), coldRetard: !!bd.retarded, buildSharedBy: bd.name, seedGrams: Math.round(bd.seedL), flourGrams: Math.round(bd.flourL), waterGrams: Math.round(bd.waterL), sugarGrams: Math.round(bd.sugarL || 0), totalLevainGrams: Math.round(bd.M + (bd.sugarL || 0)) } : null;
+      const ctx = mixHelpContext({ b, i, total: plan.list.length, t, params, groupOf, showTemp, waterTemp: mixWaterTemp, startMin, base: schedule[i] ? schedule[i].base : 0, nowClock: fmtClock(nowMin), runName: dayName, runDate: dayDate, tempUnit, starterName: starter.name, ambientTemp, starterTemp, lev, done: doneBatches.includes(i), active: activeBatch === i });
+      return <MixHelpPanel key={key} title={"B" + (i + 1) + " · " + t.name} ctx={ctx} messages={helpChats[key] || []} onMessages={(ms) => setHelpChats((h) => ({ ...h, [key]: ms.slice(-HELP_MAX_MSGS) }))} onClose={() => setHelpOpen(null)} />;
+    })()}
+    {mixSheetOpen && (() => {
+      const total = (plan.list || []).length;
+      const all = (plan.list || []).map((b, i) => mixSheetData({ b, i, total, t: types[b.ti], params, groupOf, showTemp, waterTemp: mixWaterTemp }));
+      const shown = all.filter((L, i) => mixSheetOff.indexOf(i) === -1);
+      const fx = (MS_PAGE.w - MS_FORM.w) / 2, fy = (MS_PAGE.h - MS_FORM.h) / 2;
+      const marks = cropMarkRects(fx, fy, MS_FORM.w, MS_FORM.h);
+      return (
+        <div className="label-print-overlay" data-k="mixsheets">
+          <div className="label-print-ui">
+            <div className="lpu-title">Mix sheets<small>4&quot;×6.5&quot; portrait · {shown.length} sheet{shown.length === 1 ? "" : "s"} · one per page</small></div>
+            <div className="lpu-spacer" />
+            <button className="lpu-print" data-f="mixSheetPrint" disabled={shown.length === 0} onClick={() => window.print()}>Print / Save PDF</button>
+            <button className="lpu-close" onClick={() => setMixSheetOpen(false)} aria-label="Close">×</button>
+          </div>
+          <div className="label-print-hint">Set the print dialog to <b>100% scale</b>, <b>margins: None</b> on Letter paper, and tick <b>Background graphics</b> so the dark badges print. Cut through the crop marks: each pair of matching ticks marks one edge of the 4&quot; × 6.5&quot; sheet.</div>
+          <div className="label-copies">
+            <span className="lcp-hd">Print</span>
+            {all.map((L, i) => (
+              <label className="lcp-item" key={i}>
+                <input type="checkbox" data-f={"ms-pick-" + i} checked={mixSheetOff.indexOf(i) === -1} onChange={() => setMixSheetOff((st) => st.indexOf(i) !== -1 ? st.filter((x) => x !== i) : [...st, i])} />
+                <span>B{L.n}</span>
+              </label>
+            ))}
+          </div>
+          <div className="label-stage">
+            <div className="label-sheets">
+              {shown.length === 0 && <div className="label-print-hint">No sheets selected.</div>}
+              {shown.map((L) => (
+                <React.Fragment key={L.n}>
+                {L.warns.map((w, wi) => <div className="label-print-hint ms-warn" data-k="mswhen" key={wi}>B{L.n}: {w}</div>)}
+                {mixSheetOver[L.n] && <div className="label-print-hint ms-warn" data-k="mswarn">B{L.n}: more than fits on this sheet, even at the smallest type. The lowest rows may be cut off, so check the preview below. Trim or combine ingredients before printing.</div>}
+                <div className="label-sheet ms-page" data-k="mspage" style={{ width: MS_PAGE.w + "in", height: MS_PAGE.h + "in", position: "relative" }}>
+                  {marks.map((m, mi) => <div className="ms-crop" key={mi} style={{ left: m.left + "in", top: m.top + "in", width: m.width + "in", height: m.height + "in" }} />)}
+                  <div style={{ position: "absolute", left: fx + "in", top: fy + "in", width: MS_FORM.w + "in", height: MS_FORM.h + "in" }}>
+                    <MixSheetForm L={L} tempUnit={tempUnit} onFit={onMixFit} />
+                  </div>
+                </div>
+                </React.Fragment>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    })()}
+    {labelOpen && (() => {
+      const P = AVERY_6468;
+      const data = (plan.list || []).map((b, i) => {
+        const t = types[b.ti];
+        return { n: i + 1, name: t.name, size: b.size, dough: b.dough, totalFlour: b.totalFlour, totalWater: b.totalWater, lines: benchLines(t, b).map((l) => ({ name: l.name, g: l.g })) };
+      });
+      const expanded = [];
+      data.forEach((L, i) => { const c = Math.max(1, Math.min(10, Math.floor(+labelCopies[i] || 1))); for (let k = 0; k < c; k++) expanded.push(L); });
+      const per = Math.max(1, P.cols * P.rows);
+      const skip = labelSkip.filter((p) => p >= 0 && p < per);
+      const sheets = [];
+      let di = 0, sx = 0;
+      while (true) {
+        const cells = [];
+        for (let p = 0; p < per; p++) {
+          const blocked = sx === 0 && skip.indexOf(p) !== -1;
+          cells.push((!blocked && di < expanded.length) ? expanded[di++] : null);
+        }
+        sheets.push(cells);
+        sx++;
+        if (di >= expanded.length) break;
+      }
+      const sheetStyle = { width: P.pageW + "in", height: P.pageH + "in", boxSizing: "border-box", paddingTop: `calc(${P.top}in + ${labelOffY}mm)`, paddingLeft: `calc(${P.left}in + ${labelOffX}mm)` };
+      const gridStyle = { display: "grid", gridTemplateColumns: `repeat(${P.cols}, ${P.labelW}in)`, gridAutoRows: `${P.labelH}in`, columnGap: `${P.hGut}in`, rowGap: `${P.vGut}in` };
+      return (
+        <div className="label-print-overlay">
+          <div className="label-print-ui">
+            <div className="lpu-title">Bucket labels<small>Avery 6468 · 2&quot;×4&quot; · {expanded.length} label{expanded.length === 1 ? "" : "s"} · {sheets.length} sheet{sheets.length === 1 ? "" : "s"}</small></div>
+            <label className="lpu-ctl sm">Nudge&nbsp;→<input type="number" step="0.5" value={labelOffX} onChange={(e) => setLabelOffX(+e.target.value || 0)} /><em>mm</em></label>
+            <label className="lpu-ctl sm">Nudge&nbsp;↓<input type="number" step="0.5" value={labelOffY} onChange={(e) => setLabelOffY(+e.target.value || 0)} /><em>mm</em></label>
+            <div className="lpu-spacer" />
+            <button className="lpu-print" onClick={() => window.print()}>Print / Save PDF</button>
+            <button className="lpu-close" onClick={() => setLabelOpen(false)} aria-label="Close">×</button>
+          </div>
+          <div className="label-print-hint">Set the print dialog to <b>100% scale</b> and <b>margins: None</b>. Run one test sheet on plain paper held against a label sheet; if it's off, nudge in mm above.</div>
+          <div className="label-copies">
+            <span className="lcp-hd">Copies</span>
+            {data.map((L, i) => (
+              <label className="lcp-item" key={i}>
+                <span>B{L.n}</span>
+                <input type="number" min="1" max="10" value={labelCopies[i] ?? 1} onChange={(e) => setLabelCopies((st) => ({ ...st, [i]: Math.max(1, Math.min(10, Number(e.target.value) || 1)) }))} />
+              </label>
+            ))}
+            {Object.keys(labelCopies).some((k) => (+labelCopies[k] || 1) > 1) && <button className="lsm-reset" onClick={() => setLabelCopies({})}>×1 all</button>}
+          </div>
+          <div className="label-skipmap">
+            <div className="lsm-hd">
+              <span>Sheet 1 — untick any label already peeled off</span>
+              {skip.length > 0 && <button className="lsm-reset" onClick={() => setLabelSkip([])}>All present</button>}
+            </div>
+            <div className="lsm-grid" style={{ gridTemplateColumns: "repeat(" + P.cols + ", 1fr)" }}>
+              {Array.from({ length: per }, (_, p) => {
+                const off = skip.indexOf(p) !== -1;
+                return (
+                  <label className={"lsm-cell" + (off ? " off" : "")} key={p}>
+                    <input type="checkbox" checked={!off} onChange={() => setLabelSkip((st) => st.indexOf(p) !== -1 ? st.filter((x) => x !== p) : [...st, p])} />
+                    <span>{p + 1}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+          <div className="label-stage">
+            <div className="label-sheets">
+              {sheets.map((sheet, si) => (
+                <div className="label-sheet" key={si} style={sheetStyle}>
+                  <div style={gridStyle}>
+                    {sheet.map((L, ci) => L === null ? <div className="label-cell" key={ci} /> : (
+                      <div className="label-cell" key={ci}>
+                        <div className="lc-left">
+                          <span className="lc-n">B{L.n}</span>
+                          <span className="lc-name">{L.name}</span>
+                          <span className="lc-tot"><span>Flour <b>{fmtG(L.totalFlour)} g</b></span><span>Water <b>{fmtG(L.totalWater)} g</b></span></span>
+                        </div>
+                        <div className="lc-right">
+                          <div className="lc-lines">
+                            {L.lines.map((ln, j) => <div className="lc-line" key={j}><span className="lc-ing">{ln.name}</span><span className="lc-g">{fmtG(ln.g)} g</span></div>)}
+                          </div>
+                          <div className="lc-foot"><span className="pnum">{L.size}</span> loaves · <span className="pnum">{fmtG(L.dough)}</span> g dough</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    })()}
+    </>
+  );
+}
