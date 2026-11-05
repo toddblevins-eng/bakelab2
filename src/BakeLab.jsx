@@ -26,6 +26,7 @@ const cloneRecipe = (r) => ({
   levHyd: r.levHyd ?? 80, levInoc: r.levInoc ?? 10, levRefInoc: r.levRefInoc ?? 10, levBuildHrs: r.levBuildHrs ?? 5, levRefTemp: r.levRefTemp ?? 24,
   levWhole: r.levWhole ?? 0, levExpNote: r.levExpNote || "",
   levSugar: r.levSugar ?? 0, levSugarName: r.levSugarName || "",
+  levSeedHyd: r.levSeedHyd ?? "", levSeedName: r.levSeedName || "",
   ddt: r.ddt ?? DDT_DEFAULT_C,
   bakeTemp: r.bakeTemp ?? 245, bakeMin: r.bakeMin ?? 45, steamMin: r.steamMin ?? 20,
   autolyse: r.autolyse ?? 45,
@@ -36,10 +37,10 @@ const cloneRecipe = (r) => ({
   price: r.price ?? 0,
   scald: !!r.scald, scaldFlour: r.scaldFlour || "", scaldPct: r.scaldPct ?? 10, scaldHyd: r.scaldHyd ?? 500, scaldLiquid: r.scaldLiquid || "", scaldMethod: r.scaldMethod === "poured" ? "poured" : "cooked",
   flours: r.flours.map((f) => mk(f.name, f.pct)),
-  inclusions: r.inclusions.map((f) => ({ ...mk(f.name, f.pct), when: cleanWhen(f.when) })),
+  inclusions: r.inclusions.map((f) => ({ ...mk(f.name, f.pct), when: cleanWhen(f.when), ...((f.waterPct !== undefined && f.waterPct !== null && f.waterPct !== "") ? { waterPct: f.waterPct } : {}) })),
   liquids: (r.liquids || []).map((l) => ({ ...mkL(l.name, l.pct, l.factor ?? 100), when: cleanWhen(l.when) })),
 });
-const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", levSugar: 0, levSugarName: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", price: 0, scald: false, scaldFlour: "", scaldPct: 10, scaldHyd: 500, scaldLiquid: "", scaldMethod: "cooked", inclusions: [], liquids: [] });
+const blankRecipe = () => ({ name: "New recipe", loafWeight: 850, shape: "round", flours: [mk("Bread flour", 100)], water: 75, salt: 2, levain: 20, levHyd: 80, levInoc: 10, levRefInoc: 10, levBuildHrs: 5, levRefTemp: 24, levWhole: 0, levExpNote: "", levSugar: 0, levSugarName: "", levSeedHyd: "", levSeedName: "", ddt: DDT_DEFAULT_C, bakeTemp: 245, bakeMin: 45, steamMin: 20, autolyse: 45, calNote: "", bassinage: false, bassinagePct: 8, notes: "", price: 0, scald: false, scaldFlour: "", scaldPct: 10, scaldHyd: 500, scaldLiquid: "", scaldMethod: "cooked", inclusions: [], liquids: [] });
 
 // date helpers — defined early because DEFAULT_SLOTS uses them at module-eval time
 const todayISO = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
@@ -92,8 +93,7 @@ const ovenShapeCap = (oven, shape) => (oven ? Math.max(0, Math.floor(+oven[ovenK
 const grossFlourUnits = (t, refH) => {
   let f = 0; ingLines(t).forEach((l) => { if (l.key.indexOf("fl_") === 0 || l.key === "scf") f += l.pct; });
   const lev = +t.levain || 0, H = +t.levHyd || 80, I = Math.max(0.1, +t.levInoc || 10);
-  const den = 1 + H / 100 + I / 100, feed = lev / den;
-  return f + feed + feed * (I / 100) * 100 / (100 + (+refH || 80));
+  return f + levainSplit(lev, H, I, seedHydOf(t, refH)).flourTot;
 };
 const MASS_G = { g: 1, kg: 1000, lb: 453.592, oz: 28.3495 };
 const VOL_ML = { mL: 1, L: 1000 };
@@ -171,7 +171,7 @@ const computeRunCosts = ({ plan, types, builds, pantry, settings, refHyd, rental
   (builds || []).forEach((bd) => {
     const sumLev = bd.items.reduce((a, x) => a + x.levW, 0);
     if (!(sumLev > 0)) return;
-    const flour = bd.flourL + bd.seedL * 100 / (100 + (+refHyd || 80));
+    const flour = bd.flourL + bd.seedL * 100 / (100 + (+bd.seedHyd || +refHyd || 80));
     const w = Math.max(0, Math.min(100, +bd.whole || 0)) / 100;
     bd.items.forEach((x) => {
       const b = plan.list[x.gi]; if (!b) return;
@@ -407,6 +407,17 @@ function CostsTab({ res, locked, lockedAt, hours, setHours, rate, setRate, defau
 }
 
 // Scald editor, shared by the recipe editor and each Plan card. `onPatch(partial)` writes recipe fields.
+const SCALD_PCT_PRESETS = [10, 20, 30];
+// Quick scald flour % (of total flour). A value that is not one of the presets shows as "x% (custom)" so nothing is lost.
+function ScaldPctSelect({ value, onChange, dataF }) {
+  const v = Math.round((+value || 0) * 100) / 100, inList = SCALD_PCT_PRESETS.indexOf(v) >= 0;
+  return (
+    <select data-f={dataF} value={inList ? String(v) : "custom"} onChange={(e) => { if (e.target.value !== "custom") onChange(+e.target.value); }}>
+      {SCALD_PCT_PRESETS.map((q) => <option key={q} value={String(q)}>{q}%</option>)}
+      {!inList && <option value="custom">{v}% (custom)</option>}
+    </select>
+  );
+}
 function ScaldEditor({ t, onPatch, buf }) {
   const sc = scaldInfo(t);
   const on = !!t.scald;
@@ -435,6 +446,7 @@ function ScaldEditor({ t, onPatch, buf }) {
         </div>
         <div className="sd-row">
           <label className="sd-f"><span>Scald flour (% of total flour)</span><input data-f="scaldPct" type="number" min="0" step="0.5" value={t.scaldPct ?? 10} onFocus={(e) => e.target.select()} onChange={(e) => onPatch({ scaldPct: num(e.target.value) })} /></label>
+          <label className="sd-f"><span>Quick %</span><ScaldPctSelect dataF="scaldPctPreset" value={t.scaldPct ?? 10} onChange={(v) => onPatch({ scaldPct: v })} /></label>
           <label className="sd-f"><span>Taken from</span>
             <select data-f="scaldFlour" value={flourVal} onChange={(e) => onPatch({ scaldFlour: e.target.value })}>
               {flours.map((f) => <option key={f.id} value={f.name}>{f.name}</option>)}
@@ -746,11 +758,11 @@ function mixHelpContext(o) {
       name: t.name,
       flours: (t.flours || []).map((f, idx) => ({ name: f.name, pct: rd(flourPctOf(t, idx)) })),
       waterPct: rd(+t.water || 0), saltPct: rd(+t.salt || 0), trueHydrationPct: rd(trueHydration(t)),
-      levain: { pctOfFlour: rd(+t.levain || 0), hydrationPct: +t.levHyd || 80, inoculationPct: +t.levInoc || 10, wholeGrainPct: +t.levWhole || 0, ...(levSugarPct(t) > 0 ? { sugar: levSugarName(t), sugarPctOfLevainFlour: +t.levSugar } : {}), note: t.levExpNote || "" },
+      levain: { pctOfFlour: rd(+t.levain || 0), hydrationPct: +t.levHyd || 80, seedStarterHydrationPct: seedHydOf(t, 80), ...(t.levSeedName ? { seedStarter: t.levSeedName } : {}), inoculationPct: +t.levInoc || 10, wholeGrainPct: +t.levWhole || 0, ...(levSugarPct(t) > 0 ? { sugar: levSugarName(t), sugarPctOfLevainFlour: +t.levSugar } : {}), note: t.levExpNote || "" },
       bassinagePctOfWater: t.bassinage ? rd(+t.bassinagePct || 0) : 0,
       scald: sc.on ? { flour: sc.flourName, flourPctOfTotal: rd(sc.sf), liquid: sc.liquidName, liquidPct: rd(sc.S), method: sc.method, bufferPct: t.scaldBuf ? (+t.scaldBufPct || 0) : 0 } : null,
       liquids: (t.liquids || []).map((l) => ({ name: l.name, pct: rd(+l.pct || 0), waterContentPct: +l.factor || 100 })),
-      inclusions: (t.inclusions || []).map((f) => ({ name: f.name, pct: rd(+f.pct || 0) })),
+      inclusions: (t.inclusions || []).map((f) => ({ name: f.name, pct: rd(+f.pct || 0), ...(incWaterPct(f) > 0 ? { waterPct: incWaterPct(f) } : {}) })),
       bake: { temp: showTemp(t.bakeTemp ?? 245), minutes: +t.bakeMin || 45, steamMinutes: t.steamMin ?? 20 },
       notesFromLastBakes: String(t.notes || "").slice(0, 600),
     },
@@ -1190,7 +1202,7 @@ const trueHydration = (t) => {
   const levFlour = den > 0 ? lev * 100 / den : 0;
   const levWater = den > 0 ? lev * lh / den : 0;
   const totalFlour = 100 + levFlour;
-  const totalWater = (+t.water || 0) + liq + levWater;
+  const totalWater = (+t.water || 0) + liq + incWaterTotal(t) + levWater;
   return totalFlour > 0 ? (totalWater / totalFlour) * 100 : 0;
 };
 // Exact inverse of trueHydration: the water % (of flour) that makes the dough land on `target` true hydration,
@@ -1201,7 +1213,7 @@ const waterForTargetHydration = (t, target) => {
   const lev = +t.levain || 0, lh = +t.levHyd || 80, den = 100 + lh;
   const levFlour = den > 0 ? lev * 100 / den : 0;
   const levWater = den > 0 ? lev * lh / den : 0;
-  return Math.round((target * (100 + levFlour) / 100 - liq - levWater) * 10) / 10;
+  return Math.round((target * (100 + levFlour) / 100 - liq - incWaterTotal(t) - levWater) * 10) / 10;
 };
 // Readout + "solve water for a target" control. Used in the recipe editor and on each Plan card.
 function HydrationLine({ t, onSetWater }) {
@@ -1213,7 +1225,7 @@ function HydrationLine({ t, onSetWater }) {
   const same = need !== null && Math.abs(need - (+t.water || 0)) < 0.05;
   return (
     <div className="bl-hyd-readout">
-      <span>True hydration <b>{hyd}%</b><span className="bl-hyd-note">incl. levain @ {+t.levHyd || 80}%</span></span>
+      <span>True hydration <b>{hyd}%</b><span className="bl-hyd-note" data-k="hydnote">incl. levain @ {+t.levHyd || 80}%{incWaterTotal(t) > 0 ? " · inclusions' water +" + (Math.round(incWaterTotal(t) * 10) / 10) + "%" : ""}</span></span>
       <span className="bl-hyd-solve">
         <input type="number" min="0" step="0.5" value={target} placeholder="target %" onChange={(e) => setTarget(e.target.value)} />
         {need !== null && (unreachable ? <span className="bl-hyd-need bad">unreachable — levain alone is over</span> : <span className="bl-hyd-need">→ water {need}%</span>)}
@@ -1222,7 +1234,7 @@ function HydrationLine({ t, onSetWater }) {
     </div>
   );
 }
-const RECIPE_FORMULA_KEYS = ["name","loafWeight","shape","water","salt","levain","levHyd","levInoc","levRefInoc","levBuildHrs","levRefTemp","levWhole","levExpNote","ddt","bakeTemp","bakeMin","steamMin","autolyse","calNote","bassinage","bassinagePct"];
+const RECIPE_FORMULA_KEYS = ["name","loafWeight","shape","water","salt","levain","levHyd","levInoc","levRefInoc","levBuildHrs","levRefTemp","levWhole","levExpNote","levSeedHyd","levSeedName","ddt","bakeTemp","bakeMin","steamMin","autolyse","calNote","bassinage","bassinagePct"];
 const sameIngList = (x, y, skipFirstPct) => {
   const xs = x || [], ys = y || [];
   if (xs.length !== ys.length) return false;
@@ -1230,6 +1242,7 @@ const sameIngList = (x, y, skipFirstPct) => {
     if ((xs[i].name || "") !== (ys[i].name || "")) return false;
     if (!(skipFirstPct && i === 0) && (+xs[i].pct || 0) !== (+ys[i].pct || 0)) return false;
     if (cleanWhen(xs[i].when) !== cleanWhen(ys[i].when)) return false;
+    if (incWaterPct(xs[i]) !== incWaterPct(ys[i])) return false;
   }
   return true;
 };
@@ -1285,6 +1298,24 @@ const scaldInfo = (t) => {
   return { enabled: true, on, flourIdx, flourName, flourPct, sf, hyd, wantS, avail, S, liqIdx, isWater, liquidName, method: t.scaldMethod === "poured" ? "poured" : "cooked", warns };
 };
 
+// Water that inclusions bring to the dough and that counts toward true hydration. Butter is ~16% water; a "% water" typed on an inclusion overrides the guess.
+const incWaterDefault = (name) => { const n = String(name || ""); return (/(^|[^a-z])butter([^a-z]|$)/i.test(n) && !/(peanut|almond|cashew|cocoa|shea|cookie|biscuit|apple|nut)/i.test(n)) ? 16 : 0; };
+const incWaterPct = (inc) => { const v = inc ? inc.waterPct : undefined; if (v !== undefined && v !== null && v !== "" && Number.isFinite(+v)) return Math.max(0, Math.min(100, +v)); return incWaterDefault(inc && inc.name); };
+const incWaterTotal = (t) => (t.inclusions || []).reduce((a, f) => a + (+f.pct || 0) * incWaterPct(f) / 100, 0);
+// The seed starter's hydration for a recipe: its own (e.g. a separate stiff starter), else the app's starter (Thelma).
+const seedHydOf = (t, dflt) => { const v = +(t && t.levSeedHyd); if (v > 0) return v; const e = +(t && t.levSeedHydEff); if (e > 0) return e; return +dflt > 0 ? +dflt : 80; };
+// "Hydration" on a levain is the FINISHED levain's hydration (fresh feed + seed together). With fresh flour f, fresh water w and a seed s = I*f at hydration hs:
+//   (w + s*hs/(1+hs)) / (f + s/(1+hs)) = H   =>   M = f * (1 + I + H + I*(H - hs)/(1 + hs))      (seed hydration = H gives the familiar 1 + I + H)
+// Inputs in percent. If the seed is so wet that even a dry feed overshoots H, no water is added and the levain finishes wetter (wet = true).
+const levainSplit = (M, Hp, Ip, hsp) => {
+  const H = Hp / 100, I = Math.max(0.001, Ip / 100), hs = hsp / 100;
+  const den = 1 + I + H + I * (H - hs) / (1 + hs);
+  let f = den > 0 ? M / den : 0, seed = I * f, seedFlour = seed / (1 + hs), seedWater = seed - seedFlour;
+  let w = H * (f + seedFlour) - seedWater, wet = false;
+  if (w < 0) { wet = true; w = 0; f = M / (1 + I); seed = I * f; seedFlour = seed / (1 + hs); seedWater = seed - seedFlour; }
+  const flourTot = f + seedFlour, waterTot = w + seedWater;
+  return { f, w, seed, seedFlour, seedWater, flourTot, waterTot, hyd: flourTot > 0 ? waterTot / flourTot * 100 : 0, wet };
+};
 // Sugar added to the levain build (e.g. a sweet stiff levain): % of the levain's feed flour, ON TOP of any sugar in the dough. It becomes its own line
 // ("lsg") so dough weight, costing and the shopping list count it, but at the bench it is weighed as part of the levain (see benchLines).
 const levSugarName = (t) => (String(t.levSugarName || "").trim() || "Granulated sugar");
@@ -1292,7 +1323,7 @@ const levSugarPct = (t) => {
   const S = Math.max(0, +t.levSugar || 0), lev = +t.levain || 0;
   if (!(S > 0) || !(lev > 0)) return 0;
   const H = +t.levHyd || 80, I = Math.max(0.1, +t.levInoc || 10);
-  return lev * (S / 100) / (1 + H / 100 + I / 100);
+  return lev * (S / 100) * levainSplit(1, H, I, seedHydOf(t, 80)).f;   // % of the FRESH flour in the build
 };
 const ingLines = (t) => {
   const sc = scaldInfo(t);
@@ -1321,7 +1352,7 @@ const ingLines = (t) => {
 const benchLines = (t, b) => ingLines(t).filter((l) => l.pct > 0 && l.key !== "lsg").map((l) => (l.key === "levain" && (b.weights.lsg || 0) > 0 ? { ...l, g: (b.weights.levain || 0) + b.weights.lsg, sugarG: b.weights.lsg } : { ...l, g: b.weights[l.key] }));
 // Scald buffer: cook a little extra so pot loss can't leave the dough short. The dough still takes the exact amount.
 const SCALD_BUF_DEFAULT = 5;
-const BUILD_ID = "2026-11-05 b"; // bump on every delivery: it is shown in the header so the running build is never a guess
+const BUILD_ID = "2026-11-05 c"; // bump on every delivery: it is shown in the header so the running build is never a guess
 const scaldBufFactor = (t) => (t && t.scaldBuf ? 1 + Math.max(0, +t.scaldBufPct || 0) / 100 : 1);
 // The scald as the baker handles it for one batch: what goes into the dough (flour + liquid, already prepped) and what to cook (that plus the buffer).
 const scaldAmounts = (t, b) => {
@@ -1333,9 +1364,9 @@ const scaldAmounts = (t, b) => {
 // id-independent signature of a formula, with main flour normalized
 const formulaKey = (r) => JSON.stringify({
   lw: +r.loafWeight, sh: r.shape || "round", w: +r.water, s: +r.salt, lv: +r.levain,
-  lh: +r.levHyd || 80, li: +r.levInoc || 10, ri: +r.levRefInoc || 10, lb: +r.levBuildHrs || 5, lr: +r.levRefTemp || 24, lwh: +r.levWhole || 0, ls: +r.levSugar || 0, ln: (+r.levSugar || 0) > 0 ? normName(levSugarName(r)) : "", lxn: r.levExpNote || "", bt: +r.bakeTemp || 245, bm: +r.bakeMin || 45, sm: +r.steamMin || 20, au: +r.autolyse || 45, cn: r.calNote || "",
+  lh: +r.levHyd || 80, li: +r.levInoc || 10, ri: +r.levRefInoc || 10, lb: +r.levBuildHrs || 5, lr: +r.levRefTemp || 24, lwh: +r.levWhole || 0, lsh: +r.levSeedHyd || 0, ls: +r.levSugar || 0, ln: (+r.levSugar || 0) > 0 ? normName(levSugarName(r)) : "", lxn: r.levExpNote || "", bt: +r.bakeTemp || 245, bm: +r.bakeMin || 45, sm: +r.steamMin || 20, au: +r.autolyse || 45, cn: r.calNote || "",
   fl: r.flours.map((f, i) => [f.name, i === 0 ? mainPct(r) : +f.pct || 0]),
-  inc: r.inclusions.map((f) => [f.name, +f.pct || 0]),
+  inc: r.inclusions.map((f) => [f.name, +f.pct || 0, incWaterPct(f)]),
   lq: (r.liquids || []).map((l) => [l.name, +l.pct || 0, +l.factor || 100]),
   bs: !!r.bassinage, bp: +r.bassinagePct || 0, sd: scaldKeyPart(r),
 });
@@ -1343,7 +1374,7 @@ const formulaKey = (r) => JSON.stringify({
 // signature of the base dough only (flours + hydration + salt + levain build + autolyse + DDT); inclusions / loaf weight / shape / bake ignored
 const baseDoughKey = (r) => JSON.stringify({
   w: +r.water || 0, s: +r.salt || 0, lv: +r.levain || 0,
-  lh: +r.levHyd || 80, li: +r.levInoc || 10, ri: +r.levRefInoc || 10, lb: +r.levBuildHrs || 5, lr: +r.levRefTemp || 24, lwh: +r.levWhole || 0, ls: +r.levSugar || 0, ln: (+r.levSugar || 0) > 0 ? normName(levSugarName(r)) : "",
+  lh: +r.levHyd || 80, li: +r.levInoc || 10, ri: +r.levRefInoc || 10, lb: +r.levBuildHrs || 5, lr: +r.levRefTemp || 24, lwh: +r.levWhole || 0, lsh: +r.levSeedHyd || 0, ls: +r.levSugar || 0, ln: (+r.levSugar || 0) > 0 ? normName(levSugarName(r)) : "",
   au: +r.autolyse || 45, dt: Math.round((+r.ddt || DDT_DEFAULT_C) * 10) / 10,
   fl: r.flours.map((f, i) => [f.name, i === 0 ? mainPct(r) : +f.pct || 0]),
   lq: (r.liquids || []).map((l) => [l.name, +l.pct || 0, +l.factor || 100]),
@@ -1737,7 +1768,7 @@ export default function App() {
   const startMin = parseTime(startTime);
 
   // production "types" derived from slots (formula + day quantity)
-  const types = useMemo(() => slots.map((s, i) => ({ ...s.draft, loaves: s.loaves, mixOrder: s.mixOrder ?? i + 1, bakeOrder: s.bakeOrder ?? i + 1, scaldBuf: !!s.scaldBuf, scaldBufPct: s.scaldBufPct ?? SCALD_BUF_DEFAULT })), [slots]);
+  const types = useMemo(() => slots.map((s, i) => ({ ...s.draft, loaves: s.loaves, mixOrder: s.mixOrder ?? i + 1, bakeOrder: s.bakeOrder ?? i + 1, scaldBuf: !!s.scaldBuf, scaldBufPct: s.scaldBufPct ?? SCALD_BUF_DEFAULT, levSeedHydEff: +starter.refHyd || 80 })), [slots, starter.refHyd]);
 
   // ---- batch planner -------------------------------------------------------
   const plan = useMemo(() => {
@@ -2012,7 +2043,7 @@ export default function App() {
       types.forEach((t, ti) => {
         const batches = plan.list.map((b, gi) => ({ b, gi })).filter((x) => x.b.ti === ti);
         if (batches.length === 0) return;
-        const k = [+t.levHyd || 80, +t.levInoc || 10, +t.levRefInoc || 10, +t.levBuildHrs || 5, +t.levRefTemp || 24, +t.levWhole || 0, +t.levSugar || 0, (+t.levSugar || 0) > 0 ? normName(levSugarName(t)) : ""].join("|");
+        const k = [+t.levHyd || 80, +t.levInoc || 10, +t.levRefInoc || 10, +t.levBuildHrs || 5, +t.levRefTemp || 24, +t.levWhole || 0, +t.levSugar || 0, (+t.levSugar || 0) > 0 ? normName(levSugarName(t)) : "", seedHydOf(t, starter.refHyd)].join("|");
         if (!sig[k]) sig[k] = { ti, names: [], items: [] };
         if (sig[k].names.indexOf(t.name) === -1) sig[k].names.push(t.name);
         batches.forEach((x) => {
@@ -2047,7 +2078,7 @@ export default function App() {
       const I = Math.max(0.1, +t.levInoc || 10);          // working inoculation
       const refInoc = Math.max(0.1, +t.levRefInoc || 10);  // inoculation the baseline was calibrated at
       const whole = Math.max(0, +t.levWhole || 0);         // % whole grain in the levain flour
-      const refH = +starter.refHyd || 80;
+      const refH = seedHydOf(t, starter.refHyd);          // the hydration the starter is kept at is the reference for timing
       // inoculation: less seed than calibration → longer natural rise (each halving adds inocDoubleHrs)
       const inocAdd = inocDoubleHrs * 60 * Math.log2(refInoc / I);
       // hydration: stiffer than ref → slower. hydDoubleHrs = +hrs per halving of hydration below ref
@@ -2083,14 +2114,15 @@ export default function App() {
       const rawBuf = levBufferPct[key];
       const bufPct = buffered ? ((rawBuf === undefined || rawBuf === null || rawBuf === "") ? 2 : (Number(rawBuf) || 0)) : 0;
       const M = bd.items.reduce((a, x) => a + x.levW, 0) * (1 + bufPct / 100);
-      const denom = 1 + bd.H / 100 + bd.I / 100;
-      const flourL = M / denom, waterL = flourL * bd.H / 100, seedL = flourL * bd.I / 100;
+      const seedHyd = seedHydOf(types[bd.ti], starter.refHyd);
+      const sp = levainSplit(M, bd.H, bd.I, seedHyd);
+      const flourL = sp.f, waterL = sp.w, seedL = sp.seed;
       const sugarL = bd.items.reduce((a, x) => a + (x.lsgW || 0), 0) * (1 + bufPct / 100);
       const sugarName = sugarL > 0 ? levSugarName(types[bd.ti]) : "";
       const mTot = flourL + waterL + seedL;
       const Twater = waterL > 0 ? (Tlev * mTot - flourL * ambientTemp - seedL * starterTemp) / waterL : Tlev;
       const holdMin = bd.items[bd.items.length - 1].mixOff - bd.targetPeak;
-      return { ...bd, key, retarded, buffered, bufPct, retardHold, retardLate, peakOff, desired, Tlev, M, flourL, waterL, seedL, sugarL, sugarName, Twater, holdMin };
+      return { ...bd, key, retarded, buffered, bufPct, retardHold, retardLate, peakOff, desired, Tlev, M, flourL, waterL, seedL, seedHyd, seedFlourL: sp.seedFlour, finishHyd: sp.hyd, wetSeed: sp.wet, sugarL, sugarName, Twater, holdMin };
     });
     return { feedOff, autoFeed, builds: out };
   }, [plan, types, schedule, params.autolyse, ambientTemp, starterTemp, feedMode, feedTime, startMin, inocDoubleHrs, hydResp, wholeResp, q10, starter.refHyd, retard, levBuffer, levBufferPct, levCombine]);
@@ -2107,7 +2139,7 @@ export default function App() {
       let fl = 0, lq = 0;
       plan.list.forEach((b) => { if (b.ti === ti) { fl += b.weights.scf || 0; lq += (sc.isWater ? b.weights.scw : b.weights.scl) || 0; } });
       const k = scaldBufFactor(t);
-      if (fl > 0) out.push({ ti, name: t.name, flourName: sc.flourName, fl: fl * k, liquidName: sc.liquidName, lq: lq * k, method: sc.method, k, dough: fl + lq, on: !!t.scaldBuf, pct: t.scaldBufPct });
+      if (fl > 0) out.push({ ti, name: t.name, flourName: sc.flourName, fl: fl * k, liquidName: sc.liquidName, lq: lq * k, method: sc.method, k, dough: fl + lq, on: !!t.scaldBuf, pct: t.scaldBufPct, pctFlour: +t.scaldPct || 0 });
     });
     return out;
   }, [plan, types]);
@@ -2296,6 +2328,7 @@ export default function App() {
   const removeFlour = (ti, idx) => patchDraft(ti, (d) => ({ ...d, flours: d.flours.filter((_, j) => j !== idx) }));
   const setIncName = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.map((f, j) => (j === idx ? { ...f, name: v } : f)) }));
   const setIncWhen = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.map((f, j) => (j === idx ? { ...f, when: cleanWhen(v) } : f)) }));
+  const setIncWater = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.map((f, j) => (j === idx ? { ...f, waterPct: v === "" ? "" : Math.max(0, Math.min(100, Number(v) || 0)) } : f)) }));
   const setIncPct = (ti, idx, v) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.map((f, j) => (j === idx ? { ...f, pct: Math.max(0, Number(v) || 0) } : f)) }));
   const addInc = (ti) => patchDraft(ti, (d) => ({ ...d, inclusions: [...d.inclusions, mk("Inclusion " + (d.inclusions.length + 1), 0)] }));
   const removeInc = (ti, idx) => patchDraft(ti, (d) => ({ ...d, inclusions: d.inclusions.filter((_, j) => j !== idx) }));
@@ -2348,7 +2381,7 @@ export default function App() {
           waterPct: +r.water || 0,
           scald: (() => { const sc = scaldInfo(r); return sc.on ? { flour: sc.flourName, pctOfTotalFlour: Math.round(sc.sf * 10) / 10, liquid: sc.liquidName, liquidPctOfFlour: Math.round(sc.S * 10) / 10, method: sc.method } : null; })(),
           liquids: (r.liquids || []).map((l) => ({ name: l.name, pct: +l.pct || 0, waterFactorPct: +l.factor || 100, ...(isScaldLiquid(r, l) ? { addedAt: "scald" } : cleanWhen(l.when) ? { addedAt: cleanWhen(l.when) } : {}) })),
-          saltPct: +r.salt || 0, levainPct: +r.levain || 0, levainHydrationPct: +r.levHyd || 80, inoculationPct: +r.levInoc || 10,
+          saltPct: +r.salt || 0, levainPct: +r.levain || 0, levainHydrationPct: +r.levHyd || 80, levainSeedHydrationPct: seedHydOf(r, starter.refHyd), inoculationPct: +r.levInoc || 10,
           levainBuildHrs: +r.levBuildHrs || 5, ...((+r.levSugar || 0) > 0 ? { levainSugarPctOfLevainFlour: +r.levSugar, levainSugarName: levSugarName(r) } : {}), levainRefTempC: +r.levRefTemp || 24, levainWholeGrainPct: +r.levWhole || 0,
           trueHydrationPct: Math.round(trueHydration(r) * 10) / 10,
           autolyseMin: +r.autolyse || 45, targetDoughTempC: Math.round((+r.ddt || DDT_DEFAULT_C) * 10) / 10,
@@ -2915,6 +2948,7 @@ export default function App() {
         .sc-flag{font-size:12.5px;margin-left:auto;color:var(--ink2);}
         .sc-buf{display:flex;align-items:center;gap:8px;width:100%;font-size:12.5px;color:var(--ink2);cursor:pointer;} .sc-buf input[type=number]{width:58px;padding:5px 7px;font-family:'BL Punct','B612 Mono',ui-monospace,monospace;font-size:12.5px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);} .sc-buf .lbuffer-pct{display:inline-flex;align-items:center;gap:4px;}
         .lev-buf{margin:2px 0 8px;} .lev-buf-tog{display:inline-flex;align-items:center;gap:8px;cursor:pointer;} .lev-buf-note{font-size:11.5px;color:var(--ink2);margin-left:auto;}
+        .sc-pct{display:flex;align-items:center;gap:8px;width:100%;font-size:12.5px;color:var(--ink2);} .sc-pct select{font-family:'DM Sans';font-size:13px;padding:5px 8px;border:1.5px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);}
         .sd-buf{margin-top:8px;} .sc-buf input[type=checkbox]{accent-color:var(--crust);width:18px;height:18px;}
         .sc-row.short{background:#fdf0ef;} .sc-row.short .sc-flag{color:var(--alert);font-weight:700;}
         .sc-row.low{background:#fff6e3;} .sc-row.low .sc-flag{color:var(--crust2);font-weight:700;}
@@ -3666,6 +3700,7 @@ export default function App() {
                   <div className="ing-row" key={f.id}>
                     <IngredientInput className="ing-name" value={f.name} onCommit={(v) => patchEditInc(idx, { name: v })} placeholder={"Inclusion " + (idx + 1)} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" />
                     <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => patchEditInc(idx, { pct: Math.max(0, Number(e.target.value) || 0) })} /><em>%</em></div>
+                    <div className="liq-cell" title="Water content of this inclusion. It counts toward true hydration (butter is about 16%)."><input type="number" min="0" max="100" data-f="inc-water" placeholder={String(incWaterDefault(f.name))} value={f.waterPct ?? ""} onChange={(e) => patchEditInc(idx, { waterPct: e.target.value === "" ? "" : Math.max(0, Math.min(100, Number(e.target.value) || 0)) })} /><em>% water</em></div>
                     <span className="when-end">
                       <WhenSelect kind="inclusion" value={cleanWhen(f.when)} def={defaultWhen("inclusion", f.name, groupOf)} onChange={(v) => patchEditInc(idx, { when: cleanWhen(v) })} />
                       <button className="ing-x" onClick={() => removeEditInc(idx)}>×</button>
@@ -3689,6 +3724,10 @@ export default function App() {
                   <div className="bl-field2"><label>Inoculation %</label><input type="number" min="0" value={editingDraft.levInoc ?? 10} onChange={(e) => patchEdit({ levInoc: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div className="bl-field2"><label>Build to peak (h)</label><input type="number" min="0" step="0.25" value={editingDraft.levBuildHrs ?? 5} onChange={(e) => patchEdit({ levBuildHrs: Math.max(0, Number(e.target.value) || 0) })} /></div>
                   <div className="bl-field2"><label>Ref temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(editingDraft.levRefTemp ?? 24))} onChange={(e) => patchEdit({ levRefTemp: uToC(Number(e.target.value) || 0) })} /></div>
+                </div>
+                <div className="bl-re-row" data-k="levseed">
+                  <div className="bl-field2"><label>Seed starter hydration % <span className="bl-sub-note">blank = {starter.name} ({starter.refHyd}%)</span></label><input data-f="levSeedHyd" type="number" min="0" placeholder={String(starter.refHyd)} value={editingDraft.levSeedHyd ?? ""} onChange={(e) => patchEdit({ levSeedHyd: e.target.value === "" ? "" : Math.max(0, Number(e.target.value) || 0) })} /></div>
+                  <div className="bl-field2"><label>Seed starter name</label><input data-f="levSeedName" type="text" placeholder={starter.name} value={editingDraft.levSeedName ?? ""} onChange={(e) => patchEdit({ levSeedName: e.target.value })} /></div>
                 </div>
                 <div className="bl-re-row" data-k="levsugar">
                   <div className="bl-field2"><label>Sugar in levain % <span className="bl-sub-note">of levain flour · on top of the dough's sugar</span></label><input data-f="levSugar" type="number" min="0" step="0.5" value={editingDraft.levSugar ?? 0} onChange={(e) => patchEdit({ levSugar: Math.max(0, Number(e.target.value) || 0) })} /></div>
@@ -4019,7 +4058,7 @@ export default function App() {
                   <div className="cell"><label>Salt</label><div className="wrap"><input type="number" min="0" value={t.salt} onChange={(e) => setFixed(ti, "salt", e.target.value)} /><span className="pc">%</span></div></div>
                 </div>
 
-                <div className="bl-subhead bl-lev-sh">Levain <span className="bl-lev-starter">◆ {starter.name}</span></div>
+                <div className="bl-subhead bl-lev-sh">Levain <span className="bl-lev-starter">◆ {t.levSeedName || starter.name}</span></div>
                 <div className="bl-lev-section">
                   <div className="bl-fixed">
                     <div className="cell"><label>Levain</label><div className="wrap"><input type="number" min="0" value={t.levain} onChange={(e) => setFixed(ti, "levain", e.target.value)} /><span className="pc">%</span></div></div>
@@ -4030,6 +4069,10 @@ export default function App() {
                     <div className="bl-field2"><label>Build to peak (h)</label><input type="number" min="0" step="0.25" value={t.levBuildHrs ?? 5} onChange={(e) => setDraft(ti, { levBuildHrs: Math.max(0, Number(e.target.value) || 0) })} /></div>
                     <div className="bl-field2"><label>Ref temp (°{tempUnit})</label><input type="number" value={Math.round(cToU(t.levRefTemp ?? 24))} onChange={(e) => setDraft(ti, { levRefTemp: uToC(Number(e.target.value) || 0) })} /></div>
                     <div className="bl-field2"><label>Whole grain in levain</label><div className="wrap2"><input type="number" min="0" value={t.levWhole ?? 0} onChange={(e) => setDraft(ti, { levWhole: Math.max(0, Number(e.target.value) || 0) })} /><span className="pc">%</span></div></div>
+                  </div>
+                  <div className="bl-lev-grid" data-k="levseed">
+                    <div className="bl-field2"><label>Seed starter hydration <span className="bl-sub-note">blank = {starter.name} ({starter.refHyd}%)</span></label><div className="wrap2"><input data-f="levSeedHyd" type="number" min="0" placeholder={String(starter.refHyd)} value={t.levSeedHyd ?? ""} onChange={(e) => setDraft(ti, { levSeedHyd: e.target.value === "" ? "" : Math.max(0, Number(e.target.value) || 0) })} /><span className="pc">%</span></div></div>
+                    <div className="bl-field2"><label>Seed starter name</label><input data-f="levSeedName" type="text" placeholder={starter.name} value={t.levSeedName ?? ""} onChange={(e) => setDraft(ti, { levSeedName: e.target.value })} /></div>
                   </div>
                   <div className="bl-lev-sugar" data-k="levsugar">
                     <div className="bl-field2"><label>Sugar in levain <span className="bl-sub-note">% of levain flour · on top of the dough's sugar</span></label><div className="wrap2"><input data-f="levSugar" type="number" min="0" step="0.5" value={t.levSugar ?? 0} onChange={(e) => setDraft(ti, { levSugar: Math.max(0, Number(e.target.value) || 0) })} /><span className="pc">%</span></div></div>
@@ -4050,7 +4093,7 @@ export default function App() {
                     );
                   })()}
                   <div className="bl-lev-exp"><label>Levain flour / experiment note</label><BufferedInput className="bl-lev-expnote" value={t.levExpNote || ""} onCommit={(v) => setDraft(ti, { levExpNote: v })} placeholder="e.g. straight bread flour · or 5% rye pre-ferment" /></div>
-                  <div className="bl-lev-hint">Timing, water temp and the build recipe are computed on the <b>Levain</b> tab from {starter.name}'s calibration.</div>
+                  <div className="bl-lev-hint">Timing, water temp and the build recipe are computed on the <b>Levain</b> tab from this recipe's build-to-peak baseline and {starter.name}'s temperature and inoculation calibration.</div>
                 </div>
                 <div className="bl-subhead" data-k="liquids">Liquids <span className="bl-sub-note">milk 88% · egg 75% · cream 60% · tangzhong liquid counts too</span></div>
                 {(t.liquids || []).length === 0 && <div className="ing-empty">No liquids besides water</div>}
@@ -4075,6 +4118,7 @@ export default function App() {
                   <div className="ing-row" key={f.id}>
                     <IngredientInput className="ing-name" value={f.name} onCommit={(v) => setIncName(ti, idx, v)} placeholder={"Inclusion " + (idx + 1)} ingredients={ingOptions} onNewName={ensurePantryIng} kind="inclusion" />
                     <div className="ing-pct"><input type="number" min="0" value={f.pct} onChange={(e) => setIncPct(ti, idx, e.target.value)} /><em>%</em></div>
+                    <div className="liq-cell" title="Water content of this inclusion. It counts toward true hydration (butter is about 16%)."><input type="number" min="0" max="100" data-f="inc-water" placeholder={String(incWaterDefault(f.name))} value={f.waterPct ?? ""} onChange={(e) => setIncWater(ti, idx, e.target.value)} /><em>% water</em></div>
                     <span className="when-end">
                       <WhenSelect kind="inclusion" value={cleanWhen(f.when)} def={defaultWhen("inclusion", f.name, groupOf)} folds={Math.floor(+params.folds || 0)} onChange={(v) => setIncWhen(ti, idx, v)} />
                       <button className="ing-x" title="Remove inclusion" onClick={() => removeInc(ti, idx)}>×</button>
@@ -4261,6 +4305,7 @@ export default function App() {
                   <span className="sc-name">{p.name}</span>
                   <span className="sc-nums">{fmtG(p.fl)} g {p.flourName} + {fmtG(p.lq)} g {p.liquidName.toLowerCase()}{p.k > 1 ? " · " + fmtG(p.dough) + " g goes in the dough" : ""}</span>
                   <span className="sc-flag">{p.method === "poured" ? "pour boiling liquid over, mix" : "cook to " + showTemp(65) + ", stirring"}</span>
+                  <label className="sc-pct" data-k="scaldpctprep"><span>Scald flour</span><ScaldPctSelect dataF="scaldPctPrep" value={p.pctFlour} onChange={(v) => setDraft(p.ti, { scaldPct: v })} /><span>of total flour</span></label>
                   <label className="sc-buf" data-k="scaldbuf">
                     <input type="checkbox" data-f="scaldBuf" checked={p.on} onChange={() => patchSlot(p.ti, (sl) => ({ ...sl, scaldBuf: !sl.scaldBuf }))} />
                     <span>Buffer — pot loss</span>
@@ -4394,9 +4439,11 @@ export default function App() {
                       <div className="lrow"><span>Build time</span><b>{fmtDur(bd.retarded ? bd.baseAdjMin : bd.desired)}</b></div>
                       <div className="lrow"><span>Seed {Math.round(bd.I * 10) / 10}% → @ref</span><b>{fmtDur(bd.baseAdjMin)}</b></div>
                       <div className="lrow"><span>Levain temp</span><b>~{showTemp(bd.Tlev)}</b></div>
+                      <div className="lrow" data-k="levfinish"><span>Finished levain</span><b>{Math.round(bd.finishHyd * 10) / 10}% (seed {bd.seedHyd}%)</b></div>
+                      {bd.wetSeed && <div className="eq-warn" data-k="levwet">The seed ({bd.seedHyd}%) is wetter than the {bd.H}% target, so no water is added and the levain finishes at {Math.round(bd.finishHyd * 10) / 10}%.</div>}
                     </div>
                     <div className="lmix">
-                      <div className="ing"><span>Mature starter</span><span>{fmtG(bd.seedL)} g</span></div>
+                      <div className="ing"><span>{types[bd.ti].levSeedName || "Mature starter"}</span><span>{fmtG(bd.seedL)} g</span></div>
                       <div className="ing"><span>Flour</span><span>{fmtG(bd.flourL)} g</span></div>
                       <div className="ing"><span>Water</span><span>{fmtG(bd.waterL)} g</span></div>
                       {bd.sugarL > 0 && <div className="ing" data-k="levsugarrow"><span>{bd.sugarName}</span><span>{fmtG(bd.sugarL)} g</span></div>}
